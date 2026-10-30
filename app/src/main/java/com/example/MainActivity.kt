@@ -86,6 +86,11 @@ class MainActivity : ComponentActivity() {
 
         lifecycleScope.launch {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
+            com.example.data.firebase.InstallationManager.getInstance(applicationContext).initializeAndSync()
+            com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
+            com.example.data.firebase.VersionControlManager.getInstance(applicationContext).checkForUpdates()
+            com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
+            com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
 
         setContent {
@@ -101,6 +106,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        com.example.data.firebase.InstallationManager.getInstance(applicationContext).recordHeartbeat()
     }
 
     override fun onPictureInPictureModeChanged(
@@ -160,6 +170,35 @@ fun MainAppNav(
     val noticeManager = remember { NoticeManager.getInstance(context) }
     val isNoticeVisible by noticeManager.isNoticeVisible.collectAsStateWithLifecycle()
     val noticeContent by noticeManager.noticeContent.collectAsStateWithLifecycle()
+
+    val versionControlManager = remember { com.example.data.firebase.VersionControlManager.getInstance(context) }
+    val versionState by versionControlManager.versionState.collectAsStateWithLifecycle()
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+            contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+            onResult = { isGranted ->
+                if (isGranted) {
+                    com.example.data.firebase.AppAnalytics.getInstance(context).logEvent("notification_permission_granted")
+                }
+            }
+        )
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                    context,
+                    android.Manifest.permission.POST_NOTIFICATIONS
+                ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    if (versionState is com.example.data.firebase.VersionCheckState.ForceUpdate) {
+        val info = (versionState as com.example.data.firebase.VersionCheckState.ForceUpdate).info
+        com.example.ui.screens.ForceUpdateScreen(versionInfo = info)
+        return
+    }
 
     // Hide bottom bar on player screen or when in PIP mode
     val shouldShowBottomBar = !isInPipMode && currentRoute?.startsWith("player/") != true

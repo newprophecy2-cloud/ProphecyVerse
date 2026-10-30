@@ -156,6 +156,9 @@ interface WatchlistDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertWatchlistEntry(entry: WatchlistEntry)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertWatchlistEntries(entries: List<WatchlistEntry>)
+
     @Query("DELETE FROM watchlist_entries WHERE animeId = :animeId")
     suspend fun deleteWatchlistEntry(animeId: String)
 }
@@ -181,6 +184,9 @@ interface PlaybackHistoryDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertHistory(history: PlaybackHistory)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertHistories(histories: List<PlaybackHistory>)
 
     @Query("DELETE FROM playback_history WHERE id = :id")
     suspend fun deleteHistory(id: String)

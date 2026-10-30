@@ -178,6 +178,10 @@ class DetailViewModel(
     fun refreshDetails() {
         viewModelScope.launch {
             _isLoading.value = true
+            com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
+                "anime_view",
+                mapOf("anime_id" to animeId)
+            )
             repository.refreshAnimeDetails(animeId)
             _isLoading.value = false
         }
@@ -222,12 +226,26 @@ class DetailViewModel(
     fun toggleWatchlist(status: String = "WATCHING") {
         viewModelScope.launch {
             repository.toggleWatchlist(animeId, status)
+            val entry = watchlistEntry.value
+            com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
+                .syncWatchlistStatus(
+                    animeId = animeId,
+                    status = status,
+                    isFavorite = entry?.isFavorite ?: false
+                )
         }
     }
 
     fun toggleFavorite() {
         viewModelScope.launch {
             repository.toggleFavorite(animeId)
+            val entry = watchlistEntry.value
+            com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
+                .syncWatchlistStatus(
+                    animeId = animeId,
+                    status = entry?.status ?: "WATCHING",
+                    isFavorite = !(entry?.isFavorite ?: false)
+                )
         }
     }
 }
@@ -279,11 +297,24 @@ class PlayerViewModel(
             }
         }
 
-        // Auto-save playback position periodically
+        var lastWatchTimeTrackMs = System.currentTimeMillis()
+        var lastCloudSyncMs = 0L
+
+        // Auto-save playback position periodically and sync with Firebase Cloud
         playerManager.onPositionUpdate = { posMs, durMs ->
             val ep = _currentEpisode.value
             if (ep != null && durMs > 0) {
+                val now = System.currentTimeMillis()
+                val deltaSec = (now - lastWatchTimeTrackMs) / 1000
+                if (deltaSec >= 10 && playerManager.isPlaying.value) {
+                    com.example.data.firebase.AppAnalytics.getInstance(application).recordWatchTime(
+                        deltaSec, animeId, ep.id
+                    )
+                    lastWatchTimeTrackMs = now
+                }
+
                 viewModelScope.launch {
+                    val isCompleted = durMs > 0 && posMs >= (durMs * 0.9)
                     repository.updatePlaybackProgress(
                         animeId = animeId,
                         episodeId = ep.id,
@@ -293,6 +324,22 @@ class PlayerViewModel(
                         positionMs = posMs,
                         durationMs = durMs
                     )
+
+                    // Non-blocking cloud history synchronization
+                    if (now - lastCloudSyncMs > 10000L || isCompleted) {
+                        lastCloudSyncMs = now
+                        com.example.data.firebase.CloudHistoryRepository.getInstance(application)
+                            .syncPlaybackProgress(
+                                animeId = animeId,
+                                episodeId = ep.id,
+                                seasonNumber = ep.seasonNumber,
+                                episodeNumber = ep.episodeNumber,
+                                episodeTitle = ep.title,
+                                positionMs = posMs,
+                                durationMs = durMs,
+                                completed = isCompleted
+                            )
+                    }
                 }
             }
         }
@@ -302,6 +349,15 @@ class PlayerViewModel(
         _currentEpisode.value = episode
         _isResolving.value = true
         _resolutionError.value = null
+
+        com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
+            "episode_play",
+            mapOf(
+                "anime_id" to animeId,
+                "episode_id" to episode.id,
+                "episode_number" to episode.episodeNumber
+            )
+        )
 
         viewModelScope.launch {
             val db = AppDatabase.getInstance(getApplication())

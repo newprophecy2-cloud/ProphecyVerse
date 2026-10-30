@@ -35,6 +35,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,10 +69,15 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     var showClearCacheDialog by remember { mutableStateOf(false) }
+    var showAccountDialog by remember { mutableStateOf(false) }
     var autoplayNext by remember { mutableStateOf(true) }
     var preferredAudio by remember { mutableStateOf("Japanese") }
     var preferredSub by remember { mutableStateOf("English") }
     var skipInterval by remember { mutableStateOf(10) }
+
+    val authManager = remember { com.example.data.firebase.AuthManager.getInstance(context) }
+    val authState by authManager.authState.collectAsState(initial = com.example.data.firebase.AuthState.Loading)
+    val installationManager = remember { com.example.data.firebase.InstallationManager.getInstance(context) }
 
     LazyColumn(
         modifier = Modifier
@@ -82,12 +88,89 @@ fun SettingsScreen(
     ) {
         item {
             Text(
-                text = "Settings & Privacy",
+                text = "Settings & Preferences",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
                 color = TextPrimary
             )
             Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // Account & Cloud Sync Section
+        item {
+            SettingsCategoryHeader(title = "Account & Cloud Sync")
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showAccountDialog = true }
+                    .testTag("account_settings_card"),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = if (authManager.isGuest) "Guest Session" else "Prophecy Verse Account",
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary,
+                                fontSize = 16.sp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(if (authManager.isGuest) AccentCyan.copy(alpha = 0.2f) else PlayableGreen.copy(alpha = 0.2f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = if (authManager.isGuest) "ANONYMOUS" else "SYNCED",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (authManager.isGuest) AccentCyan else PlayableGreen
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (authManager.isGuest) "Tap to link account or sign in to sync watch progress across devices."
+                            else "Logged in as ${authManager.currentUser?.email ?: "User"}",
+                            fontSize = 12.sp,
+                            color = TextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Device ID: ${installationManager.installationId.take(10)}...",
+                            fontSize = 11.sp,
+                            color = TextMuted
+                        )
+                    }
+
+                    Button(
+                        onClick = { showAccountDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceHighlight),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(
+                            text = if (authManager.isGuest) "Link / Log In" else "Manage",
+                            color = AccentCyan,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
 
         // Playback Preferences Section
@@ -203,8 +286,23 @@ fun SettingsScreen(
                 onClick = { com.example.data.notice.NoticeManager.getInstance(context).showNotice() }
             )
 
+            Spacer(modifier = Modifier.height(8.dp))
+
+            SettingsOptionRow(
+                title = "🚀 Check for Updates",
+                value = "v1.0",
+                onClick = {
+                    com.example.data.firebase.VersionControlManager.getInstance(context).checkForUpdates()
+                    Toast.makeText(context, "Checking for latest Prophecy Verse updates...", Toast.LENGTH_SHORT).show()
+                }
+            )
+
             Spacer(modifier = Modifier.height(40.dp))
         }
+    }
+
+    if (showAccountDialog) {
+        AccountDialog(onDismissRequest = { showAccountDialog = false })
     }
 
     if (showClearCacheDialog) {
