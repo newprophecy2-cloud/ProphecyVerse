@@ -35,7 +35,7 @@ jobs:
           packages: 'platform-tools'
 
       - name: Install Android SDK platform and build tools
-        run: sdkmanager --install "platforms;android-36" "platforms;android-36-ext1" "build-tools;36.0.0"
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
 
       - name: Create temporary debug signing key
         shell: bash
