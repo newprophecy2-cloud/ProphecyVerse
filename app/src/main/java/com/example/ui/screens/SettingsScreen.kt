@@ -70,10 +70,13 @@ fun SettingsScreen(
     val context = LocalContext.current
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showAccountDialog by remember { mutableStateOf(false) }
+    var showAudioPriorityDialog by remember { mutableStateOf(false) }
     var autoplayNext by remember { mutableStateOf(true) }
-    var preferredAudio by remember { mutableStateOf("Japanese") }
     var preferredSub by remember { mutableStateOf("English") }
     var skipInterval by remember { mutableStateOf(10) }
+
+    val audioPreferences = remember { com.example.data.preferences.AudioPreferences.getInstance(context) }
+    val audioConfig by audioPreferences.config.collectAsState()
 
     val authManager = remember { com.example.data.firebase.AuthManager.getInstance(context) }
     val authState by authManager.authState.collectAsState(initial = com.example.data.firebase.AuthState.Loading)
@@ -203,11 +206,9 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             SettingsOptionRow(
-                title = "Preferred Audio",
-                value = preferredAudio,
-                onClick = {
-                    preferredAudio = if (preferredAudio == "Japanese") "English" else "Japanese"
-                }
+                title = "Audio Track Priority",
+                value = audioConfig.displaySummary,
+                onClick = { showAudioPriorityDialog = true }
             )
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -299,6 +300,12 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(40.dp))
         }
+    }
+
+    if (showAudioPriorityDialog) {
+        com.example.ui.components.AudioPriorityDialog(
+            onDismissRequest = { showAudioPriorityDialog = false }
+        )
     }
 
     if (showAccountDialog) {

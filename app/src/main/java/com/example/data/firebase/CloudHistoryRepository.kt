@@ -45,8 +45,9 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 // 1. Save locally in Room
                 database.playbackHistoryDao().upsertHistory(history)
 
-                // 2. Sync to Firestore in background
-                val ownerKey = AuthManager.getInstance(context).currentUid
+                // 2. Sync to Firestore if authenticated
+                val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
+                val ownerKey = currentUser.uid
                 val docData = hashMapOf<String, Any>(
                     "id" to history.id,
                     "anime_id" to animeId,
@@ -84,7 +85,8 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 )
                 database.watchlistDao().upsertWatchlistEntry(entry)
 
-                val ownerKey = AuthManager.getInstance(context).currentUid
+                val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
+                val ownerKey = currentUser.uid
                 val docData = hashMapOf<String, Any>(
                     "anime_id" to animeId,
                     "status" to status,
@@ -108,7 +110,8 @@ class CloudHistoryRepository private constructor(private val context: Context) {
     fun pullCloudHistoryAndWatchlist() {
         scope.launch {
             try {
-                val ownerKey = AuthManager.getInstance(context).currentUid
+                val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
+                val ownerKey = currentUser.uid
                 // Pull cloud history
                 val historyDocs = firestore.collection("watch_history")
                     .document(ownerKey)

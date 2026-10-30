@@ -294,9 +294,10 @@ class PlayerManager(
             .apply {
                 playWhenReady = true
                 volume = 1.0f
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 trackSelectionParameters = trackSelectionParameters
                     .buildUpon()
-                    .setPreferredAudioLanguages("ja", "jpn", "en", "eng", "hi", "hin")
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 setMediaItem(mediaItem, startPositionMs)
                 prepare()
@@ -480,9 +481,11 @@ class PlayerManager(
         val player = exoPlayer ?: return
         when (option.id) {
             "auto_audio" -> {
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
                     .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 _availableAudioTracks.value = _availableAudioTracks.value.map {
                     it.copy(isSelected = it.id == "auto_audio")

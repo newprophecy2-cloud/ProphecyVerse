@@ -4,7 +4,6 @@ import android.content.Context
 import android.util.Log
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
-import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.CoroutineScope
@@ -17,7 +16,7 @@ import kotlinx.coroutines.tasks.await
 
 sealed class AuthState {
     data object Loading : AuthState()
-    data class Guest(val user: FirebaseUser) : AuthState()
+    data class Guest(val guestId: String) : AuthState()
     data class Authenticated(val user: FirebaseUser, val email: String) : AuthState()
     data class Error(val message: String) : AuthState()
 }
@@ -45,59 +44,49 @@ class AuthManager private constructor(private val context: Context) {
         get() = auth.currentUser
 
     val isGuest: Boolean
-        get() = auth.currentUser?.isAnonymous ?: true
+        get() = auth.currentUser == null
 
     val currentUid: String
         get() = auth.currentUser?.uid ?: "guest_${InstallationManager.getInstance(context).installationId}"
 
     init {
+        // Evaluate initial authentication state immediately
+        val user = auth.currentUser
+        if (user != null) {
+            _authState.value = AuthState.Authenticated(user, user.email ?: "")
+            syncUserProfile(user)
+        } else {
+            _authState.value = AuthState.Guest(currentUid)
+        }
+
         auth.addAuthStateListener { firebaseAuth ->
-            val user = firebaseAuth.currentUser
-            if (user == null) {
-                // Automatically ensure guest session if not logged in
-                scope.launch {
-                    ensureGuestSignIn()
-                }
+            val u = firebaseAuth.currentUser
+            if (u != null) {
+                _authState.value = AuthState.Authenticated(u, u.email ?: "")
+                syncUserProfile(u)
             } else {
-                if (user.isAnonymous) {
-                    _authState.value = AuthState.Guest(user)
-                } else {
-                    _authState.value = AuthState.Authenticated(user, user.email ?: "")
-                }
-                syncUserProfile(user)
+                _authState.value = AuthState.Guest(currentUid)
             }
         }
     }
 
-    suspend fun ensureGuestSignIn(): Result<FirebaseUser> {
-        return try {
-            val existing = auth.currentUser
-            if (existing != null) {
-                return Result.success(existing)
-            }
-            val result = auth.signInAnonymously().await()
-            val user = result.user ?: throw IllegalStateException("Guest sign-in returned null user")
-            _authState.value = AuthState.Guest(user)
-            syncUserProfile(user)
-            AppAnalytics.getInstance(context).logEvent("sign_in_guest")
-            Result.success(user)
-        } catch (e: Exception) {
-            Log.e("AuthManager", "Guest sign in failed", e)
-            _authState.value = AuthState.Error(e.localizedMessage ?: "Guest login failed")
-            Result.failure(e)
+    /**
+     * Initializes or verifies the local guest session.
+     * Uses device-backed UUID identity without requiring anonymous auth tokens from Firebase.
+     */
+    fun ensureGuestSignIn(): Result<Unit> {
+        val user = auth.currentUser
+        if (user == null) {
+            _authState.value = AuthState.Guest(currentUid)
+        } else {
+            _authState.value = AuthState.Authenticated(user, user.email ?: "")
         }
+        return Result.success(Unit)
     }
 
     suspend fun registerWithEmail(email: String, pass: String): Result<FirebaseUser> {
         return try {
-            val currentUser = auth.currentUser
-            val result = if (currentUser != null && currentUser.isAnonymous) {
-                // Link current anonymous account to email/pass so watch history is preserved!
-                val credential = EmailAuthProvider.getCredential(email.trim(), pass)
-                currentUser.linkWithCredential(credential).await()
-            } else {
-                auth.createUserWithEmailAndPassword(email.trim(), pass).await()
-            }
+            val result = auth.createUserWithEmailAndPassword(email.trim(), pass).await()
             val user = result.user ?: throw IllegalStateException("Registration returned null user")
             _authState.value = AuthState.Authenticated(user, email.trim())
             syncUserProfile(user)
@@ -137,7 +126,7 @@ class AuthManager private constructor(private val context: Context) {
         scope.launch {
             try {
                 auth.signOut()
-                ensureGuestSignIn()
+                _authState.value = AuthState.Guest(currentUid)
             } catch (e: Exception) {
                 Log.e("AuthManager", "Sign out error", e)
             }
@@ -150,7 +139,7 @@ class AuthManager private constructor(private val context: Context) {
                 val instId = InstallationManager.getInstance(context).installationId
                 val data = hashMapOf<String, Any>(
                     "uid" to user.uid,
-                    "is_anonymous" to user.isAnonymous,
+                    "is_anonymous" to false,
                     "installation_id" to instId,
                     "last_login_at" to System.currentTimeMillis(),
                     "app_version" to "1.0",

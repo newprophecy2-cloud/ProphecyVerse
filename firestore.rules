@@ -20,9 +20,9 @@ service cloud.firestore {
       allow read, write: if isOwner(userId) || isAdmin();
     }
 
-    // Device installation registry
+    // Device installation registry: each device can register and heartbeat its installation
     match /installations/{installationId} {
-      allow read, write: if isAuthenticated();
+      allow read, write: if true;
     }
 
     // Watch history & continue watching per user / installation
@@ -43,9 +43,9 @@ service cloud.firestore {
       }
     }
 
-    // Client analytics events: authenticated users can write events
+    // Client analytics events: allows write without auth so install/open events can be recorded
     match /analytics_events/{eventId} {
-      allow create: if isAuthenticated();
+      allow create: if true;
       allow read: if isAdmin();
       allow update, delete: if false;
     }
