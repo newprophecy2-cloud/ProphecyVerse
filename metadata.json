@@ -1,0 +1,6 @@
+{
+  "name": "ProphecyVerse",
+  "description": "Anime discovery and direct streaming player with database-first architecture, AniList metadata, and Media3 ExoPlayer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
