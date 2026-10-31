@@ -142,7 +142,7 @@ data class WatchlistEntry(
     ]
 )
 data class PlaybackHistory(
-    @PrimaryKey val id: String, // "${animeId}_${episodeId}"
+    @PrimaryKey val id: String, // animeId (exactly one entry per series or movie)
     val animeId: String,
     val episodeId: String,
     val seasonNumber: Int,
@@ -188,12 +188,18 @@ data class DownloadEntry(
     val downloadUrl: String? = null,
     val mediaType: String? = null, // "anime", "movie", "kdrama", "series"
     val errorMessage: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
+    val quality: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
+    val audioLanguage: String? = null,
     val createdAt: Long = System.currentTimeMillis()
 ) {
     val isCompleted: Boolean get() = downloadStatus == "COMPLETED"
     val isDownloading: Boolean get() = downloadStatus == "DOWNLOADING"
     val isPaused: Boolean get() = downloadStatus == "PAUSED"
     val episodeId: String get() = id
+    val progressPercent: Int get() = if (totalBytes > 0L) ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
+    val formattedSpeed: String get() = "Active"
 }
 
 @Entity(tableName = "local_profiles")

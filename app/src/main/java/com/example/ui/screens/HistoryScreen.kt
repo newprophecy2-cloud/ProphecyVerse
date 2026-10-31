@@ -61,6 +61,7 @@ import java.util.Locale
 @Composable
 fun HistoryScreen(
     viewModel: LibraryViewModel,
+    onAnimeClick: (String) -> Unit = {},
     onPlayHistoryClick: (String, String) -> Unit
 ) {
     val history by viewModel.history.collectAsStateWithLifecycle()
@@ -114,7 +115,7 @@ fun HistoryScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
-                            .clickable { onPlayHistoryClick(item.animeId, item.episodeId) }
+                            .clickable { onAnimeClick(item.animeId) }
                             .testTag("history_card_${item.id}"),
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark)

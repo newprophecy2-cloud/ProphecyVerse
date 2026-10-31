@@ -117,6 +117,9 @@ class PlayerManager(
         _errorMessage.value = null
         _activeAudioDecoder.value = null
         _isPlaybackEnded.value = false
+        _isBuffering.value = true
+        _duration.value = 0L
+        _currentPosition.value = startPositionMs
 
         // Build safe HTTP DataSource with response-authorized headers
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -325,6 +328,17 @@ class PlayerManager(
         })
 
         player.addListener(object : Player.Listener {
+            override fun onEvents(player: Player, events: Player.Events) {
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
+                val pos = player.currentPosition
+                if (pos >= 0) {
+                    _currentPosition.value = pos
+                }
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
@@ -333,8 +347,13 @@ class PlayerManager(
                     Player.STATE_READY -> {
                         _isBuffering.value = false
                         val dur = player.duration
-                        _duration.value = if (dur > 0 && dur != C.TIME_UNSET) dur else 0L
+                        if (dur > 0 && dur != C.TIME_UNSET) {
+                            _duration.value = dur
+                        }
                         retryCount = 0
+                        if (!player.isPlaying && player.playWhenReady) {
+                            player.play()
+                        }
                     }
                     Player.STATE_ENDED -> {
                         _isBuffering.value = false
@@ -357,10 +376,18 @@ class PlayerManager(
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _isPlaying.value = isPlaying
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
             }
 
             override fun onTracksChanged(tracks: Tracks) {
                 extractTracks(tracks)
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -574,16 +601,30 @@ class PlayerManager(
     private fun startPositionTicker() {
         tickerJob?.cancel()
         tickerJob = scope.launch(Dispatchers.Main) {
+            var bufferingSeconds = 0
             while (isActive) {
                 exoPlayer?.let { player ->
-                    if (player.isPlaying) {
-                        val pos = player.currentPosition
-                        val dur = player.duration
+                    val dur = player.duration
+                    if (dur > 0 && dur != C.TIME_UNSET) {
+                        _duration.value = dur
+                    }
+                    val pos = player.currentPosition
+                    if (pos >= 0) {
                         _currentPosition.value = pos
-                        if (dur > 0 && dur != C.TIME_UNSET) {
-                            _duration.value = dur
-                        }
+                    }
+
+                    if (player.isPlaying) {
+                        bufferingSeconds = 0
                         onPositionUpdate?.invoke(pos, _duration.value)
+                    } else if (player.playbackState == Player.STATE_BUFFERING) {
+                        bufferingSeconds++
+                        // If buffering persists for 15s without playing, auto fallback to next source
+                        if (bufferingSeconds >= 15) {
+                            bufferingSeconds = 0
+                            Log.w(TAG, "Playback stalled in buffering state for 15s. Triggering fallback.")
+                            _errorMessage.value = "Playback link stalled. Trying alternative source..."
+                            onPlaybackFailedCallback?.invoke()
+                        }
                     }
                 }
                 delay(1000)

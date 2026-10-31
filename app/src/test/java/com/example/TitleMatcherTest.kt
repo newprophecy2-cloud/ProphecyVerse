@@ -98,7 +98,7 @@ class TitleMatcherTest {
         val onePieceLiveAction = ProphecySearchResultItem(
             id = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MzgvIiwicyI6MCwiZSI6MH0",
             title = "ONE PIECE",
-            mediaType = "live_action",
+            mediaType = "series", // Real provider returns "series", not "live_action"
             year = "2023",
             seasonCount = 2
         )
@@ -114,7 +114,7 @@ class TitleMatcherTest {
         val laConfidence = TitleMatcher.computeMatchConfidence(onePieceAnime, onePieceLiveAction)
         val animeConfidence = TitleMatcher.computeMatchConfidence(onePieceAnime, onePieceAnimeBackend)
 
-        assertEquals("Anime should not match Live action", 0f, laConfidence, 0.01f)
+        assertEquals("Anime should not match Live action even if mediaType is series", 0f, laConfidence, 0.01f)
         assertTrue("Anime should match Anime with high confidence (got $animeConfidence)", animeConfidence >= 0.85f)
     }
 }

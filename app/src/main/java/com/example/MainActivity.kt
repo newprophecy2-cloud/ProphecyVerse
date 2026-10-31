@@ -313,6 +313,9 @@ fun MainAppNav(
                 val libraryViewModel: LibraryViewModel = viewModel()
                 HistoryScreen(
                     viewModel = libraryViewModel,
+                    onAnimeClick = { animeId ->
+                        navController.navigate(Screen.Detail.createRoute(animeId))
+                    },
                     onPlayHistoryClick = { animeId, episodeId ->
                         navController.navigate(Screen.Player.createRoute(animeId, episodeId))
                     }

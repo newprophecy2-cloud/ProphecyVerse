@@ -13,6 +13,12 @@ import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
 import com.example.player.PlayerManager
+import com.example.player.PreResolveQueueManager
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import com.example.data.download.DownloadManager
+import com.example.data.local.DownloadEntry
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -62,7 +69,20 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
+    private val connectivityManager = application.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            viewModelScope.launch {
+                // When internet connectivity returns, automatically refresh feeds in background
+                repository.refreshHomeDiscovery(force = false)
+            }
+        }
+    }
+
     init {
+        try {
+            connectivityManager?.registerDefaultNetworkCallback(networkCallback)
+        } catch (_: Exception) {}
         refreshHome()
     }
 
@@ -70,16 +90,30 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         _selectedCategory.value = cat
     }
 
+    fun checkAndRefreshOnResume() {
+        viewModelScope.launch {
+            // Silently check for fresh content when returning to Home screen
+            repository.refreshHomeDiscovery(force = false)
+        }
+    }
+
     fun refreshHome() {
         viewModelScope.launch {
             _isRefreshing.value = true
             _errorMessage.value = null
-            val result = repository.refreshHomeDiscovery()
+            val result = repository.refreshHomeDiscovery(force = true)
             if (result.isFailure) {
                 _errorMessage.value = "Unable to fetch latest feeds. Showing cached catalog."
             }
             _isRefreshing.value = false
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            connectivityManager?.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {}
     }
 }
 
@@ -126,7 +160,7 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         searchDebounceJob = viewModelScope.launch {
-            delay(400) // 400ms debounce
+            delay(250) // Fast 250ms debounce
             _isSearching.value = true
             _error.value = null
             val res = repository.searchAnime(newQuery)
@@ -156,6 +190,9 @@ class DetailViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val seasons: StateFlow<List<SeasonEntry>> = repository.observeSeasons(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val allEpisodes: StateFlow<List<EpisodeEntry>> = repository.observeAllEpisodes(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selectedSeason = MutableStateFlow(1)
@@ -189,11 +226,23 @@ class DetailViewModel(
 
     init {
         viewModelScope.launch {
-            seasons.collect { sList ->
-                if (sList.isNotEmpty() && sList.none { it.seasonNumber == _selectedSeason.value }) {
-                    _selectedSeason.value = sList.first().seasonNumber
+            combine(seasons, allEpisodes) { sList, epList -> sList to epList }
+                .collect { (sList, epList) ->
+                    if (sList.isNotEmpty()) {
+                        val currentHasEpisodes = epList.any { it.seasonNumber == _selectedSeason.value }
+                        if (!currentHasEpisodes && epList.isNotEmpty()) {
+                            // Find the first season that actually has episodes (e.g. One Piece Season 22)
+                            val seasonWithEps = epList.firstOrNull()?.seasonNumber
+                            if (seasonWithEps != null && sList.any { it.seasonNumber == seasonWithEps }) {
+                                _selectedSeason.value = seasonWithEps
+                            } else {
+                                _selectedSeason.value = sList.first().seasonNumber
+                            }
+                        } else if (sList.none { it.seasonNumber == _selectedSeason.value }) {
+                            _selectedSeason.value = sList.first().seasonNumber
+                        }
+                    }
                 }
-            }
         }
         refreshDetails()
     }
@@ -280,6 +329,7 @@ class PlayerViewModel(
 ) : AndroidViewModel(application) {
     private val repository = AnimeRepository(AppDatabase.getInstance(application))
     val playerManager = PlayerManager(application, viewModelScope)
+    val preResolveManager = PreResolveQueueManager(repository, viewModelScope)
 
     val animeEntry: StateFlow<AnimeEntry?> = repository.observeAnimeById(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
@@ -289,6 +339,9 @@ class PlayerViewModel(
 
     val seasons: StateFlow<List<SeasonEntry>> = repository.observeSeasons(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val preResolveQueueStatus: StateFlow<Map<String, PreResolveQueueManager.ResolutionStatus>> =
+        preResolveManager.queueStatus
 
     private val _selectedSeason = MutableStateFlow(1)
     val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
@@ -323,6 +376,34 @@ class PlayerViewModel(
     private val _activeSource = MutableStateFlow<ProphecySourceDto?>(null)
     val activeSource: StateFlow<ProphecySourceDto?> = _activeSource.asStateFlow()
 
+    // Download integration
+    val downloadManager = DownloadManager.getInstance(application)
+
+    val currentDownload: StateFlow<DownloadEntry?> = _currentEpisode.flatMapLatest { ep ->
+        if (ep == null) flowOf(null) else downloadManager.observeDownload(ep.id)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val animeDownloads: StateFlow<List<DownloadEntry>> = downloadManager.observeDownloadsForAnime(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val storageStats: StateFlow<DownloadManager.StorageStats> = downloadManager.storageStats
+
+    val liveProgressMap: StateFlow<Map<String, DownloadManager.LiveProgress>> = downloadManager.liveProgressMap
+
+    // Available qualities from actual sources (never fabricated)
+    val availableDownloadQualities: StateFlow<List<String>> = _availableSources.combine(playerManager.availableQualities) { sources, qualities ->
+        val fromSources = sources.mapNotNull { it.quality?.trim() }.filter { it.isNotBlank() }
+        val fromPlayer = qualities.map { it.label.substringBefore('(').trim() }.filter { it.isNotBlank() && !it.contains("Auto", ignoreCase = true) }
+        (fromSources + fromPlayer).distinct()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Available audio languages from actual sources (never fabricated)
+    val availableDownloadLanguages: StateFlow<List<String>> = _availableSources.combine(playerManager.availableAudioTracks) { sources, audioTracks ->
+        val fromSources = sources.mapNotNull { it.language?.trim() }.filter { it.isNotBlank() }
+        val fromPlayer = audioTracks.map { it.label.substringBefore('(').trim() }.filter { it.isNotBlank() && !it.contains("Default", ignoreCase = true) }
+        (fromSources + fromPlayer).distinct()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     // In-memory active direct playback data
     private var activeDirectData: DirectPlayData? = null
     private var activeSourceId: String? = null
@@ -330,6 +411,10 @@ class PlayerViewModel(
     private var currentCandidateIndex: Int = 0
 
     init {
+        playerManager.onPlaybackEndedCallback = {
+            flushProgress()
+        }
+
         viewModelScope.launch {
             // Find episode or wait for database
             repository.observeAllEpisodes(animeId).collect { epList ->
@@ -454,6 +539,44 @@ class PlayerViewModel(
                 return@launch
             }
 
+            // 3. Fast-Path: Check 17-episode pre-resolve cache for instant start (< 25m TTL)
+            if (preferredSourceId == null) {
+                val prepared = preResolveManager.getPreparedSource(episode.id)
+                if (prepared != null) {
+                    _activeSource.value = prepared.source
+                    _availableSources.value = listOf(prepared.source)
+                    activeDirectData = prepared.directData
+                    activeSourceId = prepared.source.id
+                    _isResolving.value = false
+
+                    val lastSavedPos = try {
+                        db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { 0L }
+
+                    playerManager.initializePlayer(
+                        directData = prepared.directData,
+                        startPositionMs = lastSavedPos,
+                        onPlaybackFailed = {
+                            viewModelScope.launch {
+                                _isResolving.value = true
+                                val freshSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                resolveWithFallback(backendId, episode, freshSources, 0)
+                            }
+                        },
+                        onRetryNeeded = {
+                            viewModelScope.launch {
+                                val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                resolveWithFallback(backendId, episode, refreshedSources, 0)
+                            }
+                        }
+                    )
+
+                    // Slide pre-resolve queue forward for next 17 episodes
+                    preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
+                    return@launch
+                }
+            }
+
             // Route D: Get sources for the selected episode
             val sourcesRes = repository.fetchEpisodeSources(backendId, episode.id)
             if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
@@ -517,12 +640,17 @@ class PlayerViewModel(
                     },
                     onRetryNeeded = {
                         viewModelScope.launch {
+                            // Link expired (e.g. Google UserContent signed URL expiration):
+                            // Request fresh sources and resolve afresh
                             val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
                             val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
                             resolveWithFallback(backendId, episode, newCandidates, 0)
                         }
                     }
                 )
+
+                // Trigger 17-episode sliding queue in background
+                preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
                 return
             } else {
                 lastError = playRes.exceptionOrNull()?.message
@@ -543,8 +671,138 @@ class PlayerViewModel(
         startPlaybackForEpisode(next)
     }
 
+    fun startDownload(preferredQuality: String? = null, preferredLanguage: String? = null) {
+        val ep = _currentEpisode.value ?: return
+        val anime = animeEntry.value ?: return
+        downloadManager.startOrResumeDownload(
+            animeId = animeId,
+            episodeId = ep.id,
+            seasonNumber = ep.seasonNumber,
+            episodeNumber = ep.episodeNumber,
+            episodeTitle = ep.title,
+            animeTitle = anime.preferredTitle,
+            posterUrl = anime.posterUrl,
+            mediaType = anime.format ?: "anime",
+            preferredQuality = preferredQuality,
+            preferredLanguage = preferredLanguage,
+            preferredSourceId = activeSourceId
+        )
+    }
+
+    fun pauseDownload() {
+        _currentEpisode.value?.let { downloadManager.pauseDownload(it.id) }
+    }
+
+    fun resumeDownload() {
+        startDownload()
+    }
+
+    fun retryDownload() {
+        startDownload()
+    }
+
+    fun cancelDownload() {
+        _currentEpisode.value?.let { downloadManager.cancelDownload(it.id) }
+    }
+
+    fun deleteDownload() {
+        _currentEpisode.value?.let { downloadManager.deleteDownloadedFile(it.id) }
+    }
+
+    fun startBatchDownload(
+        episodes: List<EpisodeEntry>,
+        preferredQuality: String? = null,
+        preferredLanguage: String? = null
+    ) {
+        val anime = animeEntry.value ?: return
+        for (ep in episodes) {
+            downloadManager.startOrResumeDownload(
+                animeId = animeId,
+                episodeId = ep.id,
+                seasonNumber = ep.seasonNumber,
+                episodeNumber = ep.episodeNumber,
+                episodeTitle = ep.title,
+                animeTitle = anime.preferredTitle,
+                posterUrl = anime.posterUrl,
+                mediaType = anime.format ?: "anime",
+                preferredQuality = preferredQuality,
+                preferredLanguage = preferredLanguage,
+                preferredSourceId = if (ep.id == _currentEpisode.value?.id) activeSourceId else null
+            )
+        }
+    }
+
+    fun pauseDownloadForEpisode(episodeId: String) {
+        downloadManager.pauseDownload(episodeId)
+    }
+
+    fun resumeDownloadForEpisode(episodeId: String, preferredQuality: String? = null, preferredLanguage: String? = null) {
+        val ep = allEpisodes.value.firstOrNull { it.id == episodeId } ?: _currentEpisode.value ?: return
+        val anime = animeEntry.value ?: return
+        downloadManager.startOrResumeDownload(
+            animeId = animeId,
+            episodeId = ep.id,
+            seasonNumber = ep.seasonNumber,
+            episodeNumber = ep.episodeNumber,
+            episodeTitle = ep.title,
+            animeTitle = anime.preferredTitle,
+            posterUrl = anime.posterUrl,
+            mediaType = anime.format ?: "anime",
+            preferredQuality = preferredQuality,
+            preferredLanguage = preferredLanguage
+        )
+    }
+
+    fun cancelDownloadForEpisode(episodeId: String) {
+        downloadManager.cancelDownload(episodeId)
+    }
+
+    fun deleteDownloadForEpisode(episodeId: String) {
+        downloadManager.deleteDownloadedFile(episodeId)
+    }
+
+    fun pauseAllDownloads() {
+        val active = animeDownloads.value.filter { it.downloadStatus == "DOWNLOADING" }
+        for (d in active) {
+            downloadManager.pauseDownload(d.id)
+        }
+    }
+
+    fun resumeAllDownloads() {
+        val paused = animeDownloads.value.filter { it.downloadStatus == "PAUSED" }
+        for (d in paused) {
+            resumeDownloadForEpisode(d.id, d.quality, d.audioLanguage)
+        }
+    }
+
+    fun flushProgress() {
+        val ep = _currentEpisode.value ?: return
+        val posMs = playerManager.currentPosition.value
+        val durMs = playerManager.duration.value
+        if (posMs > 0L && durMs > 0L) {
+            viewModelScope.launch {
+                val isCompleted = posMs >= (durMs * 0.9)
+                val anime = animeEntry.value
+                repository.updatePlaybackProgress(
+                    animeId = animeId,
+                    episodeId = ep.id,
+                    seasonNumber = ep.seasonNumber,
+                    episodeNumber = ep.episodeNumber,
+                    episodeTitle = ep.title,
+                    positionMs = posMs,
+                    durationMs = durMs,
+                    animeTitle = anime?.preferredTitle ?: anime?.titleEnglish,
+                    posterUrl = anime?.posterUrl,
+                    mediaType = anime?.format ?: "ANIME"
+                )
+            }
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
+        flushProgress()
+        preResolveManager.clear()
         playerManager.release()
     }
 }

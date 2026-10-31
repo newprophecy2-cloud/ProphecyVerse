@@ -20,14 +20,27 @@ object TitleMatcher {
             .lowercase(Locale.ROOT)
     }
 
+    const val ONE_PIECE_ANILIST_ID = 21
+    const val ONE_PIECE_ANIME_BACKEND_ID = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MjUzLyIsInMiOjAsImUiOjB9"
+    const val ONE_PIECE_LIVE_ACTION_BACKEND_ID = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MzgvIiwicyI6MCwiZSI6MH0"
+
     /**
-     * Determines whether a title or mediaType denotes a Live Action production.
+     * Determines whether a title, mediaType, or year denotes a Live Action production.
      */
-    fun isLiveAction(title: String?, mediaType: String?): Boolean {
+    fun isLiveAction(
+        title: String?,
+        mediaType: String?,
+        year: String? = null,
+        seasonCount: Int? = null
+    ): Boolean {
         val normTitle = normalize(title)
         val normMedia = mediaType?.lowercase(Locale.ROOT) ?: ""
         if (normMedia == "live_action" || normMedia == "live action") return true
         if (normTitle.contains("live action") || normTitle.contains("liveaction")) return true
+        // Specifically detect 2023 Netflix One Piece Live Action series
+        if (normTitle == "one piece" && (year == "2023" || (seasonCount != null && seasonCount in 1..2 && year != "1999"))) {
+            return true
+        }
         return false
     }
 
@@ -39,14 +52,33 @@ object TitleMatcher {
         aniListMedia: AniListMedia,
         prophecyItem: ProphecySearchResultItem
     ): Float {
+        // 1. Guaranteed stable identifier check for One Piece anime
+        if (aniListMedia.id == ONE_PIECE_ANILIST_ID) {
+            if (prophecyItem.id == ONE_PIECE_ANIME_BACKEND_ID) {
+                return 1.0f
+            }
+            if (prophecyItem.id == ONE_PIECE_LIVE_ACTION_BACKEND_ID || prophecyItem.year == "2023") {
+                return 0f
+            }
+            if (normalize(prophecyItem.title) == "one piece" && (prophecyItem.year == "1999" || (prophecyItem.seasonCount ?: 0) > 2)) {
+                return 1.0f
+            }
+        }
+
         val normProphecy = normalize(prophecyItem.title)
         if (normProphecy.isBlank()) return 0f
 
         val aniIsLiveAction = isLiveAction(
-            aniListMedia.title?.english ?: aniListMedia.title?.romaji,
-            aniListMedia.format
+            title = aniListMedia.title?.english ?: aniListMedia.title?.romaji,
+            mediaType = aniListMedia.format,
+            year = (aniListMedia.startDate?.year ?: aniListMedia.seasonYear)?.toString()
         )
-        val prophecyIsLiveAction = isLiveAction(prophecyItem.title, prophecyItem.mediaType)
+        val prophecyIsLiveAction = isLiveAction(
+            title = prophecyItem.title,
+            mediaType = prophecyItem.mediaType,
+            year = prophecyItem.year,
+            seasonCount = prophecyItem.seasonCount
+        )
 
         // Anime and Live Action must be treated as different media entities!
         // Never substitute an Anime for Live Action or vice versa.
@@ -97,8 +129,9 @@ object TitleMatcher {
             }
         }
 
-        // Season count check: if candidate has 1-2 seasons but AniList is a 100+ episode long-runner (e.g. One Piece anime with 1000+ episodes vs 8-episode LA series)
-        val episodes = aniListMedia.episodes ?: 0
+        // Season count check: if candidate has 1-2 seasons but AniList is a long-runner or releasing anime
+        val isOngoing = aniListMedia.status.equals("RELEASING", ignoreCase = true)
+        val episodes = aniListMedia.episodes ?: if (isOngoing) 1000 else 0
         val seasons = prophecyItem.seasonCount ?: 0
         if (episodes > 100 && seasons in 1..2 && (prophecyYear != null && aniYear != null && kotlin.math.abs(aniYear - prophecyYear) > 3)) {
             maxSimilarity = (maxSimilarity - 0.50f).coerceAtLeast(0f)
@@ -114,11 +147,32 @@ object TitleMatcher {
         entry: com.example.data.local.AnimeEntry,
         prophecyItem: ProphecySearchResultItem
     ): Float {
+        // 1. Guaranteed stable identifier check for One Piece
+        if (entry.aniListId == ONE_PIECE_ANILIST_ID || normalize(entry.preferredTitle) == "one piece") {
+            val isEntryLiveAction = isLiveAction(entry.preferredTitle, entry.format, entry.year)
+            if (!isEntryLiveAction) {
+                if (prophecyItem.id == ONE_PIECE_ANIME_BACKEND_ID) {
+                    return 1.0f
+                }
+                if (prophecyItem.id == ONE_PIECE_LIVE_ACTION_BACKEND_ID || prophecyItem.year == "2023") {
+                    return 0f
+                }
+                if (normalize(prophecyItem.title) == "one piece" && (prophecyItem.year == "1999" || (prophecyItem.seasonCount ?: 0) > 2)) {
+                    return 1.0f
+                }
+            }
+        }
+
         val normProphecy = normalize(prophecyItem.title)
         if (normProphecy.isBlank()) return 0f
 
-        val entryIsLiveAction = isLiveAction(entry.preferredTitle, entry.format)
-        val prophecyIsLiveAction = isLiveAction(prophecyItem.title, prophecyItem.mediaType)
+        val entryIsLiveAction = isLiveAction(entry.preferredTitle, entry.format, entry.year)
+        val prophecyIsLiveAction = isLiveAction(
+            title = prophecyItem.title,
+            mediaType = prophecyItem.mediaType,
+            year = prophecyItem.year,
+            seasonCount = prophecyItem.seasonCount
+        )
 
         if (entryIsLiveAction != prophecyIsLiveAction) {
             return 0f
@@ -163,7 +217,8 @@ object TitleMatcher {
             }
         }
 
-        val epCount = entry.episodeCount ?: 0
+        val isReleasing = entry.status.equals("RELEASING", ignoreCase = true)
+        val epCount = entry.episodeCount ?: if (isReleasing) 1000 else 0
         val seasons = prophecyItem.seasonCount ?: 0
         if (epCount > 100 && seasons in 1..2 && (prophecyYear != null && entryYear != null && kotlin.math.abs(entryYear - prophecyYear) > 3)) {
             maxSimilarity = (maxSimilarity - 0.50f).coerceAtLeast(0f)

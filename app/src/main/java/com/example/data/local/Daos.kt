@@ -203,6 +203,9 @@ interface PlaybackHistoryDao {
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId AND episodeId = :episodeId LIMIT 1")
     suspend fun getHistoryForEpisode(animeId: String, episodeId: String): PlaybackHistory?
 
+    @Query("SELECT * FROM playback_history WHERE animeId = :animeId LIMIT 1")
+    suspend fun getHistoryForAnime(animeId: String): PlaybackHistory?
+
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId ORDER BY lastPlayedAt DESC LIMIT 1")
     fun observeLastPlayedForAnime(animeId: String): Flow<PlaybackHistory?>
 

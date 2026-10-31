@@ -406,6 +406,82 @@ fun DetailScreen(
 
                 // Seasons & Episodes Section
                 if (item.isPlayable) {
+                    // Dedicated Continue Watching Card when lastPlayed is available
+                    if (lastPlayed != null) {
+                        item {
+                            Card(
+                                shape = RoundedCornerShape(12.dp),
+                                colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, AccentIndigo),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                                    .clickable { onPlayEpisode(item.id, lastPlayed!!.episodeId) }
+                                    .testTag("detail_resume_card")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Continue Watching",
+                                            color = AccentCyan,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = "Season ${lastPlayed!!.seasonNumber} • Episode ${lastPlayed!!.episodeNumber}${if (!lastPlayed!!.episodeTitle.isNullOrBlank()) ": ${lastPlayed!!.episodeTitle}" else ""}",
+                                            color = TextPrimary,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        val progress = if (lastPlayed!!.durationMs > 0) {
+                                            (lastPlayed!!.positionMs.toFloat() / lastPlayed!!.durationMs.toFloat()).coerceIn(0f, 1f)
+                                        } else 0f
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(4.dp)
+                                                .clip(RoundedCornerShape(2.dp))
+                                                .background(SurfaceHighlight)
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth(progress)
+                                                    .height(4.dp)
+                                                    .background(PlayableGreen)
+                                            )
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Button(
+                                        onClick = { onPlayEpisode(item.id, lastPlayed!!.episodeId) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = PlayableGreen),
+                                        shape = RoundedCornerShape(8.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.PlayArrow,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Resume", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     item {
                         Text(
                             text = "Episodes",
@@ -416,8 +492,8 @@ fun DetailScreen(
                         )
                     }
 
-                    // Season Chips if multiple seasons
-                    if (seasons.size > 1) {
+                    // Season Chips (always visible when seasons exist, e.g. Season 22 for One Piece)
+                    if (seasons.isNotEmpty()) {
                         item {
                             LazyRow(
                                 contentPadding = PaddingValues(horizontal = 16.dp),

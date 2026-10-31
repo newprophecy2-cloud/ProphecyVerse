@@ -49,6 +49,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.data.local.AnimeEntry
@@ -74,6 +77,12 @@ fun HomeScreen(
     onAnimeClick: (String) -> Unit,
     onPlayHistoryClick: (String, String) -> Unit
 ) {
+    val listState = rememberLazyListState()
+
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        viewModel.checkAndRefreshOnResume()
+    }
+
     val trending by viewModel.trending.collectAsStateWithLifecycle()
     val seasonal by viewModel.seasonal.collectAsStateWithLifecycle()
     val popular by viewModel.popular.collectAsStateWithLifecycle()
@@ -102,6 +111,7 @@ fun HomeScreen(
     }
 
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .background(SpaceDark)

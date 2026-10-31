@@ -333,7 +333,7 @@ fun DownloadedItemCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onPlayClick)
+            .clickable(onClick = onMediaPageClick)
             .testTag("downloaded_card_${item.id}"),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark)

@@ -22,7 +22,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DownloadEntry::class,
         LocalProfile::class
     ],
-    version = 2,
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -80,6 +80,56 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Safely migrate playback_history to have exactly 1 record per anime/movie (id = animeId)
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `playback_history_new` (
+                        `id` TEXT NOT NULL,
+                        `animeId` TEXT NOT NULL,
+                        `episodeId` TEXT NOT NULL,
+                        `seasonNumber` INTEGER NOT NULL,
+                        `episodeNumber` INTEGER NOT NULL,
+                        `episodeTitle` TEXT,
+                        `positionMs` INTEGER NOT NULL,
+                        `durationMs` INTEGER NOT NULL,
+                        `completed` INTEGER NOT NULL,
+                        `animeTitle` TEXT,
+                        `posterUrl` TEXT,
+                        `mediaType` TEXT,
+                        `lastPlayedAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                """.trimIndent())
+
+                // Deduplicate: preserve the latest watched episode per animeId
+                db.execSQL("""
+                    INSERT OR REPLACE INTO `playback_history_new`
+                    SELECT h.animeId AS id, h.animeId, h.episodeId, h.seasonNumber, h.episodeNumber,
+                           h.episodeTitle, h.positionMs, h.durationMs, h.completed, h.animeTitle,
+                           h.posterUrl, h.mediaType, h.lastPlayedAt
+                    FROM `playback_history` h
+                    INNER JOIN (
+                        SELECT animeId, MAX(lastPlayedAt) AS maxPlayedAt
+                        FROM `playback_history`
+                        GROUP BY animeId
+                    ) latest ON h.animeId = latest.animeId AND h.lastPlayedAt = latest.maxPlayedAt
+                """.trimIndent())
+
+                db.execSQL("DROP TABLE IF EXISTS `playback_history`")
+                db.execSQL("ALTER TABLE `playback_history_new` RENAME TO `playback_history`")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_playback_history_animeId` ON `playback_history` (`animeId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_playback_history_lastPlayedAt` ON `playback_history` (`lastPlayedAt`)")
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `download_entries` ADD COLUMN `quality` TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE `download_entries` ADD COLUMN `audioLanguage` TEXT DEFAULT NULL")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -87,7 +137,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "prophecyverse.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                 INSTANCE = instance
                 instance

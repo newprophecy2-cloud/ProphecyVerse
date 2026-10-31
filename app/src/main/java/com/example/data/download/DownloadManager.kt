@@ -65,6 +65,8 @@ class DownloadManager private constructor(private val context: Context) {
     fun observeCompletedDownloads(): Flow<List<DownloadEntry>> = downloadDao.observeCompletedDownloads()
     fun observeActiveDownloads(): Flow<List<DownloadEntry>> = downloadDao.observeActiveDownloads()
     fun observeDownloadsForAnime(animeId: String): Flow<List<DownloadEntry>> = downloadDao.observeDownloadsForAnime(animeId)
+    fun observeDownload(episodeId: String): Flow<DownloadEntry?> = downloadDao.observeDownload(episodeId)
+    suspend fun getDownload(episodeId: String): DownloadEntry? = downloadDao.getDownload(episodeId)
 
     /**
      * Resolves the media stream and begins an app-private background download.
@@ -77,7 +79,10 @@ class DownloadManager private constructor(private val context: Context) {
         episodeTitle: String?,
         animeTitle: String,
         posterUrl: String?,
-        mediaType: String? = "anime"
+        mediaType: String? = "anime",
+        preferredQuality: String? = null,
+        preferredLanguage: String? = null,
+        preferredSourceId: String? = null
     ) {
         if (activeJobs.containsKey(episodeId)) {
             Log.d(TAG, "Download already active for episode: $episodeId")
@@ -100,11 +105,18 @@ class DownloadManager private constructor(private val context: Context) {
                         downloadedBytes = 0L,
                         totalBytes = 0L,
                         mediaType = mediaType,
+                        quality = preferredQuality,
+                        audioLanguage = preferredLanguage,
                         createdAt = System.currentTimeMillis()
                     )
                     downloadDao.upsertDownload(existing)
                 } else {
-                    existing = existing.copy(downloadStatus = "DOWNLOADING", errorMessage = null)
+                    existing = existing.copy(
+                        downloadStatus = "DOWNLOADING",
+                        errorMessage = null,
+                        quality = preferredQuality ?: existing.quality,
+                        audioLanguage = preferredLanguage ?: existing.audioLanguage
+                    )
                     downloadDao.upsertDownload(existing)
                 }
 
@@ -141,7 +153,18 @@ class DownloadManager private constructor(private val context: Context) {
 
                     val sourcesRes = repository.fetchEpisodeSources(backendId, episodeId)
                     val sources = sourcesRes.getOrNull()
-                    val source = sources?.firstOrNull { it.downloadable == true } ?: sources?.firstOrNull()
+                    val source = if (!preferredSourceId.isNullOrBlank()) {
+                        sources?.firstOrNull { it.id == preferredSourceId }
+                    } else if (!preferredQuality.isNullOrBlank() || !preferredLanguage.isNullOrBlank()) {
+                        sources?.firstOrNull { s ->
+                            (preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true) &&
+                            (preferredLanguage.isNullOrBlank() || s.language?.contains(preferredLanguage, ignoreCase = true) == true)
+                        } ?: sources?.firstOrNull { s ->
+                            preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true
+                        } ?: sources?.firstOrNull { it.downloadable == true } ?: sources?.firstOrNull()
+                    } else {
+                        sources?.firstOrNull { it.downloadable == true } ?: sources?.firstOrNull()
+                    }
 
                     if (source == null) {
                         downloadDao.upsertDownload(
@@ -167,7 +190,23 @@ class DownloadManager private constructor(private val context: Context) {
 
                     directUrl = playData.playbackUrl
                     headers = playData.headers
-                    downloadDao.upsertDownload(existing.copy(downloadUrl = directUrl))
+                    existing = existing.copy(
+                        downloadUrl = directUrl,
+                        quality = existing.quality ?: source.quality,
+                        audioLanguage = existing.audioLanguage ?: source.language
+                    )
+                    downloadDao.upsertDownload(existing)
+                }
+
+                val targetUrl = directUrl
+                if (targetUrl.isNullOrBlank()) {
+                    downloadDao.upsertDownload(
+                        existing.copy(
+                            downloadStatus = "FAILED",
+                            errorMessage = "No valid download URL available"
+                        )
+                    )
+                    return@launch
                 }
 
                 // App-private target file (guaranteed not in Gallery)
@@ -177,7 +216,7 @@ class DownloadManager private constructor(private val context: Context) {
 
                 executeDownloadLoop(
                     episodeId = episodeId,
-                    url = directUrl,
+                    url = targetUrl,
                     headers = headers,
                     tempFile = tempFile,
                     finalFile = finalFile,

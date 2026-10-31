@@ -48,19 +48,47 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Settings
+import android.content.Context
+import android.media.AudioManager
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.material.icons.filled.BrightnessMedium
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Tune
+import android.text.format.Formatter
+import com.example.data.local.DownloadEntry
+import com.example.data.download.DownloadManager
+import com.example.player.PreResolveQueueManager
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.TabRowDefaults
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -147,6 +175,18 @@ fun PlayerScreen(
     val suggestions by viewModel.suggestions.collectAsStateWithLifecycle()
     val nextEpisode by viewModel.nextEpisode.collectAsStateWithLifecycle()
 
+    // Download state below player
+    val currentDownload by viewModel.currentDownload.collectAsStateWithLifecycle()
+    val availableDownloadQualities by viewModel.availableDownloadQualities.collectAsStateWithLifecycle()
+    val availableDownloadLanguages by viewModel.availableDownloadLanguages.collectAsStateWithLifecycle()
+    val animeDownloads by viewModel.animeDownloads.collectAsStateWithLifecycle()
+    val liveProgressMap by viewModel.liveProgressMap.collectAsStateWithLifecycle()
+    val storageStats by viewModel.storageStats.collectAsStateWithLifecycle()
+    val allEpisodes by viewModel.allEpisodes.collectAsStateWithLifecycle()
+
+    var showDownloadManagementSheet by remember { mutableStateOf(false) }
+    var downloadSheetInitialTab by remember { mutableIntStateOf(0) }
+
     var areControlsVisible by remember { mutableStateOf(true) }
     var isControlsLocked by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
@@ -154,6 +194,100 @@ fun PlayerScreen(
     var activeSettingsTab by remember { mutableStateOf(0) } // 0: Sources, 1: Audio, 2: Subtitles, 3: Quality, 4: Speed
     var userIsSeeking by remember { mutableStateOf(false) }
     var seekSliderPos by remember { mutableStateOf(0f) }
+
+    val preResolveStatus by viewModel.preResolveQueueStatus.collectAsStateWithLifecycle()
+    var showTechInfoDialog by remember { mutableStateOf(false) }
+
+    val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
+    val activity = context as? Activity
+    val window = activity?.window
+
+    var brightnessLevel by remember { mutableStateOf<Float?>(null) }
+    var showBrightnessHud by remember { mutableStateOf(false) }
+
+    var volumeLevel by remember { mutableStateOf<Int?>(null) }
+    var maxVolume by remember {
+        mutableStateOf(audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15)
+    }
+    var showVolumeHud by remember { mutableStateOf(false) }
+
+    var seekFeedbackText by remember { mutableStateOf<String?>(null) }
+    var isSeekForward by remember { mutableStateOf(true) }
+    var showSeekFeedback by remember { mutableStateOf(false) }
+
+    // Restore window brightness on exit
+    DisposableEffect(Unit) {
+        val originalBrightness = window?.attributes?.screenBrightness ?: -1f
+        onDispose {
+            window?.let { w ->
+                val lp = w.attributes
+                lp.screenBrightness = originalBrightness
+                w.attributes = lp
+            }
+        }
+    }
+
+    LaunchedEffect(showBrightnessHud) {
+        if (showBrightnessHud) {
+            delay(1500)
+            showBrightnessHud = false
+        }
+    }
+
+    LaunchedEffect(showVolumeHud) {
+        if (showVolumeHud) {
+            delay(1500)
+            showVolumeHud = false
+        }
+    }
+
+    LaunchedEffect(showSeekFeedback) {
+        if (showSeekFeedback) {
+            delay(1200)
+            showSeekFeedback = false
+        }
+    }
+
+    val onBrightnessChange: (Float) -> Unit = { delta ->
+        window?.let { w ->
+            val lp = w.attributes
+            val cur = if (lp.screenBrightness < 0f) 0.5f else lp.screenBrightness
+            val next = (cur + delta / 800f).coerceIn(0.01f, 1.0f)
+            lp.screenBrightness = next
+            w.attributes = lp
+            brightnessLevel = next
+            showBrightnessHud = true
+        }
+    }
+
+    val onVolumeChange: (Float) -> Unit = { delta ->
+        audioManager?.let { am ->
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            maxVolume = max
+            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val step = if (delta > 0) 1 else -1
+            val next = (cur + step).coerceIn(0, max)
+            if (next != cur) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, next, 0)
+            }
+            volumeLevel = next
+            showVolumeHud = true
+        }
+    }
+
+    val onDoubleTapLeft = {
+        viewModel.playerManager.seekBy(-10000)
+        seekFeedbackText = "-10s"
+        isSeekForward = false
+        showSeekFeedback = true
+    }
+
+    val onDoubleTapRight = {
+        viewModel.playerManager.seekBy(10000)
+        seekFeedbackText = "+10s"
+        isSeekForward = true
+        showSeekFeedback = true
+    }
 
     // Intercept back button when in fullscreen
     BackHandler(enabled = isFullscreen) {
@@ -213,11 +347,13 @@ fun PlayerScreen(
                     if (!inPip) {
                         viewModel.playerManager.pause()
                     }
+                    viewModel.flushProgress()
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
                     if (!inPip) {
                         viewModel.playerManager.pause()
                     }
+                    viewModel.flushProgress()
                 }
                 else -> {}
             }
@@ -225,6 +361,7 @@ fun PlayerScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.flushProgress()
             viewModel.playerManager.release()
         }
     }
@@ -237,18 +374,21 @@ fun PlayerScreen(
                 .fillMaxSize()
                 .background(Color.Black)
                 .testTag("player_screen_fullscreen")
-                .then(
-                    if (!isInPipMode) {
-                        Modifier.clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null
-                        ) {
-                            areControlsVisible = !areControlsVisible
-                        }
-                    } else Modifier
-                )
         ) {
             VideoSurface(playerInstance = playerInstance)
+
+            if (!isInPipMode) {
+                PlayerGestureLayer(
+                    modifier = Modifier.fillMaxSize(),
+                    isLocked = isControlsLocked,
+                    onSingleTap = { areControlsVisible = !areControlsVisible },
+                    onDoubleTapLeft = onDoubleTapLeft,
+                    onDoubleTapRight = onDoubleTapRight,
+                    onBrightnessChange = onBrightnessChange,
+                    onVolumeChange = onVolumeChange,
+                    onGestureEnd = {}
+                )
+            }
 
             LoadingAndBufferingOverlay(
                 isResolving = isResolving,
@@ -276,6 +416,34 @@ fun PlayerScreen(
                         viewModel.playerManager.seekTo(0L)
                         viewModel.playerManager.play()
                     }
+                )
+            }
+
+            // HUD Indicators (Brightness, Volume, Seek Feedback)
+            if (showBrightnessHud && !isInPipMode) {
+                val pct = ((brightnessLevel ?: 0.5f) * 100).toInt()
+                BrightnessHudIndicator(
+                    percentage = pct,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            if (showVolumeHud && !isInPipMode) {
+                val cur = volumeLevel ?: audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: 0
+                val pct = if (maxVolume > 0) (cur * 100 / maxVolume) else 0
+                VolumeHudIndicator(
+                    percentage = pct,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            if (showSeekFeedback && !isInPipMode) {
+                SeekFeedbackHUD(
+                    text = seekFeedbackText ?: "",
+                    isForward = isSeekForward,
+                    modifier = Modifier
+                        .align(if (isSeekForward) Alignment.CenterEnd else Alignment.CenterStart)
+                        .padding(horizontal = 48.dp)
                 )
             }
 
@@ -319,7 +487,12 @@ fun PlayerScreen(
                     activeSettingsTab = if (availableSources.size > 1) 0 else if (audioTracks.size > 1) 1 else 3
                     showTrackSettingsDialog = true
                 },
-                onEnterPip = onEnterPip
+                onOpenTechInfo = { showTechInfoDialog = true },
+                onEnterPip = onEnterPip,
+                onOpenDownloadSheet = {
+                    downloadSheetInitialTab = 0
+                    showDownloadManagementSheet = true
+                }
             )
 
             if (!isInPipMode && showTrackSettingsDialog) {
@@ -340,6 +513,17 @@ fun PlayerScreen(
                     onSetSpeed = { viewModel.playerManager.setSpeed(it) }
                 )
             }
+
+            if (!isInPipMode && showTechInfoDialog) {
+                TechInfoDialog(
+                    anime = anime,
+                    currentEpisode = currentEpisode,
+                    player = playerInstance,
+                    activeSource = activeSource,
+                    activeAudioDecoder = viewModel.playerManager.activeAudioDecoder.collectAsStateWithLifecycle().value,
+                    onDismiss = { showTechInfoDialog = false }
+                )
+            }
         }
     } else {
         // Portrait Mode: Top 16:9 Video Player + Scrollable Content
@@ -357,18 +541,21 @@ fun PlayerScreen(
                     .fillMaxWidth()
                     .aspectRatio(16f / 9f)
                     .background(Color.Black)
-                    .then(
-                        if (!isInPipMode) {
-                            Modifier.clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null
-                            ) {
-                                areControlsVisible = !areControlsVisible
-                            }
-                        } else Modifier
-                    )
             ) {
                 VideoSurface(playerInstance = playerInstance)
+
+                if (!isInPipMode) {
+                    PlayerGestureLayer(
+                        modifier = Modifier.fillMaxSize(),
+                        isLocked = isControlsLocked,
+                        onSingleTap = { areControlsVisible = !areControlsVisible },
+                        onDoubleTapLeft = onDoubleTapLeft,
+                        onDoubleTapRight = onDoubleTapRight,
+                        onBrightnessChange = onBrightnessChange,
+                        onVolumeChange = onVolumeChange,
+                        onGestureEnd = {}
+                    )
+                }
 
                 LoadingAndBufferingOverlay(
                     isResolving = isResolving,
@@ -396,6 +583,34 @@ fun PlayerScreen(
                             viewModel.playerManager.seekTo(0L)
                             viewModel.playerManager.play()
                         }
+                    )
+                }
+
+                // HUD Indicators (Brightness, Volume, Seek Feedback)
+                if (showBrightnessHud && !isInPipMode) {
+                    val pct = ((brightnessLevel ?: 0.5f) * 100).toInt()
+                    BrightnessHudIndicator(
+                        percentage = pct,
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                }
+
+                if (showVolumeHud && !isInPipMode) {
+                    val cur = volumeLevel ?: audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: 0
+                    val pct = if (maxVolume > 0) (cur * 100 / maxVolume) else 0
+                    VolumeHudIndicator(
+                        percentage = pct,
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                }
+
+                if (showSeekFeedback && !isInPipMode) {
+                    SeekFeedbackHUD(
+                        text = seekFeedbackText ?: "",
+                        isForward = isSeekForward,
+                        modifier = Modifier
+                            .align(if (isSeekForward) Alignment.CenterEnd else Alignment.CenterStart)
+                            .padding(horizontal = 24.dp)
                     )
                 }
 
@@ -439,15 +654,21 @@ fun PlayerScreen(
                         activeSettingsTab = if (availableSources.size > 1) 0 else if (audioTracks.size > 1) 1 else 3
                         showTrackSettingsDialog = true
                     },
-                    onEnterPip = onEnterPip
+                    onOpenTechInfo = { showTechInfoDialog = true },
+                    onEnterPip = onEnterPip,
+                    onOpenDownloadSheet = {
+                        downloadSheetInitialTab = 0
+                        showDownloadManagementSheet = true
+                    }
                 )
             }
 
             // Scrollable Content Below Video Player:
-            // 1. Title & Current Episode Info + Manual Next Episode Card
-            // 2. Season Selector (Feature 02)
-            // 3. Episode Selector (Feature 02)
-            // 4. Suggest for You (Feature 02)
+            // 1. Title & Current Episode Info + Compact Download Button (pop-up trigger)
+            // 2. Manual Next Episode Card
+            // 3. Season Selector (Feature 02)
+            // 4. Episode Selector (Feature 02)
+            // 5. Suggest for You (Feature 02)
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -455,7 +676,7 @@ fun PlayerScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // Title and episode details header
+                // Title and episode details header + Compact Download Button
                 item {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Text(
@@ -475,6 +696,25 @@ fun PlayerScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Compact Download Button Row (under player & title)
+                        CompactDownloadActionRow(
+                            download = currentDownload,
+                            activeDownloadsCount = animeDownloads.count { it.downloadStatus == "DOWNLOADING" || it.downloadStatus == "PAUSED" },
+                            onOpenDownloadSheet = {
+                                downloadSheetInitialTab = 0
+                                showDownloadManagementSheet = true
+                            },
+                            onOpenBatchSheet = {
+                                downloadSheetInitialTab = 1
+                                showDownloadManagementSheet = true
+                            },
+                            onOpenQueueSheet = {
+                                downloadSheetInitialTab = 2
+                                showDownloadManagementSheet = true
+                            }
+                        )
                     }
                 }
 
@@ -556,7 +796,7 @@ fun PlayerScreen(
                 }
 
                 // Feature 02: Season Selector
-                if (seasons.size > 1) {
+                if (seasons.isNotEmpty()) {
                     item {
                         Column {
                             Text(
@@ -613,6 +853,7 @@ fun PlayerScreen(
                 } else {
                     items(seasonEpisodes, key = { it.id }) { ep ->
                         val isCurrent = (currentEpisode?.id == ep.id)
+                        val qStatus = preResolveStatus[ep.id]
                         Card(
                             shape = RoundedCornerShape(10.dp),
                             colors = CardDefaults.cardColors(
@@ -657,14 +898,44 @@ fun PlayerScreen(
                                     Spacer(modifier = Modifier.width(12.dp))
 
                                     Column {
-                                        Text(
-                                            text = ep.title ?: "Episode ${ep.episodeNumber}",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.SemiBold,
-                                            color = if (isCurrent) AccentCyan else TextPrimary,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = ep.title ?: "Episode ${ep.episodeNumber}",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.SemiBold,
+                                                color = if (isCurrent) AccentCyan else TextPrimary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            if (!isCurrent && qStatus == PreResolveQueueManager.ResolutionStatus.READY) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Surface(
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    color = PlayableGreen.copy(alpha = 0.2f)
+                                                ) {
+                                                    Text(
+                                                        text = "⚡ Ready",
+                                                        color = PlayableGreen,
+                                                        fontSize = 10.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                    )
+                                                }
+                                            } else if (!isCurrent && qStatus == PreResolveQueueManager.ResolutionStatus.RESOLVING) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Surface(
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    color = AccentCyan.copy(alpha = 0.2f)
+                                                ) {
+                                                    Text(
+                                                        text = "Pre-resolving...",
+                                                        color = AccentCyan,
+                                                        fontSize = 10.sp,
+                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
                                         if (isCurrent) {
                                             Text(
                                                 text = "Now Playing",
@@ -739,6 +1010,32 @@ fun PlayerScreen(
                     onSelectSubTrack = { viewModel.playerManager.selectTrack(it) },
                     onSelectQualityTrack = { viewModel.playerManager.selectTrack(it) },
                     onSetSpeed = { viewModel.playerManager.setSpeed(it) }
+                )
+            }
+
+            if (!isInPipMode && showDownloadManagementSheet) {
+                DownloadManagementBottomSheet(
+                    animeTitle = anime?.preferredTitle ?: "ProphecyVerse",
+                    selectedSeason = selectedSeason,
+                    seasons = seasons.map { it.seasonNumber },
+                    currentEpisode = currentEpisode,
+                    allEpisodes = allEpisodes,
+                    currentDownload = currentDownload,
+                    animeDownloads = animeDownloads,
+                    liveProgressMap = liveProgressMap,
+                    availableQualities = availableDownloadQualities,
+                    availableLanguages = availableDownloadLanguages,
+                    storageStats = storageStats,
+                    initialTab = downloadSheetInitialTab,
+                    onDismiss = { showDownloadManagementSheet = false },
+                    onStartSingleDownload = { q, l -> viewModel.startDownload(q, l) },
+                    onStartBatchDownload = { eps, q, l -> viewModel.startBatchDownload(eps, q, l) },
+                    onPauseDownload = { epId -> viewModel.pauseDownloadForEpisode(epId) },
+                    onResumeDownload = { epId, q, l -> viewModel.resumeDownloadForEpisode(epId, q, l) },
+                    onCancelDownload = { epId -> viewModel.cancelDownloadForEpisode(epId) },
+                    onDeleteDownload = { epId -> viewModel.deleteDownloadForEpisode(epId) },
+                    onPauseAll = { viewModel.pauseAllDownloads() },
+                    onResumeAll = { viewModel.resumeAllDownloads() }
                 )
             }
         }
@@ -962,7 +1259,9 @@ private fun PlayerControlsOverlay(
     onToggleFullscreen: () -> Unit,
     onOpenAudioSettings: () -> Unit,
     onOpenGeneralSettings: () -> Unit,
-    onEnterPip: () -> Unit
+    onOpenTechInfo: () -> Unit,
+    onEnterPip: () -> Unit,
+    onOpenDownloadSheet: () -> Unit = {}
 ) {
     AnimatedVisibility(
         visible = isVisible,
@@ -1044,6 +1343,16 @@ private fun PlayerControlsOverlay(
                     }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = onOpenTechInfo,
+                            modifier = Modifier.testTag("player_tech_info_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Info,
+                                contentDescription = "Technical Info HUD",
+                                tint = AccentGold
+                            )
+                        }
                         if (audioTracksCount > 0) {
                             IconButton(
                                 onClick = onOpenAudioSettings,
@@ -1064,6 +1373,16 @@ private fun PlayerControlsOverlay(
                                 imageVector = Icons.Default.Settings,
                                 contentDescription = "Tracks & Quality",
                                 tint = Color.White
+                            )
+                        }
+                        IconButton(
+                            onClick = onOpenDownloadSheet,
+                            modifier = Modifier.testTag("player_download_controls_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Download,
+                                contentDescription = "Download Management",
+                                tint = AccentCyan
                             )
                         }
                         IconButton(
@@ -1183,8 +1502,8 @@ private fun PlayerControlsOverlay(
                         val timeText = when {
                             dur > 0 -> "${formatMillis(pos)} / ${formatMillis(dur)}"
                             isResolving || isBuffering -> "${formatMillis(pos)} / Loading..."
-                            isPlaying -> "${formatMillis(pos)} / Live"
-                            else -> "${formatMillis(pos)} / --:--"
+                            isPlaying -> "${formatMillis(pos)} / Loading..."
+                            else -> "${formatMillis(pos)} / Loading..."
                         }
                         Text(
                             text = timeText,
@@ -1490,7 +1809,7 @@ private fun TrackSettingsDialog(
                             }
                         }
                         4 -> {
-                            val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+                            val speeds = listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
                             LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 items(speeds, key = { it.toString() }) { speed ->
                                     val isSelected = (playbackSpeed == speed)
@@ -1545,6 +1864,250 @@ fun TrackSelectionRow(
     }
 }
 
+@Composable
+private fun PlayerGestureLayer(
+    modifier: Modifier = Modifier,
+    isLocked: Boolean,
+    onSingleTap: () -> Unit,
+    onDoubleTapLeft: () -> Unit,
+    onDoubleTapRight: () -> Unit,
+    onBrightnessChange: (Float) -> Unit,
+    onVolumeChange: (Float) -> Unit,
+    onGestureEnd: () -> Unit
+) {
+    var boxWidth by remember { mutableStateOf(1) }
+    var isDraggingLeft by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = modifier
+            .onSizeChanged { boxWidth = it.width.coerceAtLeast(1) }
+            .pointerInput(isLocked) {
+                if (!isLocked) {
+                    detectTapGestures(
+                        onTap = { onSingleTap() },
+                        onDoubleTap = { offset ->
+                            if (offset.x < boxWidth / 2f) {
+                                onDoubleTapLeft()
+                            } else {
+                                onDoubleTapRight()
+                            }
+                        }
+                    )
+                } else {
+                    detectTapGestures(onTap = { onSingleTap() })
+                }
+            }
+            .pointerInput(isLocked) {
+                if (!isLocked) {
+                    detectVerticalDragGestures(
+                        onDragStart = { offset ->
+                            isDraggingLeft = offset.x < boxWidth / 2f
+                        },
+                        onDragEnd = { onGestureEnd() },
+                        onDragCancel = { onGestureEnd() },
+                        onVerticalDrag = { change, dragAmount ->
+                            change.consume()
+                            val delta = -dragAmount
+                            if (isDraggingLeft) {
+                                onBrightnessChange(delta)
+                            } else {
+                                onVolumeChange(delta)
+                            }
+                        }
+                    )
+                }
+            }
+    )
+}
+
+@Composable
+private fun BrightnessHudIndicator(
+    percentage: Int,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color.Black.copy(alpha = 0.75f),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.BrightnessMedium,
+                contentDescription = null,
+                tint = AccentGold,
+                modifier = Modifier.size(24.dp)
+            )
+            Column {
+                Text(
+                    text = "Brightness",
+                    color = TextMuted,
+                    fontSize = 11.sp
+                )
+                Text(
+                    text = "$percentage%",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VolumeHudIndicator(
+    percentage: Int,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color.Black.copy(alpha = 0.75f),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.VolumeUp,
+                contentDescription = null,
+                tint = AccentCyan,
+                modifier = Modifier.size(24.dp)
+            )
+            Column {
+                Text(
+                    text = "Media Volume",
+                    color = TextMuted,
+                    fontSize = 11.sp
+                )
+                Text(
+                    text = "$percentage%",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SeekFeedbackHUD(
+    text: String,
+    isForward: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color.Black.copy(alpha = 0.8f),
+        border = BorderStroke(1.dp, AccentCyan.copy(alpha = 0.5f)),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Icon(
+                imageVector = if (isForward) Icons.Default.FastForward else Icons.Default.FastRewind,
+                contentDescription = null,
+                tint = AccentCyan,
+                modifier = Modifier.size(18.dp)
+            )
+            Text(
+                text = text,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun TechInfoDialog(
+    anime: AnimeEntry?,
+    currentEpisode: EpisodeEntry?,
+    player: androidx.media3.exoplayer.ExoPlayer?,
+    activeSource: com.example.data.remote.ProphecySourceDto?,
+    activeAudioDecoder: String?,
+    onDismiss: () -> Unit
+) {
+    val videoFormat = player?.videoFormat
+    val audioFormat = player?.audioFormat
+    val bufferedSec = (player?.totalBufferedDuration ?: 0L) / 1000
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Info, contentDescription = null, tint = AccentGold, modifier = Modifier.size(22.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Technical Information HUD", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 16.sp)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TechInfoRow("Title", anime?.preferredTitle ?: "Unknown")
+                currentEpisode?.let { ep ->
+                    TechInfoRow("Episode", "Season ${ep.seasonNumber} • Ep ${ep.episodeNumber}")
+                }
+                val resStr = if (videoFormat != null && videoFormat.width > 0 && videoFormat.height > 0) {
+                    "${videoFormat.width}x${videoFormat.height} @ ${String.format("%.1f", videoFormat.frameRate.coerceAtLeast(0f))} fps"
+                } else "Auto / Stream Default"
+                TechInfoRow("Resolution", resStr)
+
+                val vCodec = videoFormat?.sampleMimeType ?: videoFormat?.codecs ?: "H.264 / AVC"
+                TechInfoRow("Video Codec", vCodec)
+
+                val aCodec = audioFormat?.sampleMimeType ?: audioFormat?.codecs ?: "EAC3 / AAC"
+                TechInfoRow("Audio Codec", aCodec)
+
+                val isEac3 = aCodec.contains("eac3", ignoreCase = true) || aCodec.contains("eac3-joc", ignoreCase = true)
+                val decText = when {
+                    activeAudioDecoder != null -> activeAudioDecoder
+                    isEac3 -> "FFmpeg Audio Renderer (Software)"
+                    else -> "MediaCodec Hardware Audio Renderer"
+                }
+                TechInfoRow("Audio Decoder", decText)
+
+                TechInfoRow("Buffer Health", "${bufferedSec}s buffered ahead")
+                TechInfoRow("Source Provider", activeSource?.label ?: "ProphecyVerse Core Engine")
+                TechInfoRow("Source ID", activeSource?.id ?: "direct_stream")
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo)
+            ) {
+                Text("Close", color = Color.White)
+            }
+        },
+        containerColor = SurfaceDark
+    )
+}
+
+@Composable
+private fun TechInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text = label, color = TextMuted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Text(text = value, color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
 private fun formatMillis(millis: Long): String {
     val totalSeconds = (millis / 1000).coerceAtLeast(0)
     val hours = totalSeconds / 3600
@@ -1555,4 +2118,25 @@ private fun formatMillis(millis: Long): String {
     } else {
         String.format("%02d:%02d", minutes, seconds)
     }
+}
+
+@Composable
+fun DownloadSectionCard(
+    download: DownloadEntry?,
+    availableQualities: List<String>,
+    availableLanguages: List<String>,
+    onStartDownload: (quality: String?, audioLang: String?) -> Unit,
+    onPauseDownload: () -> Unit,
+    onResumeDownload: () -> Unit,
+    onCancelDownload: () -> Unit,
+    onRetryDownload: () -> Unit,
+    onDeleteDownload: () -> Unit
+) {
+    CompactDownloadActionRow(
+        download = download,
+        activeDownloadsCount = if (download?.downloadStatus == "DOWNLOADING") 1 else 0,
+        onOpenDownloadSheet = { onStartDownload(null, null) },
+        onOpenBatchSheet = {},
+        onOpenQueueSheet = {}
+    )
 }
