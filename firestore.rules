@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (request.auth.token.admin == true || request.auth.token.role == 'admin');
+    }
+
+    function validInstallationCreate(registrationId) {
+      return isAuthenticated()
+        && request.resource.data.owner_uid == request.auth.uid
+        && request.resource.data.installation_id is string
+        && registrationId == request.auth.uid + '_' + request.resource.data.installation_id;
+    }
+
+    function validInstallationUpdate(registrationId) {
+      return isAuthenticated()
+        && resource.data.owner_uid == request.auth.uid
+        && request.resource.data.owner_uid == request.auth.uid
+        && request.resource.data.installation_id == resource.data.installation_id
+        && registrationId == request.auth.uid + '_' + request.resource.data.installation_id;
+    }
+
+    // User profiles: strictly owner access or admin.
+    match /users/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin();
+    }
+
+    // Each signed-in account (including an enabled Firebase anonymous guest) can manage only
+    // its own per-installation FCM token record. Admin/server tooling can target devices securely.
+    match /installations/{registrationId} {
+      allow create: if validInstallationCreate(registrationId) || isAdmin();
+      allow read, delete: if isAdmin() || (isAuthenticated() && resource.data.owner_uid == request.auth.uid);
+      allow update: if isAdmin() || validInstallationUpdate(registrationId);
+    }
+
+    // Watch history & continue watching per user.
+    match /watch_history/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin();
+      match /episodes/{episodeId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // User library / watchlist.
+    match /watchlist/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin();
+      match /items/{animeId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // Client event writes require an authenticated owner; admin reads remain protected.
+    match /analytics_events/{eventId} {
+      allow create: if isAuthenticated()
+        && request.resource.data.user_id == request.auth.uid
+        && request.resource.data.installation_id is string
+        && request.resource.data.event_name is string;
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // Global daily totals must be maintained by a trusted server/Admin SDK, not app clients.
+    match /analytics_daily/{dateDoc} {
+      allow read, write: if isAdmin();
+    }
+
+    match /app_config/{configDoc} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Public announcement metadata only; sending FCM requires trusted server credentials.
+    match /notifications/{noticeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /admin_settings/{settingId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /admin_activity_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

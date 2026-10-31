@@ -13,6 +13,7 @@ import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
 import com.example.player.PlayerManager
+import com.example.player.PreResolveQueueManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,8 +42,20 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     val popular: StateFlow<List<AnimeEntry>> = repository.observePopular()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val kdramas: StateFlow<List<AnimeEntry>> = repository.observeKDramas()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val movies: StateFlow<List<AnimeEntry>> = repository.observeMovies()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val webSeries: StateFlow<List<AnimeEntry>> = repository.observeWebSeries()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     val continueWatching: StateFlow<List<PlaybackHistory>> = repository.observeContinueWatching()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _selectedCategory = MutableStateFlow("ALL")
+    val selectedCategory: StateFlow<String> = _selectedCategory.asStateFlow()
 
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
@@ -52,6 +65,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         refreshHome()
+    }
+
+    fun selectCategory(cat: String) {
+        _selectedCategory.value = cat
     }
 
     fun refreshHome() {
@@ -142,6 +159,9 @@ class DetailViewModel(
     val seasons: StateFlow<List<SeasonEntry>> = repository.observeSeasons(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val allEpisodes: StateFlow<List<EpisodeEntry>> = repository.observeAllEpisodes(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val _selectedSeason = MutableStateFlow(1)
     val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
 
@@ -172,12 +192,35 @@ class DetailViewModel(
     val sourceError: StateFlow<String?> = _sourceError.asStateFlow()
 
     init {
+        viewModelScope.launch {
+            combine(seasons, allEpisodes) { sList, epList -> sList to epList }
+                .collect { (sList, epList) ->
+                    if (sList.isNotEmpty()) {
+                        val currentHasEpisodes = epList.any { it.seasonNumber == _selectedSeason.value }
+                        if (!currentHasEpisodes && epList.isNotEmpty()) {
+                            // Find the first season that actually has episodes (e.g. One Piece Season 22)
+                            val seasonWithEps = epList.firstOrNull()?.seasonNumber
+                            if (seasonWithEps != null && sList.any { it.seasonNumber == seasonWithEps }) {
+                                _selectedSeason.value = seasonWithEps
+                            } else {
+                                _selectedSeason.value = sList.first().seasonNumber
+                            }
+                        } else if (sList.none { it.seasonNumber == _selectedSeason.value }) {
+                            _selectedSeason.value = sList.first().seasonNumber
+                        }
+                    }
+                }
+        }
         refreshDetails()
     }
 
     fun refreshDetails() {
         viewModelScope.launch {
             _isLoading.value = true
+            com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
+                "anime_view",
+                mapOf("anime_id" to animeId)
+            )
             repository.refreshAnimeDetails(animeId)
             _isLoading.value = false
         }
@@ -222,12 +265,26 @@ class DetailViewModel(
     fun toggleWatchlist(status: String = "WATCHING") {
         viewModelScope.launch {
             repository.toggleWatchlist(animeId, status)
+            val entry = watchlistEntry.value
+            com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
+                .syncWatchlistStatus(
+                    animeId = animeId,
+                    status = status,
+                    isFavorite = entry?.isFavorite ?: false
+                )
         }
     }
 
     fun toggleFavorite() {
         viewModelScope.launch {
             repository.toggleFavorite(animeId)
+            val entry = watchlistEntry.value
+            com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
+                .syncWatchlistStatus(
+                    animeId = animeId,
+                    status = entry?.status ?: "WATCHING",
+                    isFavorite = !(entry?.isFavorite ?: false)
+                )
         }
     }
 }
@@ -239,6 +296,7 @@ class PlayerViewModel(
 ) : AndroidViewModel(application) {
     private val repository = AnimeRepository(AppDatabase.getInstance(application))
     val playerManager = PlayerManager(application, viewModelScope)
+    val preResolveManager = PreResolveQueueManager(repository, viewModelScope)
 
     val animeEntry: StateFlow<AnimeEntry?> = repository.observeAnimeById(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
@@ -246,8 +304,32 @@ class PlayerViewModel(
     val allEpisodes: StateFlow<List<EpisodeEntry>> = repository.observeAllEpisodes(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val seasons: StateFlow<List<SeasonEntry>> = repository.observeSeasons(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val preResolveQueueStatus: StateFlow<Map<String, PreResolveQueueManager.ResolutionStatus>> =
+        preResolveManager.queueStatus
+
+    private val _selectedSeason = MutableStateFlow(1)
+    val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
+
+    val seasonEpisodes: StateFlow<List<EpisodeEntry>> = _selectedSeason.flatMapLatest { s ->
+        repository.observeEpisodes(animeId, s)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val suggestions: StateFlow<List<AnimeEntry>> = repository.observePopular()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val _currentEpisode = MutableStateFlow<EpisodeEntry?>(null)
     val currentEpisode: StateFlow<EpisodeEntry?> = _currentEpisode.asStateFlow()
+
+    val nextEpisode: StateFlow<EpisodeEntry?> = combine(_currentEpisode, allEpisodes) { current, list ->
+        if (current == null || list.isEmpty()) null
+        else {
+            val currentIndex = list.indexOfFirst { it.id == current.id }
+            if (currentIndex in 0 until list.size - 1) list[currentIndex + 1] else null
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     private val _isResolving = MutableStateFlow(true)
     val isResolving: StateFlow<Boolean> = _isResolving.asStateFlow()
@@ -274,16 +356,31 @@ class PlayerViewModel(
                 if (_currentEpisode.value == null && epList.isNotEmpty()) {
                     val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
                     _currentEpisode.value = target
+                    _selectedSeason.value = target.seasonNumber
                     startPlaybackForEpisode(target)
                 }
             }
         }
 
-        // Auto-save playback position periodically
+        var lastWatchTimeTrackMs = System.currentTimeMillis()
+        var lastCloudSyncMs = 0L
+
+        // Auto-save playback position periodically and sync with Firebase Cloud
         playerManager.onPositionUpdate = { posMs, durMs ->
             val ep = _currentEpisode.value
             if (ep != null && durMs > 0) {
+                val now = System.currentTimeMillis()
+                val deltaSec = (now - lastWatchTimeTrackMs) / 1000
+                if (deltaSec >= 10 && playerManager.isPlaying.value) {
+                    com.example.data.firebase.AppAnalytics.getInstance(application).recordWatchTime(
+                        deltaSec, animeId, ep.id
+                    )
+                    lastWatchTimeTrackMs = now
+                }
+
                 viewModelScope.launch {
+                    val isCompleted = durMs > 0 && posMs >= (durMs * 0.9)
+                    val anime = animeEntry.value
                     repository.updatePlaybackProgress(
                         animeId = animeId,
                         episodeId = ep.id,
@@ -291,20 +388,83 @@ class PlayerViewModel(
                         episodeNumber = ep.episodeNumber,
                         episodeTitle = ep.title,
                         positionMs = posMs,
-                        durationMs = durMs
+                        durationMs = durMs,
+                        animeTitle = anime?.preferredTitle ?: anime?.titleEnglish,
+                        posterUrl = anime?.posterUrl,
+                        mediaType = anime?.format ?: "ANIME"
                     )
+
+                    // Non-blocking cloud history synchronization
+                    if (now - lastCloudSyncMs > 10000L || isCompleted) {
+                        lastCloudSyncMs = now
+                        com.example.data.firebase.CloudHistoryRepository.getInstance(application)
+                            .syncPlaybackProgress(
+                                animeId = animeId,
+                                episodeId = ep.id,
+                                seasonNumber = ep.seasonNumber,
+                                episodeNumber = ep.episodeNumber,
+                                episodeTitle = ep.title,
+                                positionMs = posMs,
+                                durationMs = durMs,
+                                completed = isCompleted
+                            )
+                    }
                 }
             }
         }
     }
 
+    fun selectSeason(sNum: Int) {
+        _selectedSeason.value = sNum
+    }
+
     fun startPlaybackForEpisode(episode: EpisodeEntry, preferredSourceId: String? = null) {
         _currentEpisode.value = episode
+        _selectedSeason.value = episode.seasonNumber
         _isResolving.value = true
         _resolutionError.value = null
 
+        com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
+            "episode_play",
+            mapOf(
+                "anime_id" to animeId,
+                "episode_id" to episode.id,
+                "episode_number" to episode.episodeNumber
+            )
+        )
+
         viewModelScope.launch {
             val db = AppDatabase.getInstance(getApplication())
+
+            // 1. Check if episode is downloaded for offline playback
+            val download = db.downloadDao().getDownload(episode.id)
+            if (download != null && download.downloadStatus == "COMPLETED" && download.localFilePath != null) {
+                val file = java.io.File(download.localFilePath)
+                if (file.exists() && file.length() > 0) {
+                    _isResolving.value = false
+                    _activeSource.value = null
+                    val lastSavedPos = try {
+                        db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { 0L }
+
+                    val directData = DirectPlayData(
+                        mode = "offline",
+                        sourceId = "local_${episode.id}",
+                        playbackUrl = "file://${file.absolutePath}",
+                        urlType = "direct",
+                        compatibility = "verified"
+                    )
+                    playerManager.initializePlayer(
+                        directData = directData,
+                        startPositionMs = lastSavedPos,
+                        onPlaybackFailed = null,
+                        onRetryNeeded = {}
+                    )
+                    return@launch
+                }
+            }
+
+            // 2. Online playback flow using ProphecyVerse catalog
             val anime = db.animeDao().getAnimeById(animeId) ?: animeEntry.value
             val backendId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
@@ -312,6 +472,44 @@ class PlayerViewModel(
                 _resolutionError.value = "Cannot play: Anime has no playable backend catalog ID."
                 _isResolving.value = false
                 return@launch
+            }
+
+            // 3. Fast-Path: Check 17-episode pre-resolve cache for instant start (< 25m TTL)
+            if (preferredSourceId == null) {
+                val prepared = preResolveManager.getPreparedSource(episode.id)
+                if (prepared != null) {
+                    _activeSource.value = prepared.source
+                    _availableSources.value = listOf(prepared.source)
+                    activeDirectData = prepared.directData
+                    activeSourceId = prepared.source.id
+                    _isResolving.value = false
+
+                    val lastSavedPos = try {
+                        db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { 0L }
+
+                    playerManager.initializePlayer(
+                        directData = prepared.directData,
+                        startPositionMs = lastSavedPos,
+                        onPlaybackFailed = {
+                            viewModelScope.launch {
+                                _isResolving.value = true
+                                val freshSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                resolveWithFallback(backendId, episode, freshSources, 0)
+                            }
+                        },
+                        onRetryNeeded = {
+                            viewModelScope.launch {
+                                val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                resolveWithFallback(backendId, episode, refreshedSources, 0)
+                            }
+                        }
+                    )
+
+                    // Slide pre-resolve queue forward for next 17 episodes
+                    preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
+                    return@launch
+                }
             }
 
             // Route D: Get sources for the selected episode
@@ -377,12 +575,17 @@ class PlayerViewModel(
                     },
                     onRetryNeeded = {
                         viewModelScope.launch {
+                            // Link expired (e.g. Google UserContent signed URL expiration):
+                            // Request fresh sources and resolve afresh
                             val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
                             val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
                             resolveWithFallback(backendId, episode, newCandidates, 0)
                         }
                     }
                 )
+
+                // Trigger 17-episode sliding queue in background
+                preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
                 return
             } else {
                 lastError = playRes.exceptionOrNull()?.message
@@ -399,17 +602,13 @@ class PlayerViewModel(
     }
 
     fun playNextEpisode() {
-        val current = _currentEpisode.value ?: return
-        val list = allEpisodes.value
-        val currentIndex = list.indexOfFirst { it.id == current.id }
-        if (currentIndex in 0 until list.size - 1) {
-            val next = list[currentIndex + 1]
-            startPlaybackForEpisode(next)
-        }
+        val next = nextEpisode.value ?: return
+        startPlaybackForEpisode(next)
     }
 
     override fun onCleared() {
         super.onCleared()
+        preResolveManager.clear()
         playerManager.release()
     }
 }
@@ -435,6 +634,62 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     fun clearCache() {
         viewModelScope.launch {
             repository.clearSearchAndMetadataCache()
+        }
+    }
+}
+
+class DownloadsViewModel(application: Application) : AndroidViewModel(application) {
+    private val downloadManager = com.example.data.download.DownloadManager.getInstance(application)
+
+    val activeDownloads = downloadManager.observeActiveDownloads()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val completedDownloads = downloadManager.observeCompletedDownloads()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val storageStats = downloadManager.storageStats
+    val liveProgressMap = downloadManager.liveProgressMap
+
+    fun pauseDownload(episodeId: String) = downloadManager.pauseDownload(episodeId)
+    fun cancelDownload(episodeId: String) = downloadManager.cancelDownload(episodeId)
+    fun deleteDownload(episodeId: String) = downloadManager.deleteDownloadedFile(episodeId)
+    fun resumeDownload(episodeId: String) {
+        val entry = completedDownloads.value.firstOrNull { it.id == episodeId }
+            ?: activeDownloads.value.firstOrNull { it.id == episodeId } ?: return
+        downloadManager.startOrResumeDownload(
+            animeId = entry.animeId,
+            episodeId = entry.id,
+            seasonNumber = entry.seasonNumber,
+            episodeNumber = entry.episodeNumber,
+            episodeTitle = entry.episodeTitle,
+            animeTitle = entry.animeTitle,
+            posterUrl = entry.posterUrl,
+            mediaType = entry.mediaType
+        )
+    }
+}
+
+class ProfileViewModel(application: Application) : AndroidViewModel(application) {
+    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val downloadManager = com.example.data.download.DownloadManager.getInstance(application)
+
+    val profile = repository.observeProfile()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val watchlist = repository.observeWatchlist()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val history = repository.observeHistory()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val continueWatching = repository.observeContinueWatching()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val storageStats = downloadManager.storageStats
+
+    fun updateProfile(name: String, avatarId: String, bio: String) {
+        viewModelScope.launch {
+            repository.updateProfile(name, avatarId, bio)
         }
     }
 }

@@ -5,6 +5,8 @@ sealed class Screen(val route: String, val title: String) {
     data object Search : Screen("search", "Search")
     data object Library : Screen("library", "Library")
     data object History : Screen("history", "History")
+    data object Downloads : Screen("downloads", "Downloads")
+    data object Profile : Screen("profile", "Profile")
     data object Settings : Screen("settings", "Settings")
 
     data object Detail : Screen("detail/{animeId}", "Detail") {

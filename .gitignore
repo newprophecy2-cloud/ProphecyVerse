@@ -23,4 +23,6 @@
 *.jks
 *.keystore
 /debug.keystore
+/debug.keystore.base64
 /my-upload-key.jks
+.build-outputs/

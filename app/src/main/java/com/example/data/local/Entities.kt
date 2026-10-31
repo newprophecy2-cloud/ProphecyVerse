@@ -1,5 +1,6 @@
 package com.example.data.local
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -39,6 +40,8 @@ data class AnimeEntry(
     val isTrending: Boolean = false,
     val isSeasonal: Boolean = false,
     val isPopular: Boolean = false,
+    @ColumnInfo(defaultValue = "'ANIME'")
+    val mediaCategory: String = "ANIME", // "ANIME", "KDRAMA", "MOVIE", "SERIES"
     val updatedAt: Long = System.currentTimeMillis()
 )
 
@@ -139,7 +142,7 @@ data class WatchlistEntry(
     ]
 )
 data class PlaybackHistory(
-    @PrimaryKey val id: String, // "${animeId}_${episodeId}"
+    @PrimaryKey val id: String, // animeId (exactly one entry per series or movie)
     val animeId: String,
     val episodeId: String,
     val seasonNumber: Int,
@@ -148,6 +151,12 @@ data class PlaybackHistory(
     val positionMs: Long = 0,
     val durationMs: Long = 0,
     val completed: Boolean = false,
+    @ColumnInfo(defaultValue = "NULL")
+    val animeTitle: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
+    val posterUrl: String? = null,
+    @ColumnInfo(defaultValue = "NULL")
+    val mediaType: String? = null,
     val lastPlayedAt: Long = System.currentTimeMillis()
 )
 
@@ -155,4 +164,43 @@ data class PlaybackHistory(
 data class UserPreference(
     @PrimaryKey val prefKey: String,
     val prefValue: String
+)
+
+@Entity(
+    tableName = "download_entries",
+    indices = [
+        Index(value = ["animeId"]),
+        Index(value = ["downloadStatus"])
+    ]
+)
+data class DownloadEntry(
+    @PrimaryKey val id: String, // episodeId
+    val animeId: String,
+    val animeTitle: String,
+    val posterUrl: String? = null,
+    val seasonNumber: Int,
+    val episodeNumber: Int,
+    val episodeTitle: String? = null,
+    val localFilePath: String? = null,
+    val downloadStatus: String, // "DOWNLOADING", "PAUSED", "COMPLETED", "FAILED"
+    val downloadedBytes: Long = 0L,
+    val totalBytes: Long = 0L,
+    val downloadUrl: String? = null,
+    val mediaType: String? = null, // "anime", "movie", "kdrama", "series"
+    val errorMessage: String? = null,
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    val isCompleted: Boolean get() = downloadStatus == "COMPLETED"
+    val isDownloading: Boolean get() = downloadStatus == "DOWNLOADING"
+    val isPaused: Boolean get() = downloadStatus == "PAUSED"
+    val episodeId: String get() = id
+}
+
+@Entity(tableName = "local_profiles")
+data class LocalProfile(
+    @PrimaryKey val id: String = "default_user",
+    val name: String = "Anime Explorer",
+    val avatarId: String = "avatar_pirate",
+    val bio: String = "Prophecy Verse Streamer",
+    val updatedAt: Long = System.currentTimeMillis()
 )

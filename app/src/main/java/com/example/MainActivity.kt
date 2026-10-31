@@ -16,8 +16,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -46,10 +48,12 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.ui.navigation.Screen
 import com.example.ui.screens.DetailScreen
+import com.example.ui.screens.DownloadsScreen
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.LibraryScreen
 import com.example.ui.screens.PlayerScreen
+import com.example.ui.screens.ProfileScreen
 import com.example.ui.screens.SearchScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.theme.AccentCyan
@@ -61,9 +65,11 @@ import com.example.ui.theme.SurfaceHighlight
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.viewmodels.DetailViewModel
+import com.example.ui.viewmodels.DownloadsViewModel
 import com.example.ui.viewmodels.HomeViewModel
 import com.example.ui.viewmodels.LibraryViewModel
 import com.example.ui.viewmodels.PlayerViewModel
+import com.example.ui.viewmodels.ProfileViewModel
 import com.example.ui.viewmodels.SearchViewModel
 
 import androidx.lifecycle.lifecycleScope
@@ -79,19 +85,30 @@ class MainActivity : ComponentActivity() {
 
     var isPlayerActive by mutableStateOf(false)
     var isVideoPlaying by mutableStateOf(false)
+    var pendingNotificationRoute by mutableStateOf<String?>(null)
+        private set
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        pendingNotificationRoute = notificationRouteFrom(intent)
+        com.example.data.firebase.ProphecyMessagingService.ensureNotificationChannel(applicationContext)
 
         lifecycleScope.launch {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
+            com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
+            com.example.data.firebase.InstallationManager.getInstance(applicationContext).initializeAndSync()
+            com.example.data.firebase.VersionControlManager.getInstance(applicationContext).checkForUpdates()
+            com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
+            com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
 
         setContent {
             ProphecyVerseTheme {
                 MainAppNav(
                     isInPipMode = isInPipMode,
+                    notificationRoute = pendingNotificationRoute,
+                    onNotificationRouteConsumed = { pendingNotificationRoute = null },
                     onEnterPip = { enterPipMode() },
                     onPlayerStateChanged = { active, playing ->
                         isPlayerActive = active
@@ -101,6 +118,30 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingNotificationRoute = notificationRouteFrom(intent)
+    }
+
+    private fun notificationRouteFrom(intent: android.content.Intent?): String? {
+        if (intent == null) return null
+        val animeId = intent.getStringExtra("animeId") ?: intent.getStringExtra("anime_id")
+        val episodeId = intent.getStringExtra("episodeId") ?: intent.getStringExtra("episode_id")
+        if (animeId.isNullOrBlank()) return null
+        val safeAnimeId = android.net.Uri.encode(animeId)
+        return if (!episodeId.isNullOrBlank()) {
+            Screen.Player.createRoute(safeAnimeId, android.net.Uri.encode(episodeId))
+        } else {
+            Screen.Detail.createRoute(safeAnimeId)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        com.example.data.firebase.InstallationManager.getInstance(applicationContext).recordHeartbeat()
     }
 
     override fun onPictureInPictureModeChanged(
@@ -149,17 +190,53 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainAppNav(
     isInPipMode: Boolean = false,
+    notificationRoute: String? = null,
+    onNotificationRouteConsumed: () -> Unit = {},
     onEnterPip: () -> Unit = {},
     onPlayerStateChanged: (isActive: Boolean, isPlaying: Boolean) -> Unit = { _, _ -> }
 ) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
+    androidx.compose.runtime.LaunchedEffect(notificationRoute) {
+        val target = notificationRoute ?: return@LaunchedEffect
+        navController.navigate(target) { launchSingleTop = true }
+        onNotificationRouteConsumed()
+    }
     val context = LocalContext.current
     val app = context.applicationContext as Application
     val noticeManager = remember { NoticeManager.getInstance(context) }
     val isNoticeVisible by noticeManager.isNoticeVisible.collectAsStateWithLifecycle()
     val noticeContent by noticeManager.noticeContent.collectAsStateWithLifecycle()
+
+    val versionControlManager = remember { com.example.data.firebase.VersionControlManager.getInstance(context) }
+    val versionState by versionControlManager.versionState.collectAsStateWithLifecycle()
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+            contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+            onResult = { isGranted ->
+                if (isGranted) {
+                    com.example.data.firebase.AppAnalytics.getInstance(context).logEvent("notification_permission_granted")
+                }
+            }
+        )
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                    context,
+                    android.Manifest.permission.POST_NOTIFICATIONS
+                ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    if (versionState is com.example.data.firebase.VersionCheckState.ForceUpdate) {
+        val info = (versionState as com.example.data.firebase.VersionCheckState.ForceUpdate).info
+        com.example.ui.screens.ForceUpdateScreen(versionInfo = info)
+        return
+    }
 
     // Hide bottom bar on player screen or when in PIP mode
     val shouldShowBottomBar = !isInPipMode && currentRoute?.startsWith("player/") != true
@@ -169,7 +246,7 @@ fun MainAppNav(
             .fillMaxSize()
             .background(SpaceDark),
         containerColor = SpaceDark,
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        contentWindowInsets = androidx.compose.material3.ScaffoldDefaults.contentWindowInsets,
         bottomBar = {
             if (shouldShowBottomBar) {
                 BottomNavBar(navController = navController, currentRoute = currentRoute)
@@ -181,7 +258,7 @@ fun MainAppNav(
             startDestination = Screen.Home.route,
             modifier = Modifier
                 .fillMaxSize()
-                .padding(if (isInPipMode) PaddingValues(0.dp) else innerPadding)
+                .padding(if (isInPipMode || currentRoute?.startsWith("player/") == true) PaddingValues(0.dp) else innerPadding)
         ) {
             composable(Screen.Home.route) {
                 val homeViewModel: HomeViewModel = viewModel()
@@ -206,6 +283,19 @@ fun MainAppNav(
                 )
             }
 
+            composable(Screen.Downloads.route) {
+                val downloadsViewModel: DownloadsViewModel = viewModel()
+                DownloadsScreen(
+                    viewModel = downloadsViewModel,
+                    onPlayOffline = { aId, eId ->
+                        navController.navigate(Screen.Player.createRoute(aId, eId))
+                    },
+                    onAnimeClick = { aId ->
+                        navController.navigate(Screen.Detail.createRoute(aId))
+                    }
+                )
+            }
+
             composable(Screen.Library.route) {
                 val libraryViewModel: LibraryViewModel = viewModel()
                 LibraryScreen(
@@ -225,6 +315,19 @@ fun MainAppNav(
                     viewModel = libraryViewModel,
                     onPlayHistoryClick = { animeId, episodeId ->
                         navController.navigate(Screen.Player.createRoute(animeId, episodeId))
+                    }
+                )
+            }
+
+            composable(Screen.Profile.route) {
+                val profileViewModel: ProfileViewModel = viewModel()
+                ProfileScreen(
+                    viewModel = profileViewModel,
+                    onNavigateToDownloads = { navController.navigate(Screen.Downloads.route) },
+                    onNavigateToHistory = { navController.navigate(Screen.History.route) },
+                    onNavigateToLibrary = { navController.navigate(Screen.Library.route) },
+                    onPlayHistoryItem = { aId, eId ->
+                        navController.navigate(Screen.Player.createRoute(aId, eId))
                     }
                 )
             }
@@ -281,7 +384,10 @@ fun MainAppNav(
                     isInPipMode = isInPipMode,
                     onEnterPip = onEnterPip,
                     onPlayerStateChanged = onPlayerStateChanged,
-                    onBackClick = { navController.popBackStack() }
+                    onBackClick = { navController.popBackStack() },
+                    onNavigateToDetail = { targetAnimeId ->
+                        navController.navigate(Screen.Detail.createRoute(targetAnimeId))
+                    }
                 )
             }
         }
@@ -303,9 +409,9 @@ fun BottomNavBar(
     val items = listOf(
         NavigationItem(Screen.Home.route, "Discover", Icons.Default.Explore),
         NavigationItem(Screen.Search.route, "Search", Icons.Default.Search),
-        NavigationItem(Screen.Library.route, "Library", Icons.Default.Bookmark),
+        NavigationItem(Screen.Downloads.route, "Downloads", Icons.Default.Download),
         NavigationItem(Screen.History.route, "History", Icons.Default.History),
-        NavigationItem(Screen.Settings.route, "Settings", Icons.Default.Settings)
+        NavigationItem(Screen.Profile.route, "Profile", Icons.Default.Person)
     )
 
     NavigationBar(
