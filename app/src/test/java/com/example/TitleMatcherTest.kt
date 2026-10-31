@@ -84,4 +84,37 @@ class TitleMatcherTest {
         val confidence = TitleMatcher.computeMatchConfidence(aniListMedia, prophecyItem)
         assertTrue("Unrelated titles must have low confidence", confidence < 0.50f)
     }
+
+    @Test
+    fun computeMatchConfidence_onePieceAnimeDoesNotMatchLiveAction() {
+        val onePieceAnime = AniListMedia(
+            id = 21,
+            title = AniListTitle(romaji = "ONE PIECE", english = "One Piece"),
+            startDate = AniListFuzzyDate(year = 1999),
+            format = "TV",
+            episodes = 1100
+        )
+
+        val onePieceLiveAction = ProphecySearchResultItem(
+            id = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MzgvIiwicyI6MCwiZSI6MH0",
+            title = "ONE PIECE",
+            mediaType = "live_action",
+            year = "2023",
+            seasonCount = 2
+        )
+
+        val onePieceAnimeBackend = ProphecySearchResultItem(
+            id = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MjUzLyIsInMiOjAsImUiOjB9",
+            title = "One Piece",
+            mediaType = "series",
+            year = "1999",
+            seasonCount = 22
+        )
+
+        val laConfidence = TitleMatcher.computeMatchConfidence(onePieceAnime, onePieceLiveAction)
+        val animeConfidence = TitleMatcher.computeMatchConfidence(onePieceAnime, onePieceAnimeBackend)
+
+        assertEquals("Anime should not match Live action", 0f, laConfidence, 0.01f)
+        assertTrue("Anime should match Anime with high confidence (got $animeConfidence)", animeConfidence >= 0.85f)
+    }
 }

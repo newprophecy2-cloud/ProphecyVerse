@@ -28,6 +28,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -35,6 +37,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -74,12 +77,29 @@ fun HomeScreen(
     val trending by viewModel.trending.collectAsStateWithLifecycle()
     val seasonal by viewModel.seasonal.collectAsStateWithLifecycle()
     val popular by viewModel.popular.collectAsStateWithLifecycle()
+    val kdramas by viewModel.kdramas.collectAsStateWithLifecycle()
+    val movies by viewModel.movies.collectAsStateWithLifecycle()
+    val webSeries by viewModel.webSeries.collectAsStateWithLifecycle()
+    val selectedCategory by viewModel.selectedCategory.collectAsStateWithLifecycle()
     val continueWatching by viewModel.continueWatching.collectAsStateWithLifecycle()
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
     val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
 
-    val featuredAnime = trending.firstOrNull { !it.bannerUrl.isNullOrBlank() }
-        ?: trending.firstOrNull() ?: seasonal.firstOrNull()
+    // Confirmed available only on Home Screen
+    val playableTrending: List<AnimeEntry> = remember(trending) { trending.filter { it.isPlayable } }
+    val playableSeasonal: List<AnimeEntry> = remember(seasonal) { seasonal.filter { it.isPlayable } }
+    val playablePopular: List<AnimeEntry> = remember(popular) { popular.filter { it.isPlayable } }
+    val playableKdramas: List<AnimeEntry> = remember(kdramas) { kdramas.filter { it.isPlayable } }
+    val playableMovies: List<AnimeEntry> = remember(movies) { movies.filter { it.isPlayable } }
+    val playableWebSeries: List<AnimeEntry> = remember(webSeries) { webSeries.filter { it.isPlayable } }
+
+    val featuredAnime: AnimeEntry? = when (selectedCategory) {
+        "KDRAMA" -> playableKdramas.firstOrNull()
+        "MOVIES" -> playableMovies.firstOrNull()
+        "SERIES" -> playableWebSeries.firstOrNull()
+        else -> playableTrending.firstOrNull { entry: AnimeEntry -> !entry.bannerUrl.isNullOrBlank() }
+            ?: playableTrending.firstOrNull() ?: playableSeasonal.firstOrNull()
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -124,7 +144,7 @@ fun HomeScreen(
                             letterSpacing = 0.5.sp
                         )
                         Text(
-                            text = "Anime Discovery & Direct Stream",
+                            text = "Verified Streaming & Catalog",
                             style = MaterialTheme.typography.bodySmall,
                             color = AccentCyan,
                             fontSize = 11.sp
@@ -145,22 +165,55 @@ fun HomeScreen(
                         onClick = { viewModel.refreshHome() },
                         modifier = Modifier.testTag("refresh_home_button")
                     ) {
-                    if (isRefreshing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = AccentCyan,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Refresh",
-                            tint = TextSecondary
-                        )
+                        if (isRefreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                color = AccentCyan,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Refresh",
+                                tint = TextSecondary
+                            )
+                        }
                     }
                 }
             }
         }
+
+        // Category Filter Chips (All, Anime, K-Drama, Movies, Web Series)
+        item {
+            val categories = listOf(
+                "ALL" to "All",
+                "ANIME" to "Anime",
+                "KDRAMA" to "K-Drama",
+                "MOVIES" to "Movies",
+                "SERIES" to "Web Series"
+            )
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(categories) { (key, label) ->
+                    FilterChip(
+                        selected = selectedCategory == key,
+                        onClick = { viewModel.selectCategory(key) },
+                        label = { Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            containerColor = SurfaceVariantDark,
+                            labelColor = TextSecondary,
+                            selectedContainerColor = AccentIndigo,
+                            selectedLabelColor = Color.White
+                        ),
+                        border = null,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.testTag("chip_category_$key")
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
         }
 
         // Non-blocking error/offline notification if any
@@ -212,49 +265,103 @@ fun HomeScreen(
             }
         }
 
-        // Trending Rail
-        item {
-            SectionHeader(title = "Trending Now", subtitle = "Most watched this week")
-            if (trending.isEmpty() && isRefreshing) {
-                LoadingRail()
-            } else {
-                AnimeRail(
-                    animes = trending,
-                    onAnimeClick = onAnimeClick,
-                    testTagPrefix = "trending"
-                )
+        // 1. ANIME RAILS (Trending & Seasonal)
+        if (selectedCategory == "ALL" || selectedCategory == "ANIME") {
+            item {
+                SectionHeader(title = "Trending Anime", subtitle = "Confirmed available to play")
+                if (playableTrending.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playableTrending.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playableTrending,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "trending"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
             }
-            Spacer(modifier = Modifier.height(16.dp))
+
+            item {
+                SectionHeader(title = "This Season", subtitle = "Top currently airing anime releases")
+                if (playableSeasonal.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playableSeasonal.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playableSeasonal,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "seasonal"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
         }
 
-        // Seasonal Rail
-        item {
-            SectionHeader(title = "This Season", subtitle = "Top currently airing releases")
-            if (seasonal.isEmpty() && isRefreshing) {
-                LoadingRail()
-            } else {
-                AnimeRail(
-                    animes = seasonal,
-                    onAnimeClick = onAnimeClick,
-                    testTagPrefix = "seasonal"
-                )
+        // 2. K-DRAMA RAIL
+        if (selectedCategory == "ALL" || selectedCategory == "KDRAMA") {
+            item {
+                SectionHeader(title = "K-Drama Hits", subtitle = "Verified Korean drama series available now")
+                if (playableKdramas.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playableKdramas.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playableKdramas,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "kdrama"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
             }
-            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // 3. MOVIES RAIL
+        if (selectedCategory == "ALL" || selectedCategory == "MOVIES") {
+            item {
+                SectionHeader(title = "Movies", subtitle = "Verified feature films and anime movies")
+                if (playableMovies.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playableMovies.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playableMovies,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "movies"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+        }
+
+        // 4. WEB SERIES RAIL
+        if (selectedCategory == "ALL" || selectedCategory == "SERIES") {
+            item {
+                SectionHeader(title = "Web Series", subtitle = "Confirmed streaming live action & web series")
+                if (playableWebSeries.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playableWebSeries.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playableWebSeries,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "series"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
         }
 
         // All Time Popular Rail
-        item {
-            SectionHeader(title = "All-Time Popular", subtitle = "Acclaimed anime legends")
-            if (popular.isEmpty() && isRefreshing) {
-                LoadingRail()
-            } else {
-                AnimeRail(
-                    animes = popular,
-                    onAnimeClick = onAnimeClick,
-                    testTagPrefix = "popular"
-                )
+        if (selectedCategory == "ALL" || selectedCategory == "ANIME") {
+            item {
+                SectionHeader(title = "All-Time Popular", subtitle = "Acclaimed legends")
+                if (playablePopular.isEmpty() && isRefreshing) {
+                    LoadingRail()
+                } else if (playablePopular.isNotEmpty()) {
+                    AnimeRail(
+                        animes = playablePopular,
+                        onAnimeClick = onAnimeClick,
+                        testTagPrefix = "popular"
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
             }
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }

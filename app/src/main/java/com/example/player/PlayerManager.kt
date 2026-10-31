@@ -85,9 +85,13 @@ class PlayerManager(
     private val _activeAudioDecoder = MutableStateFlow<String?>(null)
     val activeAudioDecoder: StateFlow<String?> = _activeAudioDecoder.asStateFlow()
 
+    private val _isPlaybackEnded = MutableStateFlow(false)
+    val isPlaybackEnded: StateFlow<Boolean> = _isPlaybackEnded.asStateFlow()
+
     private var retryCount = 0
     private var onRetryRequested: (() -> Unit)? = null
     private var onPlaybackFailedCallback: (() -> Unit)? = null
+    var onPlaybackEndedCallback: (() -> Unit)? = null
     var onPositionUpdate: ((positionMs: Long, durationMs: Long) -> Unit)? = null
 
     data class TrackOption(
@@ -112,6 +116,7 @@ class PlayerManager(
         onPlaybackFailedCallback = onPlaybackFailed
         _errorMessage.value = null
         _activeAudioDecoder.value = null
+        _isPlaybackEnded.value = false
 
         // Build safe HTTP DataSource with response-authorized headers
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -294,9 +299,10 @@ class PlayerManager(
             .apply {
                 playWhenReady = true
                 volume = 1.0f
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 trackSelectionParameters = trackSelectionParameters
                     .buildUpon()
-                    .setPreferredAudioLanguages("ja", "jpn", "en", "eng", "hi", "hin")
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 setMediaItem(mediaItem, startPositionMs)
                 prepare()
@@ -333,6 +339,8 @@ class PlayerManager(
                     Player.STATE_ENDED -> {
                         _isBuffering.value = false
                         _isPlaying.value = false
+                        _isPlaybackEnded.value = true
+                        onPlaybackEndedCallback?.invoke()
                     }
                     Player.STATE_IDLE -> {
                         _isBuffering.value = false
@@ -480,9 +488,11 @@ class PlayerManager(
         val player = exoPlayer ?: return
         when (option.id) {
             "auto_audio" -> {
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
                     .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 _availableAudioTracks.value = _availableAudioTracks.value.map {
                     it.copy(isSelected = it.id == "auto_audio")
@@ -601,6 +611,7 @@ class PlayerManager(
         _exoPlayerInstance.value = null
         _isPlaying.value = false
         _isBuffering.value = false
+        _isPlaybackEnded.value = false
     }
 
     companion object {

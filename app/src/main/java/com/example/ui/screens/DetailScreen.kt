@@ -26,10 +26,19 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.layout.statusBarsPadding
+import com.example.data.download.DownloadManager
+import com.example.data.local.DownloadEntry
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -101,6 +110,13 @@ fun DetailScreen(
     val isLoadingSources by viewModel.isLoadingSources.collectAsStateWithLifecycle()
     val sourceError by viewModel.sourceError.collectAsStateWithLifecycle()
 
+    val context = LocalContext.current
+    val downloadManager = remember { DownloadManager.getInstance(context) }
+    val downloads by remember(anime?.id) {
+        if (anime != null) downloadManager.observeDownloadsForAnime(anime!!.id)
+        else kotlinx.coroutines.flow.flowOf(emptyList())
+    }.collectAsStateWithLifecycle(initialValue = emptyList())
+
     var isSynopsisExpanded by remember { mutableStateOf(false) }
 
     Box(
@@ -164,6 +180,7 @@ fun DetailScreen(
                         IconButton(
                             onClick = onBackClick,
                             modifier = Modifier
+                                .statusBarsPadding()
                                 .padding(start = 8.dp, top = 8.dp)
                                 .align(Alignment.TopStart)
                                 .testTag("detail_back_button")
@@ -428,30 +445,106 @@ fun DetailScreen(
                     // Episodes List
                     if (episodes.isEmpty()) {
                         item {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(32.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (isLoading) {
-                                    CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(28.dp))
-                                } else {
-                                    Text(
-                                        text = "Loading catalog episodes...",
-                                        color = TextMuted,
-                                        fontSize = 13.sp
-                                    )
+                            if (isLoading) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(32.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(28.dp))
+                                        Text(
+                                            text = "Syncing episodes from catalog...",
+                                            color = TextSecondary,
+                                            fontSize = 13.sp
+                                        )
+                                    }
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 20.dp, vertical = 24.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Card(
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(20.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Info,
+                                                contentDescription = null,
+                                                tint = AccentCoral,
+                                                modifier = Modifier.size(32.dp)
+                                            )
+                                            Text(
+                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else "No Episodes for Season $selectedSeason",
+                                                color = TextPrimary,
+                                                fontSize = 15.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                textAlign = TextAlign.Center
+                                            )
+                                            Text(
+                                                text = if (item.backendAnimeId == null) {
+                                                    "Playable episodes for \"${item.preferredTitle}\" are not currently available in the streaming provider catalog.\n(Live Action was strictly excluded to prevent incorrect playback)."
+                                                } else {
+                                                    "No episodes were found for Season $selectedSeason. Try refreshing or selecting another season."
+                                                },
+                                                color = TextMuted,
+                                                fontSize = 12.sp,
+                                                textAlign = TextAlign.Center,
+                                                lineHeight = 17.sp
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Button(
+                                                onClick = { viewModel.refreshDetails() },
+                                                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Refresh,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Retry Catalog Sync", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else {
                         items(episodes, key = { it.id }) { ep ->
+                            val downloadEntry = downloads.firstOrNull { it.episodeId == ep.id }
                             EpisodeRow(
                                 episode = ep,
                                 isPlayed = lastPlayed?.episodeId == ep.id,
+                                downloadEntry = downloadEntry,
                                 onPlayClick = { onPlayEpisode(item.id, ep.id) },
-                                onSourcesClick = { viewModel.openSourceChooser(ep) }
+                                onSourcesClick = { viewModel.openSourceChooser(ep) },
+                                onDownloadClick = {
+                                    downloadManager.startOrResumeDownload(
+                                        animeId = item.id,
+                                        episodeId = ep.id,
+                                        seasonNumber = ep.seasonNumber,
+                                        episodeNumber = ep.episodeNumber,
+                                        episodeTitle = ep.title,
+                                        animeTitle = item.preferredTitle,
+                                        posterUrl = item.posterUrl,
+                                        mediaType = item.mediaCategory ?: "anime"
+                                    )
+                                }
                             )
                         }
                     }
@@ -563,8 +656,10 @@ fun DetailScreen(
 fun EpisodeRow(
     episode: EpisodeEntry,
     isPlayed: Boolean,
+    downloadEntry: DownloadEntry? = null,
     onPlayClick: () -> Unit,
-    onSourcesClick: () -> Unit
+    onSourcesClick: () -> Unit,
+    onDownloadClick: () -> Unit = {}
 ) {
     Card(
         shape = RoundedCornerShape(10.dp),
@@ -628,6 +723,44 @@ fun EpisodeRow(
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // Download button / status
+                when {
+                    downloadEntry?.isCompleted == true -> {
+                        Icon(
+                            imageVector = Icons.Default.DownloadDone,
+                            contentDescription = "Downloaded",
+                            tint = PlayableGreen,
+                            modifier = Modifier
+                                .size(28.dp)
+                                .padding(4.dp)
+                        )
+                    }
+                    downloadEntry?.isDownloading == true -> {
+                        CircularProgressIndicator(
+                            color = AccentCyan,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier
+                                .size(24.dp)
+                                .padding(2.dp)
+                        )
+                    }
+                    else -> {
+                        IconButton(
+                            onClick = onDownloadClick,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Download,
+                                contentDescription = "Download",
+                                tint = TextMuted,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(4.dp))
+
                 Text(
                     text = "Sources",
                     fontSize = 11.sp,

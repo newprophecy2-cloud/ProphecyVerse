@@ -50,6 +50,9 @@ class AnimeRepository(
     fun observeTrending(): Flow<List<AnimeEntry>> = animeDao.observeTrending()
     fun observeSeasonal(): Flow<List<AnimeEntry>> = animeDao.observeSeasonal()
     fun observePopular(): Flow<List<AnimeEntry>> = animeDao.observePopular()
+    fun observeKDramas(): Flow<List<AnimeEntry>> = animeDao.observeKDramas()
+    fun observeMovies(): Flow<List<AnimeEntry>> = animeDao.observeMovies()
+    fun observeWebSeries(): Flow<List<AnimeEntry>> = animeDao.observeWebSeries()
     fun observeAnimeById(id: String): Flow<AnimeEntry?> = animeDao.observeAnimeById(id)
     fun observeSeasons(animeId: String): Flow<List<SeasonEntry>> = episodeDao.observeSeasons(animeId)
     fun observeEpisodes(animeId: String, seasonNumber: Int): Flow<List<EpisodeEntry>> =
@@ -77,9 +80,27 @@ class AnimeRepository(
     fun observeLastPlayedForAnime(animeId: String): Flow<PlaybackHistory?> =
         historyDao.observeLastPlayedForAnime(animeId)
 
+    fun observeProfile(): Flow<com.example.data.local.LocalProfile?> = database.localProfileDao().observeProfile()
+    suspend fun getProfile(): com.example.data.local.LocalProfile? = database.localProfileDao().getProfile()
+    suspend fun updateProfile(name: String, avatarId: String, bio: String) {
+        withContext(Dispatchers.IO) {
+            val current = database.localProfileDao().getProfile() ?: com.example.data.local.LocalProfile()
+            database.localProfileDao().upsertProfile(
+                current.copy(
+                    name = name,
+                    avatarId = avatarId,
+                    bio = bio,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
     /**
      * Discovery sync: fetches trending, seasonal, and popular feeds from AniList,
-     * normalizes and writes into Room. The UI only observes Room.
+     * verifies availability against ProphecyVerse provider catalog,
+     * and discovers confirmed available Anime, K-Dramas, Movies, and Web Series.
+     * The UI only observes Room.
      */
     suspend fun refreshHomeDiscovery(): Result<Unit> = withContext(Dispatchers.IO) {
         try {
@@ -98,14 +119,11 @@ class AnimeRepository(
                 variables = mapOf("season" to season, "seasonYear" to year)
             )
             val response = aniListApi.postQuery(request)
-            if (!response.isSuccessful || response.body()?.data == null) {
-                return@withContext Result.failure(Exception("AniList discovery error: ${response.code()}"))
-            }
+            val data = if (response.isSuccessful) response.body()?.data else null
 
-            val data = response.body()!!.data!!
-            val trendingMedia = data.trending?.media ?: emptyList()
-            val seasonalMedia = data.seasonal?.media ?: emptyList()
-            val popularMedia = data.popular?.media ?: emptyList()
+            val trendingMedia = data?.trending?.media ?: emptyList()
+            val seasonalMedia = data?.seasonal?.media ?: emptyList()
+            val popularMedia = data?.popular?.media ?: emptyList()
 
             val allMedia = (trendingMedia + seasonalMedia + popularMedia).distinctBy { it.id }
             val trendingIds = trendingMedia.map { it.id }.toSet()
@@ -144,6 +162,7 @@ class AnimeRepository(
                     isTrending = trendingIds.contains(m.id),
                     isSeasonal = seasonalIds.contains(m.id),
                     isPopular = popularIds.contains(m.id),
+                    mediaCategory = "ANIME",
                     updatedAt = System.currentTimeMillis()
                 )
                 entriesToUpsert.add(entry)
@@ -157,6 +176,103 @@ class AnimeRepository(
                     aliasesToInsert.add(AnimeAlias(animeId = targetId, alias = TitleMatcher.normalize(syn), originalAlias = syn))
                 }
             }
+
+            // Verify top items for direct provider playability
+            for (i in 0 until minOf(8, entriesToUpsert.size)) {
+                val item = entriesToUpsert[i]
+                if (item.backendAnimeId == null) {
+                    try {
+                        val searchRes = prophecyApi.searchAnime(query = item.preferredTitle, limit = 5)
+                        if (searchRes.isSuccessful) {
+                            val results = searchRes.body()?.results ?: emptyList()
+                            val matched = results
+                                .map { p -> p to TitleMatcher.computeMatchConfidenceForEntry(item, p) }
+                                .filter { it.second >= 0.80f }
+                                .maxByOrNull { it.second }
+                            if (matched != null) {
+                                entriesToUpsert[i] = item.copy(
+                                    backendAnimeId = matched.first.id,
+                                    isPlayable = true
+                                )
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            // 2. Discover & verify K-Dramas from ProphecyVerse catalog
+            try {
+                val kdramaSearch = prophecyApi.searchAnime("korean", limit = 10)
+                if (kdramaSearch.isSuccessful) {
+                    kdramaSearch.body()?.results?.forEach { item ->
+                        val entry = AnimeEntry(
+                            id = item.id,
+                            backendAnimeId = item.id,
+                            preferredTitle = item.title,
+                            titleEnglish = item.title,
+                            format = item.mediaType ?: "series",
+                            year = item.year,
+                            posterUrl = item.posterUrl,
+                            isPlayable = true,
+                            mediaCategory = "KDRAMA",
+                            genres = "K-Drama, Romance, Drama",
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        entriesToUpsert.add(entry)
+                        aliasesToInsert.add(AnimeAlias(animeId = item.id, alias = TitleMatcher.normalize(item.title), originalAlias = item.title))
+                    }
+                }
+            } catch (_: Exception) {}
+
+            // 3. Discover & verify Movies from ProphecyVerse catalog
+            try {
+                val movieSearch = prophecyApi.searchAnime("movie", limit = 10)
+                if (movieSearch.isSuccessful) {
+                    movieSearch.body()?.results?.forEach { item ->
+                        val entry = AnimeEntry(
+                            id = item.id,
+                            backendAnimeId = item.id,
+                            preferredTitle = item.title,
+                            titleEnglish = item.title,
+                            format = "MOVIE",
+                            year = item.year,
+                            posterUrl = item.posterUrl,
+                            isPlayable = true,
+                            mediaCategory = "MOVIE",
+                            genres = "Movie, Action, Animation",
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        entriesToUpsert.add(entry)
+                        aliasesToInsert.add(AnimeAlias(animeId = item.id, alias = TitleMatcher.normalize(item.title), originalAlias = item.title))
+                    }
+                }
+            } catch (_: Exception) {}
+
+            // 4. Discover & verify Web Series from ProphecyVerse catalog
+            try {
+                val seriesSearch = prophecyApi.searchAnime("series", limit = 10)
+                if (seriesSearch.isSuccessful) {
+                    seriesSearch.body()?.results?.forEach { item ->
+                        if (!item.title.contains("Bonus", ignoreCase = true)) {
+                            val entry = AnimeEntry(
+                                id = item.id,
+                                backendAnimeId = item.id,
+                                preferredTitle = item.title,
+                                titleEnglish = item.title,
+                                format = "series",
+                                year = item.year,
+                                posterUrl = item.posterUrl,
+                                isPlayable = true,
+                                mediaCategory = "SERIES",
+                                genres = "Web Series, Drama",
+                                updatedAt = System.currentTimeMillis()
+                            )
+                            entriesToUpsert.add(entry)
+                            aliasesToInsert.add(AnimeAlias(animeId = item.id, alias = TitleMatcher.normalize(item.title), originalAlias = item.title))
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
 
             animeDao.upsertAnimeList(entriesToUpsert)
             animeDao.insertAliases(aliasesToInsert)
@@ -344,42 +460,71 @@ class AnimeRepository(
             var currentEntry = animeDao.getAnimeById(animeId)
             var backendId = currentEntry?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
+            // Check existing catalog mapping table first
+            if (backendId == null && currentEntry?.aniListId != null) {
+                val mapping = animeDao.getMappingForAniList(currentEntry.aniListId!!)
+                if (mapping != null) {
+                    backendId = mapping.backendAnimeId
+                    if (currentEntry?.backendAnimeId == null) {
+                        currentEntry = currentEntry!!.copy(backendAnimeId = backendId, isPlayable = true)
+                        animeDao.upsertAnime(currentEntry!!)
+                    }
+                }
+            }
+
             // If backendId is not yet known, search ProphecyVerse for matching title
             if (backendId == null && currentEntry != null) {
-                val searchRes = try {
-                    prophecyApi.searchAnime(query = currentEntry.preferredTitle, limit = 5)
-                } catch (e: Exception) { null }
+                val searchQueries = listOfNotNull(
+                    currentEntry!!.preferredTitle,
+                    currentEntry!!.titleEnglish?.takeIf { it != currentEntry!!.preferredTitle },
+                    currentEntry!!.titleRomaji?.takeIf { it != currentEntry!!.preferredTitle }
+                ).filter { it.isNotBlank() }
 
-                if (searchRes?.isSuccessful == true) {
-                    val pItems = searchRes.body()?.results ?: emptyList()
-                    val match = pItems.firstOrNull {
-                        TitleMatcher.normalize(it.title) == TitleMatcher.normalize(currentEntry?.preferredTitle)
-                    } ?: pItems.firstOrNull()
+                for (query in searchQueries) {
+                    val searchRes = try {
+                        prophecyApi.searchAnime(query = query, limit = 20)
+                    } catch (e: Exception) { null }
 
-                    if (match != null) {
-                        backendId = match.id
-                        currentEntry = currentEntry.copy(
-                            backendAnimeId = backendId,
-                            isPlayable = true
-                        )
-                        animeDao.upsertAnime(currentEntry)
-                        if (currentEntry.aniListId != null) {
-                            animeDao.upsertMapping(
-                                CatalogMapping(
-                                    aniListId = currentEntry.aniListId,
-                                    backendAnimeId = backendId,
-                                    confidence = 0.9f
-                                )
+                    if (searchRes?.isSuccessful == true) {
+                        val pItems = searchRes.body()?.results ?: emptyList()
+                        val matchedCandidate = pItems
+                            .map { pItem -> pItem to TitleMatcher.computeMatchConfidenceForEntry(currentEntry!!, pItem) }
+                            .filter { it.second >= 0.75f }
+                            .maxByOrNull { it.second }
+
+                        if (matchedCandidate != null) {
+                            val match = matchedCandidate.first
+                            backendId = match.id
+                            currentEntry = currentEntry!!.copy(
+                                backendAnimeId = backendId,
+                                isPlayable = true
                             )
+                            animeDao.upsertAnime(currentEntry!!)
+                            if (currentEntry!!.aniListId != null) {
+                                animeDao.upsertMapping(
+                                    CatalogMapping(
+                                        aniListId = currentEntry!!.aniListId!!,
+                                        backendAnimeId = backendId,
+                                        confidence = matchedCandidate.second
+                                    )
+                                )
+                            }
+                            break
                         }
                     }
                 }
             }
 
-            // Fetch ProphecyVerse details if backendId is available
+            // Fetch ProphecyVerse details and episodes if backendId is available
             if (backendId != null) {
-                val detailResp = prophecyApi.getAnimeDetails(backendId)
-                if (detailResp.isSuccessful && detailResp.body() != null) {
+                val detailResp = try {
+                    prophecyApi.getAnimeDetails(backendId)
+                } catch (e: Exception) { null }
+
+                val seasonsList = mutableListOf<SeasonEntry>()
+                val episodesList = mutableListOf<EpisodeEntry>()
+
+                if (detailResp?.isSuccessful == true && detailResp.body() != null) {
                     val body = detailResp.body()!!
 
                     // Update AnimeEntry
@@ -398,10 +543,6 @@ class AnimeRepository(
                         updatedAt = System.currentTimeMillis()
                     )
                     animeDao.upsertAnime(updatedEntry)
-
-                    // Write seasons and episodes into Room
-                    val seasonsList = mutableListOf<SeasonEntry>()
-                    val episodesList = mutableListOf<EpisodeEntry>()
 
                     body.seasons?.forEach { s ->
                         val seasonKey = "${animeId}_s${s.number}"
@@ -426,13 +567,63 @@ class AnimeRepository(
                             )
                         }
                     }
+                }
 
-                    if (seasonsList.isNotEmpty()) {
-                        episodeDao.upsertSeasons(seasonsList)
+                // Dedicated episodes endpoint fallback: if details had no episodes, query /episodes
+                if (episodesList.isEmpty()) {
+                    val epResp = try {
+                        prophecyApi.getAnimeEpisodes(backendId)
+                    } catch (e: Exception) { null }
+
+                    if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
+                        val dtoList = epResp.body()!!
+                        val seasonsSet = mutableSetOf<Int>()
+                        dtoList.forEach { ep ->
+                            val sNum = if (ep.season > 0) ep.season else 1
+                            seasonsSet.add(sNum)
+                            episodesList.add(
+                                EpisodeEntry(
+                                    id = ep.id,
+                                    animeId = animeId,
+                                    seasonNumber = sNum,
+                                    episodeNumber = ep.number,
+                                    title = ep.title ?: "Episode ${ep.number}",
+                                    overview = ep.overview
+                                )
+                            )
+                        }
+                        seasonsSet.sorted().forEach { sNum ->
+                            if (seasonsList.none { it.seasonNumber == sNum }) {
+                                seasonsList.add(
+                                    SeasonEntry(
+                                        id = "${animeId}_s$sNum",
+                                        animeId = animeId,
+                                        seasonNumber = sNum,
+                                        title = "Season $sNum"
+                                    )
+                                )
+                            }
+                        }
                     }
-                    if (episodesList.isNotEmpty()) {
-                        episodeDao.upsertEpisodes(episodesList)
-                    }
+                }
+
+                // If seasons still empty but episodes exist, add default Season 1
+                if (seasonsList.isEmpty() && episodesList.isNotEmpty()) {
+                    seasonsList.add(
+                        SeasonEntry(
+                            id = "${animeId}_s1",
+                            animeId = animeId,
+                            seasonNumber = 1,
+                            title = "Season 1"
+                        )
+                    )
+                }
+
+                if (seasonsList.isNotEmpty()) {
+                    episodeDao.upsertSeasons(seasonsList)
+                }
+                if (episodesList.isNotEmpty()) {
+                    episodeDao.upsertEpisodes(episodesList)
                 }
             }
 
@@ -561,10 +752,19 @@ class AnimeRepository(
         episodeNumber: Int,
         episodeTitle: String?,
         positionMs: Long,
-        durationMs: Long
+        durationMs: Long,
+        animeTitle: String? = null,
+        posterUrl: String? = null,
+        mediaType: String? = null
     ) {
         withContext(Dispatchers.IO) {
+            if (positionMs <= 0L && durationMs <= 0L) return@withContext
             val isCompleted = durationMs > 0 && positionMs >= (durationMs * 0.9)
+            val anime = animeDao.getAnimeById(animeId)
+            val resolvedTitle = animeTitle ?: anime?.preferredTitle ?: anime?.titleEnglish ?: "Anime"
+            val resolvedPoster = posterUrl ?: anime?.posterUrl
+            val resolvedType = mediaType ?: anime?.format ?: "ANIME"
+
             val history = PlaybackHistory(
                 id = "${animeId}_${episodeId}",
                 animeId = animeId,
@@ -575,6 +775,9 @@ class AnimeRepository(
                 positionMs = positionMs,
                 durationMs = durationMs,
                 completed = isCompleted,
+                animeTitle = resolvedTitle,
+                posterUrl = resolvedPoster,
+                mediaType = resolvedType,
                 lastPlayedAt = System.currentTimeMillis()
             )
             historyDao.upsertHistory(history)
