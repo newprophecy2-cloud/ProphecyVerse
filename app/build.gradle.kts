@@ -10,8 +10,7 @@ plugins {
 
 android {
   namespace = "com.example"
-  // API 34 is the platform supported by the native ARM64 AAPT2 in this environment.
-  compileSdk = 34
+  compileSdk = 36
 
   defaultConfig {
     applicationId = "com.aistudio.prophecyverse.vykqtb"
@@ -113,7 +112,7 @@ dependencies {
   implementation(libs.androidx.media3.session)
   implementation(libs.androidx.media3.exoplayer.hls)
   implementation(libs.androidx.media3.exoplayer.dash)
-  // implementation(libs.media3.ffmpeg.decoder)
+  implementation(libs.media3.ffmpeg.decoder)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   implementation(libs.firebase.firestore)

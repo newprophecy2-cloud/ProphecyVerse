@@ -27,6 +27,7 @@ import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
+import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
@@ -92,6 +93,7 @@ class PlayerManager(
     private var retryCount = 0
     private var onRetryRequested: (() -> Unit)? = null
     private var onPlaybackFailedCallback: (() -> Unit)? = null
+    private var lastWorkingTrackSelectionParams: androidx.media3.common.TrackSelectionParameters? = null
     var onPlaybackEndedCallback: (() -> Unit)? = null
     var onPositionUpdate: ((positionMs: Long, durationMs: Long) -> Unit)? = null
 
@@ -103,7 +105,8 @@ class PlayerManager(
         val trackIndex: Int = 0,
         val sampleMimeType: String? = null,
         val isEac3: Boolean = false,
-        val decoderType: String? = null
+        val decoderType: String? = null,
+        val isSupported: Boolean = true
     )
 
     fun initializePlayer(
@@ -182,15 +185,6 @@ class PlayerManager(
                 return DefaultAudioSink.Builder(context)
                     .setEnableFloatOutput(enableFloatOutput)
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .setAudioCapabilities(
-                        AudioCapabilities(
-                            intArrayOf(
-                                android.media.AudioFormat.ENCODING_PCM_16BIT,
-                                android.media.AudioFormat.ENCODING_PCM_FLOAT
-                            ),
-                            8
-                        )
-                    )
                     .build()
             }
 
@@ -204,24 +198,12 @@ class PlayerManager(
                 eventListener: AudioRendererEventListener,
                 out: ArrayList<Renderer>
             ) {
-                // 1. MediaCodecAudioRenderer for all non-EAC3 audio formats:
-                // We wrap mediaCodecSelector so that for EAC3 ("audio/eac3", "audio/eac3-joc"),
-                // it returns emptyList(). This guarantees MediaCodecAudioRenderer will never
-                // handle EAC3, leaving EAC3 exclusively to the FFmpeg software decoder.
-                // For all other audio formats (AAC, MP3, Opus, FLAC, Vorbis, etc.),
-                // mediaCodecSelector is called as usual, keeping existing ExoPlayer playback unchanged.
-                val selectiveMediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
-                    if (isEac3MimeType(mimeType)) {
-                        emptyList()
-                    } else {
-                        mediaCodecSelector.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
-                    }
-                }
-
+                // 1. MediaCodecAudioRenderer for all formats supported by platform MediaCodec.
+                // Standard mediaCodecSelector queries all available platform codecs (AAC, MP3, Opus, FLAC, Vorbis, and EAC3 if supported by the device).
                 out.add(
                     MediaCodecAudioRenderer(
                         context,
-                        selectiveMediaCodecSelector,
+                        mediaCodecSelector,
                         enableDecoderFallback,
                         eventHandler,
                         eventListener,
@@ -229,19 +211,18 @@ class PlayerManager(
                     )
                 )
 
-                // 2. FFmpeg Audio Decoder for EAC3 (dynamic extension if bundled):
+                // 2. FFmpeg Audio Decoder fallback (for EAC3, AC3, Opus, FLAC, Vorbis, etc.):
                 try {
-                    val ffmpegClass = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer")
-                    val constructor = ffmpegClass.getConstructor(
-                        android.os.Handler::class.java,
-                        AudioRendererEventListener::class.java,
-                        AudioSink::class.java
+                    out.add(
+                        FfmpegAudioRenderer(
+                            eventHandler,
+                            eventListener,
+                            audioSink
+                        )
                     )
-                    val ffmpegAudioRenderer = constructor.newInstance(eventHandler, eventListener, audioSink) as Renderer
-                    out.add(ffmpegAudioRenderer)
                     Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
-                } catch (_: Throwable) {
-                    // Standard MediaCodec handles platform-supported audio codecs
+                } catch (t: Throwable) {
+                    Log.w(TAG, "FFmpeg audio decoder registration failed: ${t.message}")
                 }
             }
         }.apply {
@@ -401,6 +382,26 @@ class PlayerManager(
                 _isBuffering.value = false
                 Log.e(TAG, "ExoPlayer error [${error.errorCode}]: ${error.message}", error)
 
+                // If track switching failed due to unsupported decoder on selected track, recover smoothly
+                if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED) {
+                    val prev = lastWorkingTrackSelectionParams
+                    if (prev != null) {
+                        Log.w(TAG, "Selected track decoder initialization failed. Reverting to previous working track.")
+                        lastWorkingTrackSelectionParams = null
+                        val currentPos = player.currentPosition
+                        player.trackSelectionParameters = prev
+                        _errorMessage.value = "Selected audio track cannot be decoded on this device. Reverted to previous working track."
+                        if (currentPos > 0) {
+                            player.seekTo(currentPos)
+                        }
+                        player.prepare()
+                        player.play()
+                        return
+                    }
+                }
+
                 val isResolvableHttp = error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
                         error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
                         error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
@@ -416,7 +417,7 @@ class PlayerManager(
                 } else {
                     val msg = when (error.errorCode) {
                         PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "Source unavailable (HTTP error)"
-                        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> "Decoder unsupported on device"
+                        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> "Audio/video decoder unsupported on this device"
                         PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> "Media container not supported by device"
                         else -> "Playback error encountered. Please select another source."
                     }
@@ -445,25 +446,40 @@ class PlayerManager(
             for (i in 0 until trackGroup.length) {
                 val format = trackGroup.getFormat(i)
                 val isSelected = groupInfo.isTrackSelected(i)
+                val isSupported = groupInfo.isTrackSupported(i)
 
                 when (type) {
                     C.TRACK_TYPE_AUDIO -> {
                         val lang = getDisplayLanguage(format.language)
                         val mime = format.sampleMimeType ?: ""
                         val isEac3 = isEac3MimeType(mime)
+                        val isAc3 = mime.contains("ac3", ignoreCase = true)
                         val codec = when {
                             isEac3 -> "EAC3"
-                            mime.contains("ac3", ignoreCase = true) -> "AC3"
+                            isAc3 -> "AC3"
                             mime.contains("mp4a", ignoreCase = true) || mime.contains("aac", ignoreCase = true) -> "AAC"
                             mime.contains("opus", ignoreCase = true) -> "OPUS"
                             mime.contains("flac", ignoreCase = true) -> "FLAC"
                             mime.contains("vorbis", ignoreCase = true) -> "VORBIS"
                             else -> mime.substringAfterLast('/').uppercase()
                         }
-                        val decoderBadge = if (isEac3) " [FFmpeg]" else ""
-                        val label = (if (codec.isNotBlank()) "$lang ($codec)" else lang) + decoderBadge
+                        val channelsStr = if (format.channelCount > 0) " (${format.channelCount}ch)" else ""
+                        val decoderType = when {
+                            !isSupported -> "Unsupported"
+                            isEac3 || isAc3 -> "FFmpeg"
+                            else -> "MediaCodec"
+                        }
+                        val decoderBadge = when {
+                            !isSupported -> " [Unsupported]"
+                            decoderType == "FFmpeg" -> " [FFmpeg]"
+                            else -> ""
+                        }
+                        val label = (if (codec.isNotBlank()) "$lang ($codec$channelsStr)" else lang) + decoderBadge
                         val uniqueId = "audio_${groupIndex}_${i}"
-                        if (isSelected) anyAudioSelected = true
+                        if (isSelected && isSupported) {
+                            anyAudioSelected = true
+                            _activeAudioDecoder.value = if (decoderType == "FFmpeg") "FFmpeg Audio Renderer (Software)" else "MediaCodec Hardware Audio Renderer"
+                        }
                         audioList.add(
                             TrackOption(
                                 id = uniqueId,
@@ -473,7 +489,8 @@ class PlayerManager(
                                 trackIndex = i,
                                 sampleMimeType = mime,
                                 isEac3 = isEac3,
-                                decoderType = if (isEac3) "FFmpeg" else "MediaCodec"
+                                decoderType = decoderType,
+                                isSupported = isSupported
                             )
                         )
                     }
@@ -481,22 +498,27 @@ class PlayerManager(
                         val lang = getDisplayLanguage(format.language)
                         val uniqueId = "sub_${groupIndex}_${i}"
                         if (isSelected) anySubSelected = true
-                        subList.add(TrackOption(uniqueId, lang, isSelected, trackGroup, i))
+                        subList.add(TrackOption(uniqueId, lang, isSelected, trackGroup, i, isSupported = isSupported))
                     }
                     C.TRACK_TYPE_VIDEO -> {
                         if (format.height > 0) {
                             val label = "${format.height}p" + (if (format.frameRate > 0) " (${format.frameRate.toInt()}fps)" else "")
                             val uniqueId = "video_${groupIndex}_${i}"
                             if (isSelected) anyVideoSelected = true
-                            qualityList.add(TrackOption(uniqueId, label, isSelected, trackGroup, i))
+                            qualityList.add(TrackOption(uniqueId, label, isSelected, trackGroup, i, isSupported = isSupported))
                         }
                     }
                 }
             }
         }
 
+        val hasSupportedAudio = audioList.any { it.isSupported }
+        if (!hasSupportedAudio && audioList.isNotEmpty()) {
+            _errorMessage.value = "Audio format is not supported by device decoders."
+        }
+
         // Add Auto/Default options at the front with guaranteed unique IDs
-        audioList.add(0, TrackOption("auto_audio", "Default Audio", isSelected = !anyAudioSelected))
+        audioList.add(0, TrackOption("auto_audio", "Default Audio", isSelected = !anyAudioSelected, isSupported = hasSupportedAudio))
         subList.add(0, TrackOption("off_sub", "Subtitles Off", isSelected = !anySubSelected))
         qualityList.add(0, TrackOption("auto_video", "Auto Quality", isSelected = !anyVideoSelected))
 
@@ -523,6 +545,7 @@ class PlayerManager(
         when (option.id) {
             "auto_audio" -> {
                 val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
+                lastWorkingTrackSelectionParams = player.trackSelectionParameters
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
                     .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
@@ -553,26 +576,44 @@ class PlayerManager(
             }
             else -> {
                 if (option.trackGroup != null) {
+                    if (option.id.startsWith("audio_") && !option.isSupported) {
+                        _errorMessage.value = "Audio track '${option.label}' cannot be decoded on this device. Keeping current track."
+                        return
+                    }
                     val override = TrackSelectionOverride(option.trackGroup, listOf(option.trackIndex))
+                    val previousParams = player.trackSelectionParameters
+                    if (option.id.startsWith("audio_")) {
+                        lastWorkingTrackSelectionParams = previousParams
+                    }
                     val builder = player.trackSelectionParameters.buildUpon()
                     if (option.id.startsWith("sub_")) {
                         builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
                     }
                     builder.setOverrideForType(override)
-                    player.trackSelectionParameters = builder.build()
-
-                    if (option.id.startsWith("audio_")) {
-                        _availableAudioTracks.value = _availableAudioTracks.value.map {
-                            it.copy(isSelected = it.id == option.id)
+                    try {
+                        player.trackSelectionParameters = builder.build()
+                        if (option.id.startsWith("audio_")) {
+                            _activeAudioDecoder.value = if (option.isEac3 || option.decoderType == "FFmpeg") {
+                                "FFmpeg Audio Renderer (Software)"
+                            } else {
+                                "MediaCodec Hardware Audio Renderer"
+                            }
+                            _availableAudioTracks.value = _availableAudioTracks.value.map {
+                                it.copy(isSelected = it.id == option.id)
+                            }
+                        } else if (option.id.startsWith("sub_")) {
+                            _availableSubtitles.value = _availableSubtitles.value.map {
+                                it.copy(isSelected = it.id == option.id)
+                            }
+                        } else if (option.id.startsWith("video_")) {
+                            _availableQualities.value = _availableQualities.value.map {
+                                it.copy(isSelected = it.id == option.id)
+                            }
                         }
-                    } else if (option.id.startsWith("sub_")) {
-                        _availableSubtitles.value = _availableSubtitles.value.map {
-                            it.copy(isSelected = it.id == option.id)
-                        }
-                    } else if (option.id.startsWith("video_")) {
-                        _availableQualities.value = _availableQualities.value.map {
-                            it.copy(isSelected = it.id == option.id)
-                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to apply track override: ${e.message}", e)
+                        player.trackSelectionParameters = previousParams
+                        _errorMessage.value = "Failed to switch track: ${e.message}"
                     }
                 }
             }

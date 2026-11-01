@@ -665,41 +665,43 @@ class AnimeRepository(
                     }
                 }
 
-                // Dedicated episodes endpoint fallback: if details had no episodes, query /episodes
-                if (episodesList.isEmpty()) {
-                    val epResp = try {
-                        prophecyApi.getAnimeEpisodes(backendId)
-                    } catch (e: Exception) { null }
+                // Dedicated episodes endpoint: ALWAYS query /episodes to ensure complete episode sequence (e.g. full 17 episodes)
+                val epResp = try {
+                    prophecyApi.getAnimeEpisodes(backendId)
+                } catch (e: Exception) { null }
 
-                    if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
-                        val dtoList = epResp.body()!!
-                        val seasonsSet = mutableSetOf<Int>()
-                        val defaultSeason = seasonsList.firstOrNull()?.seasonNumber ?: 1
-                        dtoList.forEach { ep ->
-                            val sNum = if (ep.season > 0) ep.season else defaultSeason
-                            seasonsSet.add(sNum)
-                            episodesList.add(
-                                EpisodeEntry(
-                                    id = ep.id,
+                if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
+                    val dtoList = epResp.body()!!
+                    val seasonsSet = mutableSetOf<Int>()
+                    val defaultSeason = seasonsList.firstOrNull()?.seasonNumber ?: 1
+                    dtoList.forEach { ep ->
+                        val sNum = if (ep.season > 0) ep.season else defaultSeason
+                        seasonsSet.add(sNum)
+                        val newEp = EpisodeEntry(
+                            id = ep.id,
+                            animeId = animeId,
+                            seasonNumber = sNum,
+                            episodeNumber = ep.number,
+                            title = ep.title ?: "Episode ${ep.number}",
+                            overview = ep.overview
+                        )
+                        val existingIndex = episodesList.indexOfFirst { it.id == ep.id }
+                        if (existingIndex >= 0) {
+                            episodesList[existingIndex] = newEp
+                        } else {
+                            episodesList.add(newEp)
+                        }
+                    }
+                    seasonsSet.sorted().forEach { sNum ->
+                        if (seasonsList.none { it.seasonNumber == sNum }) {
+                            seasonsList.add(
+                                SeasonEntry(
+                                    id = "${animeId}_s$sNum",
                                     animeId = animeId,
                                     seasonNumber = sNum,
-                                    episodeNumber = ep.number,
-                                    title = ep.title ?: "Episode ${ep.number}",
-                                    overview = ep.overview
+                                    title = "Season $sNum"
                                 )
                             )
-                        }
-                        seasonsSet.sorted().forEach { sNum ->
-                            if (seasonsList.none { it.seasonNumber == sNum }) {
-                                seasonsList.add(
-                                    SeasonEntry(
-                                        id = "${animeId}_s$sNum",
-                                        animeId = animeId,
-                                        seasonNumber = sNum,
-                                        title = "Season $sNum"
-                                    )
-                                )
-                            }
                         }
                     }
                 }

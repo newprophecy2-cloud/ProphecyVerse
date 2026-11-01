@@ -418,11 +418,20 @@ class PlayerViewModel(
         viewModelScope.launch {
             // Find episode or wait for database
             repository.observeAllEpisodes(animeId).collect { epList ->
-                if (_currentEpisode.value == null && epList.isNotEmpty()) {
-                    val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
-                    _currentEpisode.value = target
-                    _selectedSeason.value = target.seasonNumber
-                    startPlaybackForEpisode(target)
+                if (epList.isNotEmpty()) {
+                    if (_currentEpisode.value == null) {
+                        val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
+                        _currentEpisode.value = target
+                        _selectedSeason.value = target.seasonNumber
+                        startPlaybackForEpisode(target)
+                    } else {
+                        val current = _currentEpisode.value
+                        val anime = AppDatabase.getInstance(application).animeDao().getAnimeById(animeId) ?: animeEntry.value
+                        val bId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
+                        if (current != null && bId != null) {
+                            preResolveManager.slideWindow(bId, current.id, epList)
+                        }
+                    }
                 }
             }
         }

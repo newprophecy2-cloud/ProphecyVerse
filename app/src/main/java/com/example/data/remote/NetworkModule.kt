@@ -25,7 +25,7 @@ object NetworkModule {
             .writeTimeout(25, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
-                    .header("User-Agent", "ProphecyVerse/1.0 (Android)")
+                    .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME} (Android)")
                     .build()
                 chain.proceed(request)
             }

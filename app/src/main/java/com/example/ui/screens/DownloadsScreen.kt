@@ -27,6 +27,9 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -47,6 +50,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -249,16 +253,17 @@ fun DownloadsScreen(
                     message = "Episodes or movies you download will appear here for completely offline playback."
                 )
             } else {
+                val completedGroups = remember(completedDownloads) { groupDownloads(completedDownloads) }
                 LazyColumn(
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 90.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(completedDownloads, key = { it.id }) { item ->
-                        DownloadedItemCard(
-                            item = item,
-                            onPlayClick = { onPlayOffline(item.animeId, item.id) },
-                            onMediaPageClick = { onAnimeClick(item.animeId) },
-                            onDeleteClick = { itemToDelete = item }
+                    items(completedGroups, key = { it.animeId }) { animeGroup ->
+                        DownloadedAnimeGroupCard(
+                            group = animeGroup,
+                            onPlayEpisode = { ep -> onPlayOffline(ep.animeId, ep.id) },
+                            onAnimeClick = { onAnimeClick(animeGroup.animeId) },
+                            onDeleteEpisode = { ep -> itemToDelete = ep }
                         )
                     }
                 }
@@ -319,6 +324,349 @@ fun DownloadsScreen(
             },
             containerColor = SurfaceDark
         )
+    }
+}
+
+data class DownloadSeasonGroup(
+    val seasonNumber: Int,
+    val isMovie: Boolean,
+    val episodes: List<DownloadEntry>
+) {
+    val totalBytes: Long get() = episodes.sumOf { it.downloadedBytes.coerceAtLeast(it.totalBytes) }
+}
+
+data class DownloadAnimeGroup(
+    val animeId: String,
+    val animeTitle: String,
+    val posterUrl: String?,
+    val isMovie: Boolean,
+    val seasons: List<DownloadSeasonGroup>
+) {
+    val totalEpisodes: Int get() = seasons.sumOf { it.episodes.size }
+    val totalBytes: Long get() = seasons.sumOf { it.totalBytes }
+}
+
+fun groupDownloads(items: List<DownloadEntry>): List<DownloadAnimeGroup> {
+    return items.groupBy { it.animeId }.map { (animeId, animeEntries) ->
+        val first = animeEntries.first()
+        val isMovieOnly = animeEntries.all {
+            it.mediaType.equals("movie", ignoreCase = true) || it.seasonNumber == 0
+        }
+        val seasonGroups = animeEntries.groupBy { it.seasonNumber }
+            .toSortedMap()
+            .map { (seasonNum, seasonEntries) ->
+                val isSeasonMovie = seasonNum == 0 || seasonEntries.all { it.mediaType.equals("movie", ignoreCase = true) }
+                DownloadSeasonGroup(
+                    seasonNumber = seasonNum,
+                    isMovie = isSeasonMovie,
+                    episodes = seasonEntries.sortedBy { it.episodeNumber }
+                )
+            }
+        DownloadAnimeGroup(
+            animeId = animeId,
+            animeTitle = first.animeTitle,
+            posterUrl = first.posterUrl,
+            isMovie = isMovieOnly,
+            seasons = seasonGroups
+        )
+    }.sortedBy { it.animeTitle }
+}
+
+@Composable
+fun DownloadedAnimeGroupCard(
+    group: DownloadAnimeGroup,
+    onPlayEpisode: (DownloadEntry) -> Unit,
+    onAnimeClick: () -> Unit,
+    onDeleteEpisode: (DownloadEntry) -> Unit
+) {
+    val context = LocalContext.current
+    var isExpanded by remember { mutableStateOf(true) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("download_anime_group_${group.animeId}"),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            // Header Row: Poster, Anime Title, Total Stats, Expand/Collapse
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { isExpanded = !isExpanded },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Card(
+                    modifier = Modifier
+                        .width(52.dp)
+                        .aspectRatio(0.72f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onAnimeClick),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    if (!group.posterUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = group.posterUrl,
+                            contentDescription = group.animeTitle,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(SurfaceHighlight),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(imageVector = Icons.Default.Movie, contentDescription = null, tint = TextMuted)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = group.animeTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    val totalSizeStr = Formatter.formatFileSize(context, group.totalBytes)
+                    val subtitle = if (group.isMovie) {
+                        "Movie  •  $totalSizeStr"
+                    } else {
+                        val seasonCount = group.seasons.size
+                        "${group.totalEpisodes} Episode${if (group.totalEpisodes > 1) "s" else ""}  •  $seasonCount Season${if (seasonCount > 1) "s" else ""}  •  $totalSizeStr"
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AccentCyan,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                IconButton(
+                    onClick = { isExpanded = !isExpanded },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                        contentDescription = if (isExpanded) "Collapse" else "Expand",
+                        tint = TextSecondary
+                    )
+                }
+            }
+
+            // Expanded hierarchy: Seasons -> Episodes
+            if (isExpanded) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    group.seasons.forEach { season ->
+                        DownloadedSeasonSection(
+                            season = season,
+                            isSingleMovie = group.isMovie,
+                            onPlayEpisode = onPlayEpisode,
+                            onDeleteEpisode = onDeleteEpisode
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DownloadedSeasonSection(
+    season: DownloadSeasonGroup,
+    isSingleMovie: Boolean,
+    onPlayEpisode: (DownloadEntry) -> Unit,
+    onDeleteEpisode: (DownloadEntry) -> Unit
+) {
+    val context = LocalContext.current
+    var isSeasonExpanded by remember { mutableStateOf(true) }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        // If it's not a standalone movie, display Season Header
+        if (!isSingleMovie && (season.seasonNumber > 0 || !season.isMovie)) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { isSeasonExpanded = !isSeasonExpanded },
+                color = SurfaceHighlight.copy(alpha = 0.5f),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val seasonLabel = if (season.isMovie) "Movie" else "Season ${season.seasonNumber}"
+                    Text(
+                        text = seasonLabel,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextPrimary,
+                        fontSize = 12.sp
+                    )
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val sizeStr = Formatter.formatFileSize(context, season.totalBytes)
+                        Text(
+                            text = "${season.episodes.size} Ep  •  $sizeStr",
+                            color = TextMuted,
+                            fontSize = 11.sp
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = if (isSeasonExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = TextMuted,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
+        if (isSeasonExpanded) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                season.episodes.forEach { episode ->
+                    DownloadedEpisodeItemRow(
+                        item = episode,
+                        isMovie = isSingleMovie || season.isMovie,
+                        onPlayClick = { onPlayEpisode(episode) },
+                        onDeleteClick = { onDeleteEpisode(episode) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DownloadedEpisodeItemRow(
+    item: DownloadEntry,
+    isMovie: Boolean,
+    onPlayClick: () -> Unit,
+    onDeleteClick: () -> Unit
+) {
+    val context = LocalContext.current
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("downloaded_row_${item.id}"),
+        shape = RoundedCornerShape(8.dp),
+        color = SpaceDark.copy(alpha = 0.6f)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Episode chip
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = AccentIndigo.copy(alpha = 0.25f)
+            ) {
+                Text(
+                    text = if (isMovie) "Movie" else "E${item.episodeNumber}",
+                    fontWeight = FontWeight.Bold,
+                    color = AccentCyan,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(10.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                val epTitle = item.episodeTitle?.takeIf { it.isNotBlank() } ?: "Episode ${item.episodeNumber}"
+                Text(
+                    text = epTitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = PlayableGreen.copy(alpha = 0.2f)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                tint = PlayableGreen,
+                                modifier = Modifier.size(9.dp)
+                            )
+                            Spacer(modifier = Modifier.width(2.dp))
+                            Text(
+                                text = "Offline Ready",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = PlayableGreen
+                            )
+                        }
+                    }
+                    if (!item.quality.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = item.quality,
+                            color = AccentCoral,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    val sizeStr = Formatter.formatFileSize(context, item.downloadedBytes.coerceAtLeast(item.totalBytes))
+                    Text(
+                        text = sizeStr,
+                        color = TextMuted,
+                        fontSize = 10.sp
+                    )
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onPlayClick, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Play Offline",
+                        tint = PlayableGreen,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                IconButton(onClick = onDeleteClick, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Delete",
+                        tint = TextMuted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
     }
 }
 

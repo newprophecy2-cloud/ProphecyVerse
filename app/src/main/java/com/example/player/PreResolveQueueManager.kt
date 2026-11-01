@@ -138,34 +138,37 @@ class PreResolveQueueManager(
     }
 
     private suspend fun preResolveEpisode(backendAnimeId: String, episodeId: String): Boolean {
-        try {
-            // 1. Fetch sources
-            val sourcesRes = repository.fetchEpisodeSources(backendAnimeId, episodeId)
-            val sources = sourcesRes.getOrNull()
-            if (sources.isNullOrEmpty()) {
-                Log.d(TAG, "No sources found during pre-resolve for ep $episodeId")
-                return false
-            }
-
-            // 2. Resolve direct playback for top candidate
-            for (source in sources) {
-                val directRes = repository.resolveDirectPlayback(source.id)
-                val directData = directRes.getOrNull()
-                if (directData != null && !directData.playbackUrl.isNullOrBlank()) {
-                    preparedCache[episodeId] = PreparedEpisode(
-                        episodeId = episodeId,
-                        source = source,
-                        directData = directData,
-                        resolvedAtMs = System.currentTimeMillis()
-                    )
-                    Log.i(TAG, "Successfully pre-resolved stream for episode $episodeId (source: ${source.id})")
-                    return true
+        return try {
+            kotlinx.coroutines.withTimeout(12000L) {
+                // 1. Fetch sources
+                val sourcesRes = repository.fetchEpisodeSources(backendAnimeId, episodeId)
+                val sources = sourcesRes.getOrNull()
+                if (sources.isNullOrEmpty()) {
+                    Log.d(TAG, "No sources found during pre-resolve for ep $episodeId")
+                    return@withTimeout false
                 }
+
+                // 2. Resolve direct playback for top candidate
+                for (source in sources) {
+                    val directRes = repository.resolveDirectPlayback(source.id)
+                    val directData = directRes.getOrNull()
+                    if (directData != null && !directData.playbackUrl.isNullOrBlank()) {
+                        preparedCache[episodeId] = PreparedEpisode(
+                            episodeId = episodeId,
+                            source = source,
+                            directData = directData,
+                            resolvedAtMs = System.currentTimeMillis()
+                        )
+                        Log.i(TAG, "Successfully pre-resolved stream for episode $episodeId (source: ${source.id})")
+                        return@withTimeout true
+                    }
+                }
+                false
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error during pre-resolution for episode $episodeId: ${e.message}")
+            false
         }
-        return false
     }
 
     /**

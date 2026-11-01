@@ -134,7 +134,7 @@ class NoticeManager private constructor(private val context: Context) {
         try {
             val request = Request.Builder()
                 .url("https://api.country.is/")
-                .header("User-Agent", "ProphecyVerse/1.0")
+                .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME}")
                 .build()
             val response = httpClient.newCall(request).execute()
             if (response.isSuccessful) {
@@ -155,7 +155,7 @@ class NoticeManager private constructor(private val context: Context) {
         try {
             val request = Request.Builder()
                 .url("https://ipapi.co/country/")
-                .header("User-Agent", "ProphecyVerse/1.0")
+                .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME}")
                 .build()
             val response = httpClient.newCall(request).execute()
             if (response.isSuccessful) {
