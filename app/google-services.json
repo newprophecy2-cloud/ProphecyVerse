@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "357805299753",
+    "project_id": "prophecy-verse-483df",
+    "storage_bucket": "prophecy-verse-483df.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:357805299753:android:0cafd3e3c6dc70244b2438",
+        "android_client_info": {
+          "package_name": "com.prophecyverse.admin"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBR4eWR7ctDHOcgB0c7yWne3aBwpMyZRe0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:357805299753:android:0cafd3e3c6dc70244b2438",
+        "android_client_info": {
+          "package_name": "com.prophecy.verse"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBR4eWR7ctDHOcgB0c7yWne3aBwpMyZRe0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

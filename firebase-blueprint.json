@@ -1,0 +1,74 @@
+{
+  "entities": {
+    "UserAccount": {
+      "collection": "users",
+      "documentId": "uid",
+      "fields": {
+        "uid": { "type": "string", "required": true },
+        "displayName": { "type": "string", "required": false },
+        "email": { "type": "string", "required": true },
+        "status": { "type": "string", "required": true, "enum": ["ACTIVE", "SUSPENDED", "PENDING_REVIEW"] },
+        "isDownloadBlocked": { "type": "boolean", "required": true },
+        "clientVersion": { "type": "string", "required": false },
+        "platform": { "type": "string", "required": true },
+        "createdAt": { "type": "timestamp", "required": false },
+        "updatedAt": { "type": "timestamp", "required": false }
+      }
+    },
+    "NoticeItem": {
+      "collection": "notices",
+      "documentId": "auto",
+      "fields": {
+        "title": { "type": "string", "required": true },
+        "content": { "type": "string", "required": true },
+        "type": { "type": "string", "required": true, "enum": ["info", "warning", "alert", "maintenance"] },
+        "published": { "type": "boolean", "required": true },
+        "priority": { "type": "integer", "required": true },
+        "actionUrl": { "type": "string", "required": false },
+        "actionLabel": { "type": "string", "required": false },
+        "targetVersion": { "type": "string", "required": false },
+        "createdAt": { "type": "timestamp", "required": false },
+        "updatedAt": { "type": "timestamp", "required": false }
+      }
+    },
+    "VersionConfig": {
+      "collection": "app_config",
+      "documentId": "version",
+      "fields": {
+        "versionName": { "type": "string", "required": true },
+        "versionCode": { "type": "integer", "required": true },
+        "minSupportedVersionCode": { "type": "integer", "required": true },
+        "isMandatory": { "type": "boolean", "required": true },
+        "updateUrl": { "type": "string", "required": true },
+        "updateMessage": { "type": "string", "required": false },
+        "sha256": { "type": "string", "required": false },
+        "updateSources": { "type": "array", "required": false },
+        "downloads": { "type": "array", "required": false }
+      }
+    },
+    "AdminRoleRecord": {
+      "collection": "admin_roles",
+      "documentId": "uid",
+      "fields": {
+        "role": { "type": "string", "required": true, "enum": ["SUPER_ADMIN", "ADMIN", "MODERATOR"] },
+        "status": { "type": "string", "required": true, "enum": ["ACTIVE", "SUSPENDED"] },
+        "email": { "type": "string", "required": true },
+        "permissions": { "type": "array", "required": true }
+      }
+    },
+    "AdminActivityLog": {
+      "collection": "admin_logs",
+      "documentId": "auto",
+      "fields": {
+        "adminUid": { "type": "string", "required": true },
+        "adminEmail": { "type": "string", "required": true },
+        "action": { "type": "string", "required": true },
+        "targetType": { "type": "string", "required": true },
+        "targetId": { "type": "string", "required": true },
+        "details": { "type": "string", "required": true },
+        "result": { "type": "string", "required": true },
+        "timestamp": { "type": "timestamp", "required": true }
+      }
+    }
+  }
+}

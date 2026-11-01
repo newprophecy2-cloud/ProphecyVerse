@@ -2,23 +2,32 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Astral Anime Palette - Deep cosmos with vibrant cyan and luminous indigo accents
-val SpaceDark = Color(0xFF0B0F19)
-val SurfaceDark = Color(0xFF131927)
-val SurfaceVariantDark = Color(0xFF1B2336)
-val SurfaceHighlight = Color(0xFF24304A)
+// Institutional Green & Clean White Palette
+val InstitutionalGreen = Color(0xFF0A5C36)
+val InstitutionalGreenDark = Color(0xFF00391D)
+val InstitutionalGreenLight = Color(0xFF76D89B)
+val InstitutionalGreenContainer = Color(0xFFD4EEDD)
+val OnInstitutionalGreenContainer = Color(0xFF00210E)
 
-val AccentIndigo = Color(0xFF4F80FF)
-val AccentCyan = Color(0xFF00E5D2)
-val AccentPurple = Color(0xFFA855F7)
-val AccentCoral = Color(0xFFFF5376)
-val AccentGold = Color(0xFFFFC043)
+val AdminSecondary = Color(0xFF4F6353)
+val AdminSecondaryContainer = Color(0xFFD2E8D4)
+val AdminTertiary = Color(0xFF3B6570)
+val AdminTertiaryContainer = Color(0xFFBFEAF7)
 
-val TextPrimary = Color(0xFFF1F5F9)
-val TextSecondary = Color(0xFF94A3B8)
-val TextMuted = Color(0xFF64748B)
+val AdminLightBg = Color(0xFFF9FAF9)
+val AdminLightSurface = Color(0xFFFFFFFF)
+val AdminLightOnSurface = Color(0xFF191C1A)
+val AdminLightSurfaceVariant = Color(0xFFE2E9E2)
+val AdminLightOutline = Color(0xFF717A72)
 
-val BorderSubtle = Color(0xFF232D42)
-val PlayableGreen = Color(0xFF10B981)
-val InfoBlue = Color(0xFF38BDF8)
-val ErrorRed = Color(0xFFF43F5E)
+val AdminDarkBg = Color(0xFF0E1510)
+val AdminDarkSurface = Color(0xFF131C16)
+val AdminDarkOnSurface = Color(0xFFE1E4E0)
+val AdminDarkSurfaceVariant = Color(0xFF3C463E)
+val AdminDarkOutline = Color(0xFF88938A)
+
+// Status colors
+val StatusActive = Color(0xFF15803D)
+val StatusSuspended = Color(0xFFDC2626)
+val StatusWarning = Color(0xFFD97706)
+val StatusInfo = Color(0xFF2563EB)

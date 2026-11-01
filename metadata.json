@@ -1,6 +1,6 @@
 {
-  "name": "ProphecyVerse",
-  "description": "Anime discovery and direct streaming player with database-first architecture, AniList metadata, and Media3 ExoPlayer.",
+  "name": "Prophecy Verse Admin",
+  "description": "Administrative control center for Prophecy Verse V3 to manage users, notices, versions, activity logs, and backend telemetry.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

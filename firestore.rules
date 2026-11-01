@@ -1,0 +1,106 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function roleDocumentExists() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admin_roles/$(request.auth.uid));
+    }
+
+    function hasActiveRole() {
+      return roleDocumentExists() &&
+        get(/databases/$(database)/documents/admin_roles/$(request.auth.uid)).data.status == "ACTIVE";
+    }
+
+    function isPrimaryOwnerActive() {
+      return isAuthenticated() &&
+        request.auth.token.email == "newprophecy9@gmail.com" &&
+        (!roleDocumentExists() || hasActiveRole());
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        isPrimaryOwnerActive() ||
+        (
+          request.auth.token.admin == true &&
+          (!roleDocumentExists() || hasActiveRole())
+        ) ||
+        (
+          hasActiveRole() &&
+          get(/databases/$(database)/documents/admin_roles/$(request.auth.uid)).data.role in ["SUPER_ADMIN", "ADMIN"]
+        )
+      );
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        isPrimaryOwnerActive() ||
+        (
+          request.auth.token.role == "super_admin" &&
+          (!roleDocumentExists() || hasActiveRole())
+        ) ||
+        (
+          hasActiveRole() &&
+          get(/databases/$(database)/documents/admin_roles/$(request.auth.uid)).data.role == "SUPER_ADMIN"
+        )
+      );
+    }
+
+    function isModerator() {
+      return isAdmin() || (
+        hasActiveRole() &&
+        get(/databases/$(database)/documents/admin_roles/$(request.auth.uid)).data.role == "MODERATOR"
+      );
+    }
+
+    // User accounts: users may edit their profile but not moderation or privilege fields.
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isModerator();
+      allow create: if isOwner(userId);
+      allow update: if isAdmin() ||
+        (isModerator() && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["status", "moderationReason", "isDownloadBlocked", "updatedAt"])) ||
+        (isOwner(userId) && !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(["status", "moderationReason", "isDownloadBlocked", "role", "admin", "isAdmin", "permissions"]));
+      allow delete: if isAdmin();
+    }
+
+    // Notices broadcast collection
+    match /notices/{noticeId} {
+      allow read: if (resource != null && resource.data.published == true) || isModerator();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Version configuration
+    match /app_config/{configId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /version_config/{configId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Administrative roles are provisioned only by trusted server-side code.
+    match /admin_roles/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      allow write: if false;
+    }
+
+    // Administrative activity logs are append-only.
+    match /admin_logs/{logId} {
+      allow read: if isModerator();
+      allow create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}

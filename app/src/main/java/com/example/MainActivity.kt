@@ -1,352 +1,197 @@
 package com.example
 
-import android.app.Application
-import android.app.PictureInPictureParams
-import android.content.res.Configuration
-import android.os.Build
 import android.os.Bundle
-import android.util.Rational
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bookmark
-import androidx.compose.material.icons.filled.Explore
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.AdminPanelSettings
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavHostController
-import androidx.navigation.NavType
-import androidx.navigation.compose.NavHost
-import androidx.navigation.compose.composable
-import androidx.navigation.compose.currentBackStackEntryAsState
-import androidx.navigation.compose.rememberNavController
-import androidx.navigation.navArgument
-import com.example.ui.navigation.Screen
-import com.example.ui.screens.DetailScreen
-import com.example.ui.screens.HistoryScreen
-import com.example.ui.screens.HomeScreen
-import com.example.ui.screens.LibraryScreen
-import com.example.ui.screens.PlayerScreen
-import com.example.ui.screens.SearchScreen
-import com.example.ui.screens.SettingsScreen
-import com.example.ui.theme.AccentCyan
-import com.example.ui.theme.AccentIndigo
-import com.example.ui.theme.ProphecyVerseTheme
-import com.example.ui.theme.SpaceDark
-import com.example.ui.theme.SurfaceDark
-import com.example.ui.theme.SurfaceHighlight
-import com.example.ui.theme.TextMuted
-import com.example.ui.theme.TextPrimary
-import com.example.ui.viewmodels.DetailViewModel
-import com.example.ui.viewmodels.HomeViewModel
-import com.example.ui.viewmodels.LibraryViewModel
-import com.example.ui.viewmodels.PlayerViewModel
-import com.example.ui.viewmodels.SearchViewModel
-
-import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.remember
-import com.example.data.notice.NoticeManager
-import com.example.ui.components.BilingualNoticeDialog
-import kotlinx.coroutines.launch
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.analytics.AnalyticsScreen
+import com.example.analytics.AnalyticsViewModel
+import com.example.auth.AdminAuthManager
+import com.example.auth.AuthStatus
+import com.example.dashboard.DashboardScreen
+import com.example.dashboard.DashboardViewModel
+import com.example.logs.ActivityLogsScreen
+import com.example.logs.LogsViewModel
+import com.example.navigation.AdminNavDestination
+import com.example.notices.NoticeEditorScreen
+import com.example.notices.NoticeManagementScreen
+import com.example.notices.NoticeViewModel
+import com.example.schema.SchemaAuditScreen
+import com.example.settings.SettingsScreen
+import com.example.settings.SettingsViewModel
+import com.example.ui.components.AdminScaffold
+import com.example.ui.theme.InstitutionalGreen
+import com.example.ui.theme.ProphecyVerseAdminTheme
+import com.example.users.UserDetailScreen
+import com.example.users.UserManagementScreen
+import com.example.users.UserViewModel
+import com.example.version.VersionControlScreen
+import com.example.version.VersionViewModel
 
 class MainActivity : ComponentActivity() {
-    var isInPipMode by mutableStateOf(false)
-        private set
 
-    var isPlayerActive by mutableStateOf(false)
-    var isVideoPlaying by mutableStateOf(false)
+    private lateinit var authManager: AdminAuthManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
-        lifecycleScope.launch {
-            NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
-        }
+        authManager = AdminAuthManager(applicationContext)
 
         setContent {
-            ProphecyVerseTheme {
-                MainAppNav(
-                    isInPipMode = isInPipMode,
-                    onEnterPip = { enterPipMode() },
-                    onPlayerStateChanged = { active, playing ->
-                        isPlayerActive = active
-                        isVideoPlaying = playing
-                        updateAutoEnterPip(active && playing)
-                    }
-                )
-            }
-        }
-    }
-
-    override fun onPictureInPictureModeChanged(
-        isInPictureInPictureMode: Boolean,
-        newConfig: Configuration
-    ) {
-        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-        isInPipMode = isInPictureInPictureMode
-    }
-
-    override fun onUserLeaveHint() {
-        super.onUserLeaveHint()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (isPlayerActive && isVideoPlaying && !isInPipMode) {
-                enterPipMode()
-            }
-        }
-    }
-
-    fun enterPipMode() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
-                val params = PictureInPictureParams.Builder()
-                    .setAspectRatio(Rational(16, 9))
-                    .build()
-                enterPictureInPictureMode(params)
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun updateAutoEnterPip(enabled: Boolean) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            try {
-                val params = PictureInPictureParams.Builder()
-                    .setAspectRatio(Rational(16, 9))
-                    .setAutoEnterEnabled(enabled)
-                    .build()
-                setPictureInPictureParams(params)
-            } catch (_: Exception) {
+            ProphecyVerseAdminTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    AdminAppRoot(authManager = authManager)
+                }
             }
         }
     }
 }
 
 @Composable
-fun MainAppNav(
-    isInPipMode: Boolean = false,
-    onEnterPip: () -> Unit = {},
-    onPlayerStateChanged: (isActive: Boolean, isPlaying: Boolean) -> Unit = { _, _ -> }
-) {
-    val navController = rememberNavController()
-    val navBackStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = navBackStackEntry?.destination?.route
-    val context = LocalContext.current
-    val app = context.applicationContext as Application
-    val noticeManager = remember { NoticeManager.getInstance(context) }
-    val isNoticeVisible by noticeManager.isNoticeVisible.collectAsStateWithLifecycle()
-    val noticeContent by noticeManager.noticeContent.collectAsStateWithLifecycle()
+fun AdminAppRoot(authManager: AdminAuthManager) {
+    val authStatus by authManager.authStatus.collectAsState()
+    var currentDestination by remember { mutableStateOf<AdminNavDestination>(AdminNavDestination.Dashboard) }
 
-    // Hide bottom bar on player screen or when in PIP mode
-    val shouldShowBottomBar = !isInPipMode && currentRoute?.startsWith("player/") != true
+    val isAuthenticated = authStatus is AuthStatus.AuthenticatedAdmin
+    val activeAdminEmail = if (authStatus is AuthStatus.AuthenticatedAdmin) {
+        (authStatus as AuthStatus.AuthenticatedAdmin).email
+    } else {
+        ""
+    }
 
-    Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(SpaceDark),
-        containerColor = SpaceDark,
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        bottomBar = {
-            if (shouldShowBottomBar) {
-                BottomNavBar(navController = navController, currentRoute = currentRoute)
+    if (!isAuthenticated) {
+        com.example.auth.AuthScreen(authManager = authManager)
+    } else {
+        val dashboardVm: DashboardViewModel = viewModel()
+        val noticeVm: NoticeViewModel = viewModel()
+        val userVm: UserViewModel = viewModel()
+        val versionVm: VersionViewModel = viewModel()
+        val analyticsVm: AnalyticsViewModel = viewModel()
+        val logsVm: LogsViewModel = viewModel()
+        val settingsVm: SettingsViewModel = viewModel()
+
+        // Handle Back button for nested sub-screens
+        if (currentDestination !in AdminNavDestination.mainNavItems) {
+            BackHandler {
+                when (currentDestination) {
+                    is AdminNavDestination.UserDetail -> currentDestination = AdminNavDestination.UserManagement
+                    is AdminNavDestination.NoticeEditor -> currentDestination = AdminNavDestination.NoticeManagement
+                    else -> currentDestination = AdminNavDestination.Dashboard
+                }
             }
         }
-    ) { innerPadding ->
-        NavHost(
-            navController = navController,
-            startDestination = Screen.Home.route,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(if (isInPipMode) PaddingValues(0.dp) else innerPadding)
+
+        AdminScaffold(
+            currentDestination = currentDestination,
+            onNavigate = { destination -> currentDestination = destination },
+            onLogout = {
+                authManager.signOut()
+                currentDestination = AdminNavDestination.Dashboard
+            },
+            onRefresh = {
+                when (currentDestination) {
+                    is AdminNavDestination.Dashboard -> dashboardVm.refreshDashboard()
+                    is AdminNavDestination.NoticeManagement -> noticeVm.loadNotices()
+                    is AdminNavDestination.UserManagement -> userVm.loadUsers()
+                    is AdminNavDestination.VersionControl -> versionVm.loadVersionConfig()
+                    is AdminNavDestination.Analytics -> analyticsVm.fetchAnalytics()
+                    is AdminNavDestination.ActivityLogs -> logsVm.loadLogs()
+                    else -> {}
+                }
+            },
+            isFirebaseReady = authManager.isFirebaseReady(),
+            adminEmail = activeAdminEmail
         ) {
-            composable(Screen.Home.route) {
-                val homeViewModel: HomeViewModel = viewModel()
-                HomeScreen(
-                    viewModel = homeViewModel,
-                    onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
-                    },
-                    onPlayHistoryClick = { animeId, episodeId ->
-                        navController.navigate(Screen.Player.createRoute(animeId, episodeId))
-                    }
+            when (val dest = currentDestination) {
+                is AdminNavDestination.Dashboard -> DashboardScreen(
+                    viewModel = dashboardVm,
+                    onNavigate = { currentDestination = it }
                 )
-            }
-
-            composable(Screen.Search.route) {
-                val searchViewModel: SearchViewModel = viewModel()
-                SearchScreen(
-                    viewModel = searchViewModel,
-                    onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
-                    }
+                is AdminNavDestination.UserManagement -> UserManagementScreen(
+                    viewModel = userVm,
+                    onNavigate = { currentDestination = it }
                 )
-            }
-
-            composable(Screen.Library.route) {
-                val libraryViewModel: LibraryViewModel = viewModel()
-                LibraryScreen(
-                    viewModel = libraryViewModel,
-                    onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
-                    },
-                    onPlayHistoryClick = { animeId, episodeId ->
-                        navController.navigate(Screen.Player.createRoute(animeId, episodeId))
-                    }
+                is AdminNavDestination.UserDetail -> UserDetailScreen(
+                    uid = dest.uid,
+                    viewModel = userVm,
+                    adminEmail = activeAdminEmail,
+                    onBack = { currentDestination = AdminNavDestination.UserManagement }
                 )
-            }
-
-            composable(Screen.History.route) {
-                val libraryViewModel: LibraryViewModel = viewModel()
-                HistoryScreen(
-                    viewModel = libraryViewModel,
-                    onPlayHistoryClick = { animeId, episodeId ->
-                        navController.navigate(Screen.Player.createRoute(animeId, episodeId))
-                    }
+                is AdminNavDestination.NoticeManagement -> NoticeManagementScreen(
+                    viewModel = noticeVm,
+                    adminEmail = activeAdminEmail,
+                    onNavigate = { currentDestination = it }
                 )
-            }
-
-            composable(Screen.Settings.route) {
-                val libraryViewModel: LibraryViewModel = viewModel()
-                SettingsScreen(viewModel = libraryViewModel)
-            }
-
-            composable(
-                route = Screen.Detail.route,
-                arguments = listOf(navArgument("animeId") { type = NavType.StringType })
-            ) { backStackEntry ->
-                val animeId = backStackEntry.arguments?.getString("animeId") ?: return@composable
-                val detailViewModel = viewModel<DetailViewModel>(
-                    key = "detail_$animeId",
-                    factory = object : androidx.lifecycle.ViewModelProvider.Factory {
-                        @Suppress("UNCHECKED_CAST")
-                        override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
-                            return DetailViewModel(app, animeId) as T
-                        }
-                    }
+                is AdminNavDestination.NoticeEditor -> NoticeEditorScreen(
+                    noticeId = dest.noticeId,
+                    viewModel = noticeVm,
+                    adminEmail = activeAdminEmail,
+                    onBack = { currentDestination = AdminNavDestination.NoticeManagement }
                 )
-                DetailScreen(
-                    viewModel = detailViewModel,
-                    onBackClick = { navController.popBackStack() },
-                    onPlayEpisode = { aId, eId ->
-                        navController.navigate(Screen.Player.createRoute(aId, eId))
-                    }
+                is AdminNavDestination.VersionControl -> VersionControlScreen(
+                    viewModel = versionVm,
+                    adminEmail = activeAdminEmail
                 )
-            }
-
-            composable(
-                route = Screen.Player.route,
-                arguments = listOf(
-                    navArgument("animeId") { type = NavType.StringType },
-                    navArgument("episodeId") { type = NavType.StringType }
+                is AdminNavDestination.Analytics -> AnalyticsScreen(
+                    viewModel = analyticsVm
                 )
-            ) { backStackEntry ->
-                val animeId = backStackEntry.arguments?.getString("animeId") ?: return@composable
-                val episodeId = backStackEntry.arguments?.getString("episodeId") ?: return@composable
-
-                val playerViewModel = viewModel<PlayerViewModel>(
-                    key = "player_${animeId}_$episodeId",
-                    factory = object : androidx.lifecycle.ViewModelProvider.Factory {
-                        @Suppress("UNCHECKED_CAST")
-                        override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
-                            return PlayerViewModel(app, animeId, episodeId) as T
-                        }
-                    }
+                is AdminNavDestination.ActivityLogs -> ActivityLogsScreen(
+                    viewModel = logsVm
                 )
-                PlayerScreen(
-                    viewModel = playerViewModel,
-                    isInPipMode = isInPipMode,
-                    onEnterPip = onEnterPip,
-                    onPlayerStateChanged = onPlayerStateChanged,
-                    onBackClick = { navController.popBackStack() }
+                is AdminNavDestination.SchemaAudit -> SchemaAuditScreen()
+                is AdminNavDestination.Settings -> SettingsScreen(
+                    viewModel = settingsVm,
+                    adminEmail = activeAdminEmail,
+                    isFirebaseReady = authManager.isFirebaseReady()
                 )
             }
         }
-
-        BilingualNoticeDialog(
-            noticeContent = noticeContent,
-            isVisible = isNoticeVisible && !isInPipMode && currentRoute?.startsWith("player/") != true,
-            onDismiss = { noticeManager.dismissNotice() },
-            onTelegramClick = { noticeManager.openTelegramChannel(context) }
-        )
     }
 }
-
-@Composable
-fun BottomNavBar(
-    navController: NavHostController,
-    currentRoute: String?
-) {
-    val items = listOf(
-        NavigationItem(Screen.Home.route, "Discover", Icons.Default.Explore),
-        NavigationItem(Screen.Search.route, "Search", Icons.Default.Search),
-        NavigationItem(Screen.Library.route, "Library", Icons.Default.Bookmark),
-        NavigationItem(Screen.History.route, "History", Icons.Default.History),
-        NavigationItem(Screen.Settings.route, "Settings", Icons.Default.Settings)
-    )
-
-    NavigationBar(
-        containerColor = SurfaceDark,
-        tonalElevation = 8.dp
-    ) {
-        items.forEach { item ->
-            val isSelected = currentRoute == item.route
-            NavigationBarItem(
-                icon = {
-                    Icon(
-                        imageVector = item.icon,
-                        contentDescription = item.label
-                    )
-                },
-                label = { Text(text = item.label, fontSize = 11.sp) },
-                selected = isSelected,
-                onClick = {
-                    if (currentRoute != item.route) {
-                        navController.navigate(item.route) {
-                            popUpTo(Screen.Home.route) { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    }
-                },
-                colors = NavigationBarItemDefaults.colors(
-                    selectedIconColor = Color.White,
-                    selectedTextColor = AccentCyan,
-                    indicatorColor = AccentIndigo,
-                    unselectedIconColor = TextMuted,
-                    unselectedTextColor = TextMuted
-                ),
-                modifier = Modifier.testTag("nav_item_${item.route}")
-            )
-        }
-    }
-}
-
-data class NavigationItem(
-    val route: String,
-    val label: String,
-    val icon: androidx.compose.ui.graphics.vector.ImageVector
-)
