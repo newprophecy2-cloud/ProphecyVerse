@@ -92,7 +92,7 @@ import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodels.PlayerViewModel
 import kotlinx.coroutines.delay
 
-@OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(markerClass = [UnstableApi::class])
 @Composable
 fun PlayerScreen(
     viewModel: PlayerViewModel,

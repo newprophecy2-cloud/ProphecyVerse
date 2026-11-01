@@ -24,3 +24,6 @@
 *.keystore
 /debug.keystore
 /my-upload-key.jks
+
+# Public source/development archives must not be committed
+public/assets/**/*.zip
