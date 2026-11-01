@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.ui.theme.InstitutionalGreen
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 @Composable
@@ -322,10 +323,17 @@ fun AuthScreen(
                                 isLoading = true
                                 errorMessage = null
                                 scope.launch {
-                                    val result = authManager.loginWithEmail(loginEmail, loginPassword)
-                                    isLoading = false
-                                    if (result.isFailure) {
-                                        errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Login failed"
+                                    try {
+                                        val result = authManager.loginWithEmail(loginEmail, loginPassword)
+                                        if (result.isFailure) {
+                                            errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Login failed"
+                                        }
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        errorMessage = e.localizedMessage ?: "Login failed. Please try again."
+                                    } finally {
+                                        isLoading = false
                                     }
                                 }
                             },

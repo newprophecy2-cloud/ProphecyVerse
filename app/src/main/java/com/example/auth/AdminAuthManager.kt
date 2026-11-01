@@ -6,6 +6,7 @@ import com.example.data.model.AdminRoleRecord
 import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -148,6 +149,19 @@ class AdminAuthManager(private val context: Context) {
     }
 
     private suspend fun verifyAndAuthorize(uid: String, email: String, displayName: String) {
+        try {
+            verifyAndAuthorizeUnsafe(uid, email, displayName)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("AdminAuthManager", "Unexpected error while verifying administrator role", e)
+            _authStatus.value = AuthStatus.AuthError(
+                "Could not verify your administrator access. Check your role document and try again."
+            )
+        }
+    }
+
+    private suspend fun verifyAndAuthorizeUnsafe(uid: String, email: String, displayName: String) {
         _authStatus.value = AuthStatus.CheckingRole
         val currentUser = FirebaseAuthClient.currentUser()
         if (currentUser == null || currentUser.uid != uid || email.isBlank()) {

@@ -64,7 +64,12 @@ service cloud.firestore {
     // User accounts: users may edit their profile but not moderation or privilege fields.
     match /users/{userId} {
       allow read: if isOwner(userId) || isModerator();
-      allow create: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+        request.resource.data.keys().hasOnly([
+          "uid", "displayName", "email", "photoUrl", "status", "isDownloadBlocked",
+          "role", "clientVersion", "platform", "createdAt", "lastLoginAt", "updatedAt"
+        ]) &&
+        request.resource.data.get("role", "USER") == "USER";
       allow update: if isAdmin() ||
         (isModerator() && request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly(["status", "moderationReason", "isDownloadBlocked", "updatedAt"])) ||
