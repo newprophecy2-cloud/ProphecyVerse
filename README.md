@@ -47,7 +47,7 @@ The app strictly follows **database-first rendering**:
 
 ## 3. Advanced Media3 ExoPlayer Specification
 
-- **Engine:** AndroidX Media3 ExoPlayer (`androidx.media3:media3-exoplayer:1.5.1`).
+- **Engine:** AndroidX Media3 ExoPlayer (`androidx.media3:media3-exoplayer:1.4.1`).
 - **Header Injection:** Safe HTTP headers (`Referer`, `User-Agent`) injected via `DefaultHttpDataSource.Factory`.
 - **In-Memory Security:** Signed URLs, authorization tokens, and short-lived source IDs are kept strictly in memory for the active playback session and never written to Room, logs, or backups.
 - **Error & Expiry Handling:** If a stream link expires or connection drops, the player performs a single bounded retry by refreshing episode sources (Route D) and re-resolving direct play (Route E) once.
@@ -89,3 +89,23 @@ The app strictly follows **database-first rendering**:
   - Non-EAC3 (AAC) playback unchanged
   - ABI library verification for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`.
 
+
+
+## 6. Repaired security and release behavior
+
+The Android client is user-only and contains no administrative controls. Version verification is fail-closed: missing, disabled, malformed, or unreachable remote configuration shows a retry state rather than treating the client as up to date. Mandatory updates cannot be bypassed. Direct APK updates require HTTPS, the expected package ID, an adequate version code, the configured artifact SHA-256, and the configured signing-certificate SHA-256 before the Android installer is launched.
+
+The Android manifest disables cleartext traffic, and the FileProvider exposes only the temporary update-cache directory. The client does not create or overwrite the remote version configuration and does not write privileged suspension/download-policy fields. The local `firestore.rules` file is a proposed secure ruleset and has not been deployed to the live Firebase project.
+
+## 7. Build and verification
+
+Use a complete JDK 21 installation with `javac`, then run:
+
+```bash
+./gradlew clean
+./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest
+./gradlew :app:lintDebug
+```
+
+The final sandbox verification used JDK 21, Android API 34, and the native ARM64 AAPT2 toolchain. APK assembly and lint passed. Robolectric unit tests remain environment-blocked because the native runtime loader cannot initialize the bundled native libraries in this ARM64 sandbox; see `FINAL_AUDIT_REPORT.md` for the test disposition and remaining external configuration.

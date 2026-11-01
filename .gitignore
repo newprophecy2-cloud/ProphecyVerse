@@ -1,6 +1,6 @@
 *.iml
-.gradle/
-.kotlin/
+.gradle
+.kotlin
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -9,18 +9,10 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
-/build/
-/captures/
+/build
+/captures
 .externalNativeBuild
 .cxx
-
-# Local environment and credential files
+local.properties
 .env
-.env.*
-!.env.example
-
-# Android signing material (never commit local debug or release keys)
-*.jks
-*.keystore
-/debug.keystore
-/my-upload-key.jks
+debug.keystore

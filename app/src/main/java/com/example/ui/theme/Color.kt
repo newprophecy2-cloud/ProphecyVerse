@@ -2,23 +2,29 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Astral Anime Palette - Deep cosmos with vibrant cyan and luminous indigo accents
-val SpaceDark = Color(0xFF0B0F19)
-val SurfaceDark = Color(0xFF131927)
-val SurfaceVariantDark = Color(0xFF1B2336)
-val SurfaceHighlight = Color(0xFF24304A)
+val SpaceDark = Color(0xFF0B0E14)
+val SurfaceDark = Color(0xFF131722)
+val SurfaceVariantDark = Color(0xFF1C2230)
+val SurfaceHighlight = Color(0xFF283244)
 
-val AccentIndigo = Color(0xFF4F80FF)
-val AccentCyan = Color(0xFF00E5D2)
+val AccentCyan = Color(0xFF00E5FF)
+val AccentIndigo = Color(0xFF6366F1)
 val AccentPurple = Color(0xFFA855F7)
-val AccentCoral = Color(0xFFFF5376)
-val AccentGold = Color(0xFFFFC043)
+val AccentCoral = Color(0xFFFF6B6B)
+val AccentGold = Color(0xFFFBBF24)
 
-val TextPrimary = Color(0xFFF1F5F9)
+val PlayableGreen = Color(0xFF10B981)
+val InfoBlue = Color(0xFF3B82F6)
+val ErrorRed = Color(0xFFEF4444)
+
+val TextPrimary = Color(0xFFF8FAFC)
 val TextSecondary = Color(0xFF94A3B8)
 val TextMuted = Color(0xFF64748B)
 
-val BorderSubtle = Color(0xFF232D42)
-val PlayableGreen = Color(0xFF10B981)
-val InfoBlue = Color(0xFF38BDF8)
-val ErrorRed = Color(0xFFF43F5E)
+val Purple80 = Color(0xFFD0BCFF)
+val PurpleGrey80 = Color(0xFFCCC2DC)
+val Pink80 = Color(0xFFEFB8C8)
+
+val Purple40 = Color(0xFF6650a4)
+val PurpleGrey40 = Color(0xFF625b71)
+val Pink40 = Color(0xFF7D5260)

@@ -10,14 +10,15 @@ plugins {
 
 android {
   namespace = "com.example"
-  compileSdk { version = release(36) { minorApiLevel = 1 } }
+  // API 34 is the platform supported by the native ARM64 AAPT2 in this environment.
+  compileSdk = 34
 
   defaultConfig {
     applicationId = "com.aistudio.prophecyverse.vykqtb"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 5
+    versionName = "3.0.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -112,15 +113,14 @@ dependencies {
   implementation(libs.androidx.media3.session)
   implementation(libs.androidx.media3.exoplayer.hls)
   implementation(libs.androidx.media3.exoplayer.dash)
-  implementation(libs.media3.ffmpeg.decoder)
+  // implementation(libs.media3.ffmpeg.decoder)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
-  // Uncomment to use Firestore:
-  // implementation(libs.firebase.firestore)
-
-  // Uncomment ALL FOUR of the following dependencies together to use Firebase Auth and Google
-  // Sign-In via Credential Manager:
-  // implementation(libs.firebase.auth)
+  implementation(libs.firebase.firestore)
+  implementation(libs.firebase.auth)
+  implementation(libs.firebase.analytics)
+  implementation(libs.firebase.messaging)
+  implementation(libs.firebase.config)
   // implementation(libs.androidx.credentials)
   // implementation(libs.androidx.credentials.play.services)
   // implementation(libs.googleid)

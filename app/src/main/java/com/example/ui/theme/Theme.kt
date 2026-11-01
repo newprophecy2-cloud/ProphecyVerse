@@ -1,21 +1,26 @@
 package com.example.ui.theme
 
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(
-    primary = AccentIndigo,
-    onPrimary = Color.White,
-    primaryContainer = SurfaceHighlight,
-    onPrimaryContainer = AccentCyan,
-    secondary = AccentCyan,
-    onSecondary = SpaceDark,
+private val ProphecyDarkColorScheme = darkColorScheme(
+    primary = AccentCyan,
+    onPrimary = SpaceDark,
+    primaryContainer = AccentIndigo,
+    onPrimaryContainer = Color.White,
+    secondary = AccentIndigo,
+    onSecondary = Color.White,
     secondaryContainer = SurfaceVariantDark,
-    onSecondaryContainer = AccentCyan,
-    tertiary = AccentPurple,
+    onSecondaryContainer = TextPrimary,
+    tertiary = PlayableGreen,
     onTertiary = Color.White,
     background = SpaceDark,
     onBackground = TextPrimary,
@@ -23,20 +28,34 @@ private val DarkColorScheme = darkColorScheme(
     onSurface = TextPrimary,
     surfaceVariant = SurfaceVariantDark,
     onSurfaceVariant = TextSecondary,
-    outline = BorderSubtle,
-    outlineVariant = SurfaceHighlight,
     error = ErrorRed,
     onError = Color.White
 )
 
 @Composable
 fun ProphecyVerseTheme(
-    darkTheme: Boolean = true, // Anime app is dark-first
+    darkTheme: Boolean = true,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
+    val colorScheme = ProphecyDarkColorScheme
+
     MaterialTheme(
-        colorScheme = DarkColorScheme,
+        colorScheme = colorScheme,
         typography = Typography,
+        content = content
+    )
+}
+
+@Composable
+fun MyApplicationTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    dynamicColor: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    ProphecyVerseTheme(
+        darkTheme = darkTheme,
+        dynamicColor = dynamicColor,
         content = content
     )
 }

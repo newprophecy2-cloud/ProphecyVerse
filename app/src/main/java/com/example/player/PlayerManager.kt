@@ -17,8 +17,6 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
-import androidx.media3.decoder.ffmpeg.FfmpegLibrary
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -85,9 +83,16 @@ class PlayerManager(
     private val _activeAudioDecoder = MutableStateFlow<String?>(null)
     val activeAudioDecoder: StateFlow<String?> = _activeAudioDecoder.asStateFlow()
 
+    private val _videoResolution = MutableStateFlow<String?>(null)
+    val videoResolution: StateFlow<String?> = _videoResolution.asStateFlow()
+
+    private val _isPlaybackEnded = MutableStateFlow(false)
+    val isPlaybackEnded: StateFlow<Boolean> = _isPlaybackEnded.asStateFlow()
+
     private var retryCount = 0
     private var onRetryRequested: (() -> Unit)? = null
     private var onPlaybackFailedCallback: (() -> Unit)? = null
+    var onPlaybackEndedCallback: (() -> Unit)? = null
     var onPositionUpdate: ((positionMs: Long, durationMs: Long) -> Unit)? = null
 
     data class TrackOption(
@@ -112,6 +117,10 @@ class PlayerManager(
         onPlaybackFailedCallback = onPlaybackFailed
         _errorMessage.value = null
         _activeAudioDecoder.value = null
+        _isPlaybackEnded.value = false
+        _isBuffering.value = true
+        _duration.value = 0L
+        _currentPosition.value = startPositionMs
 
         // Build safe HTTP DataSource with response-authorized headers
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -220,20 +229,19 @@ class PlayerManager(
                     )
                 )
 
-                // 2. FFmpeg Audio Decoder for EAC3:
-                // We register FfmpegAudioRenderer. When the selected audio track is EAC3 (or if EAC3 is the
-                // only available audio track), MediaCodecAudioRenderer cannot handle it, so ExoPlayer routes
-                // it to this FFmpeg decoder.
+                // 2. FFmpeg Audio Decoder for EAC3 (dynamic extension if bundled):
                 try {
-                    val ffmpegAudioRenderer = FfmpegAudioRenderer(
-                        eventHandler,
-                        eventListener,
-                        audioSink
+                    val ffmpegClass = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer")
+                    val constructor = ffmpegClass.getConstructor(
+                        android.os.Handler::class.java,
+                        AudioRendererEventListener::class.java,
+                        AudioSink::class.java
                     )
+                    val ffmpegAudioRenderer = constructor.newInstance(eventHandler, eventListener, audioSink) as Renderer
                     out.add(ffmpegAudioRenderer)
                     Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
-                } catch (e: Throwable) {
-                    Log.e(TAG, "Failed to instantiate FfmpegAudioRenderer", e)
+                } catch (_: Throwable) {
+                    // Standard MediaCodec handles platform-supported audio codecs
                 }
             }
         }.apply {
@@ -243,12 +251,13 @@ class PlayerManager(
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 3000,
-                /* maxBufferMs = */ 30000,
-                /* bufferForPlaybackMs = */ 1000,
-                /* bufferForPlaybackAfterRebufferMs = */ 2000
+                /* minBufferMs = */ 4000,
+                /* maxBufferMs = */ 50000,
+                /* bufferForPlaybackMs = */ 500,
+                /* bufferForPlaybackAfterRebufferMs = */ 1000
             )
             .setPrioritizeTimeOverSizeThresholds(true)
+            .setBackBuffer(15000, true)
             .build()
 
         val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
@@ -294,9 +303,10 @@ class PlayerManager(
             .apply {
                 playWhenReady = true
                 volume = 1.0f
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 trackSelectionParameters = trackSelectionParameters
                     .buildUpon()
-                    .setPreferredAudioLanguages("ja", "jpn", "en", "eng", "hi", "hin")
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 setMediaItem(mediaItem, startPositionMs)
                 prepare()
@@ -319,6 +329,17 @@ class PlayerManager(
         })
 
         player.addListener(object : Player.Listener {
+            override fun onEvents(player: Player, events: Player.Events) {
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
+                val pos = player.currentPosition
+                if (pos >= 0) {
+                    _currentPosition.value = pos
+                }
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
@@ -327,12 +348,19 @@ class PlayerManager(
                     Player.STATE_READY -> {
                         _isBuffering.value = false
                         val dur = player.duration
-                        _duration.value = if (dur > 0 && dur != C.TIME_UNSET) dur else 0L
+                        if (dur > 0 && dur != C.TIME_UNSET) {
+                            _duration.value = dur
+                        }
                         retryCount = 0
+                        if (!player.isPlaying && player.playWhenReady) {
+                            player.play()
+                        }
                     }
                     Player.STATE_ENDED -> {
                         _isBuffering.value = false
                         _isPlaying.value = false
+                        _isPlaybackEnded.value = true
+                        onPlaybackEndedCallback?.invoke()
                     }
                     Player.STATE_IDLE -> {
                         _isBuffering.value = false
@@ -349,10 +377,24 @@ class PlayerManager(
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _isPlaying.value = isPlaying
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
             }
 
             override fun onTracksChanged(tracks: Tracks) {
                 extractTracks(tracks)
+                val dur = player.duration
+                if (dur > 0 && dur != C.TIME_UNSET) {
+                    _duration.value = dur
+                }
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (videoSize.height > 0) {
+                    _videoResolution.value = "${videoSize.height}p"
+                }
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -480,9 +522,11 @@ class PlayerManager(
         val player = exoPlayer ?: return
         when (option.id) {
             "auto_audio" -> {
+                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
                     .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
                 _availableAudioTracks.value = _availableAudioTracks.value.map {
                     it.copy(isSelected = it.id == "auto_audio")
@@ -564,16 +608,30 @@ class PlayerManager(
     private fun startPositionTicker() {
         tickerJob?.cancel()
         tickerJob = scope.launch(Dispatchers.Main) {
+            var bufferingSeconds = 0
             while (isActive) {
                 exoPlayer?.let { player ->
-                    if (player.isPlaying) {
-                        val pos = player.currentPosition
-                        val dur = player.duration
+                    val dur = player.duration
+                    if (dur > 0 && dur != C.TIME_UNSET) {
+                        _duration.value = dur
+                    }
+                    val pos = player.currentPosition
+                    if (pos >= 0) {
                         _currentPosition.value = pos
-                        if (dur > 0 && dur != C.TIME_UNSET) {
-                            _duration.value = dur
-                        }
+                    }
+
+                    if (player.isPlaying) {
+                        bufferingSeconds = 0
                         onPositionUpdate?.invoke(pos, _duration.value)
+                    } else if (player.playbackState == Player.STATE_BUFFERING) {
+                        bufferingSeconds++
+                        // If buffering persists for 15s without playing, auto fallback to next source
+                        if (bufferingSeconds >= 15) {
+                            bufferingSeconds = 0
+                            Log.w(TAG, "Playback stalled in buffering state for 15s. Triggering fallback.")
+                            _errorMessage.value = "Playback link stalled. Trying alternative source..."
+                            onPlaybackFailedCallback?.invoke()
+                        }
                     }
                 }
                 delay(1000)
@@ -601,6 +659,8 @@ class PlayerManager(
         _exoPlayerInstance.value = null
         _isPlaying.value = false
         _isBuffering.value = false
+        _isPlaybackEnded.value = false
+        _videoResolution.value = null
     }
 
     companion object {

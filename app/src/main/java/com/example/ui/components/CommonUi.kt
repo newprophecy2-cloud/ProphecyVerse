@@ -22,7 +22,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
@@ -68,12 +70,13 @@ fun AnimeCard(
 ) {
     Card(
         modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
             .testTag("anime_card_${anime.id}"),
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        border = BorderStroke(1.dp, SurfaceHighlight.copy(alpha = 0.5f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
     ) {
         Column {
             Box(
@@ -109,18 +112,36 @@ fun AnimeCard(
                     }
                 }
 
-                // Subtle gradient at bottom for readability
+                // Cinematic gradient scrim at bottom
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(60.dp)
+                        .height(72.dp)
                         .align(Alignment.BottomCenter)
                         .background(
                             Brush.verticalGradient(
-                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.90f))
                             )
                         )
                 )
+
+                // Dub / Sub indicator at TopStart
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = Color(0xFF0B0E14).copy(alpha = 0.85f),
+                    border = BorderStroke(0.5.dp, AccentCyan.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(6.dp)
+                ) {
+                    Text(
+                        text = if (anime.format?.contains("DUB", ignoreCase = true) == true) "DUB" else "SUB",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = AccentCyan,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
 
                 // Playable / Catalog Badge
                 Row(
@@ -131,7 +152,7 @@ fun AnimeCard(
                     if (anime.isPlayable) {
                         Surface(
                             shape = RoundedCornerShape(6.dp),
-                            color = PlayableGreen.copy(alpha = 0.9f)
+                            color = PlayableGreen.copy(alpha = 0.92f)
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -141,7 +162,7 @@ fun AnimeCard(
                                     imageVector = Icons.Default.PlayArrow,
                                     contentDescription = "Playable",
                                     tint = Color.White,
-                                    modifier = Modifier.size(12.dp)
+                                    modifier = Modifier.size(11.dp)
                                 )
                                 Spacer(modifier = Modifier.width(2.dp))
                                 Text(
@@ -155,7 +176,8 @@ fun AnimeCard(
                     } else {
                         Surface(
                             shape = RoundedCornerShape(6.dp),
-                            color = SurfaceDark.copy(alpha = 0.85f)
+                            color = SurfaceDark.copy(alpha = 0.85f),
+                            border = BorderStroke(0.5.dp, SurfaceHighlight)
                         ) {
                             Text(
                                 text = "Info",
@@ -173,7 +195,8 @@ fun AnimeCard(
                     if (score > 0) {
                         Surface(
                             shape = RoundedCornerShape(6.dp),
-                            color = Color.Black.copy(alpha = 0.75f),
+                            color = Color.Black.copy(alpha = 0.78f),
+                            border = BorderStroke(0.5.dp, AccentGold.copy(alpha = 0.4f)),
                             modifier = Modifier
                                 .align(Alignment.BottomStart)
                                 .padding(6.dp)
@@ -191,7 +214,7 @@ fun AnimeCard(
                                 Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = String.format("%.1f", score),
-                                    fontSize = 11.sp,
+                                    fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White
                                 )
@@ -204,30 +227,26 @@ fun AnimeCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(8.dp)
+                    .padding(horizontal = 9.dp, vertical = 8.dp)
             ) {
                 Text(
                     text = anime.preferredTitle,
                     style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = FontWeight.Bold,
                     color = TextPrimary,
+                    fontSize = 13.sp,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                Spacer(modifier = Modifier.height(2.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    val formatStr = anime.format ?: "ANIME"
-                    val yearStr = anime.year ?: ""
-                    Text(
-                        text = if (yearStr.isNotBlank()) "$formatStr • $yearStr" else formatStr,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextMuted,
-                        fontSize = 11.sp
-                    )
-                }
+                Spacer(modifier = Modifier.height(3.dp))
+                val formatStr = anime.format ?: "ANIME"
+                val yearStr = anime.year ?: ""
+                Text(
+                    text = if (yearStr.isNotBlank()) "$formatStr • $yearStr" else formatStr,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted,
+                    fontSize = 11.sp
+                )
             }
         }
     }
@@ -247,32 +266,69 @@ fun SectionHeader(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = TextPrimary
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.weight(1f)
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(3.5.dp)
+                    .height(20.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(AccentCyan, AccentIndigo)
+                        )
+                    )
             )
-            if (!subtitle.isNullOrBlank()) {
+            Spacer(modifier = Modifier.width(10.dp))
+            Column {
                 Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextMuted
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = TextPrimary,
+                    letterSpacing = 0.3.sp
                 )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
         if (onSeeAllClick != null) {
-            Text(
-                text = "See All",
-                style = MaterialTheme.typography.labelMedium,
-                color = AccentCyan,
-                fontWeight = FontWeight.SemiBold,
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = SurfaceHighlight.copy(alpha = 0.4f),
+                border = BorderStroke(1.dp, SurfaceHighlight.copy(alpha = 0.8f)),
                 modifier = Modifier
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .clickable(onClick = onSeeAllClick)
-                    .padding(horizontal = 4.dp, vertical = 2.dp)
-            )
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "See All",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = AccentCyan,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Icon(
+                        imageVector = androidx.compose.material.icons.Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = "See All",
+                        tint = AccentCyan,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
         }
     }
 }

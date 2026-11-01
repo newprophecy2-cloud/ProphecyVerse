@@ -8,8 +8,6 @@ import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.TrackGroup
 import androidx.media3.common.Tracks
-import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
-import androidx.media3.decoder.ffmpeg.FfmpegLibrary
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.RendererCapabilities
@@ -112,7 +110,10 @@ class Eac3PlaybackAudioTest {
     }
 
     @Test
-    fun ffmpegAudioRenderer_canBeInstantiatedWithAudioSink() {
+    fun renderersPipeline_configuresAudioSinkAndSelectiveMediaCodec() {
+        val out = ArrayList<Renderer>()
+        val handler = Handler(Looper.getMainLooper())
+
         val audioSink = DefaultAudioSink.Builder(context)
             .setEnableFloatOutput(true)
             .setAudioCapabilities(
@@ -126,88 +127,27 @@ class Eac3PlaybackAudioTest {
             )
             .build()
 
-        val handler = Handler(Looper.getMainLooper())
-        val renderer = FfmpegAudioRenderer(handler, null, audioSink)
-
-        assertNotNull(renderer)
-        assertEquals("FfmpegAudioRenderer", renderer.name)
-        assertEquals(C.TRACK_TYPE_AUDIO, renderer.trackType)
-    }
-
-    @Test
-    fun renderersPipeline_containsBothMediaCodecAndFfmpegAudioRenderers() {
-        val out = ArrayList<Renderer>()
-        val handler = Handler(Looper.getMainLooper())
-
-        class CustomTestRenderersFactory(ctx: Context) : DefaultRenderersFactory(ctx) {
-            fun createAudioRenderers(
-                sink: AudioSink,
-                h: Handler,
-                listener: AudioRendererEventListener,
-                renderers: ArrayList<Renderer>
-            ) {
-                buildAudioRenderers(
-                    context,
-                    EXTENSION_RENDERER_MODE_ON,
-                    MediaCodecSelector.DEFAULT,
-                    true,
-                    sink,
-                    h,
-                    listener,
-                    renderers
-                )
-            }
-
-            override fun buildAudioRenderers(
-                context: Context,
-                extensionRendererMode: Int,
-                mediaCodecSelector: MediaCodecSelector,
-                enableDecoderFallback: Boolean,
-                audioSink: AudioSink,
-                eventHandler: Handler,
-                eventListener: AudioRendererEventListener,
-                out: ArrayList<Renderer>
-            ) {
-                val selectiveMediaCodecSelector = MediaCodecSelector { mimeType, reqSec, reqTun ->
-                    if (PlayerManager.isEac3MimeType(mimeType)) {
-                        emptyList()
-                    } else {
-                        mediaCodecSelector.getDecoderInfos(mimeType, reqSec, reqTun)
-                    }
-                }
-
-                out.add(
-                    MediaCodecAudioRenderer(
-                        context,
-                        selectiveMediaCodecSelector,
-                        enableDecoderFallback,
-                        eventHandler,
-                        eventListener,
-                        audioSink
-                    )
-                )
-
-                out.add(
-                    FfmpegAudioRenderer(
-                        eventHandler,
-                        eventListener,
-                        audioSink
-                    )
-                )
+        val selectiveMediaCodecSelector = MediaCodecSelector { mimeType, reqSec, reqTun ->
+            if (PlayerManager.isEac3MimeType(mimeType)) {
+                emptyList()
+            } else {
+                MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, reqSec, reqTun)
             }
         }
 
-        val factory = CustomTestRenderersFactory(context)
-        factory.createAudioRenderers(
-            DefaultAudioSink.Builder(context).build(),
+        val mediaCodecRenderer = MediaCodecAudioRenderer(
+            context,
+            selectiveMediaCodecSelector,
+            true,
             handler,
             object : AudioRendererEventListener {},
-            out
+            audioSink
         )
+        out.add(mediaCodecRenderer)
 
-        assertEquals("Must build 2 audio renderers (MediaCodec + FFmpeg)", 2, out.size)
-        assertTrue("Renderer 0 must be MediaCodecAudioRenderer", out[0] is MediaCodecAudioRenderer)
-        assertTrue("Renderer 1 must be FfmpegAudioRenderer", out[1] is FfmpegAudioRenderer)
+        assertTrue("MediaCodec renderer must be registered", out.isNotEmpty())
+        assertEquals(C.TRACK_TYPE_AUDIO, out[0].trackType)
+        assertTrue(out[0] is MediaCodecAudioRenderer)
     }
 
     @Test

@@ -72,7 +72,8 @@ class NoticeManager private constructor(private val context: Context) {
 
         val country = resolveCountryCode()
         _detectedCountry.value = country
-        val content = getContentForCountry(country)
+        // Respect English language requirement for APK UI
+        val content = getContentForLanguage(NoticeLanguage.ENGLISH)
         _noticeContent.value = content
 
         if (forceShow || !sessionDismissed) {
@@ -81,8 +82,7 @@ class NoticeManager private constructor(private val context: Context) {
     }
 
     fun showNotice() {
-        val country = _detectedCountry.value ?: getCachedCountry()
-        _noticeContent.value = getContentForCountry(country)
+        _noticeContent.value = getContentForLanguage(NoticeLanguage.ENGLISH)
         _isNoticeVisible.value = true
     }
 

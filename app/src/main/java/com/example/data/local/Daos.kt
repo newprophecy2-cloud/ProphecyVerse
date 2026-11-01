@@ -18,6 +18,15 @@ interface AnimeDao {
     @Query("SELECT * FROM anime_entries WHERE isPopular = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
     fun observePopular(): Flow<List<AnimeEntry>>
 
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'KDRAMA' OR genres LIKE '%Drama%') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    fun observeKDramas(): Flow<List<AnimeEntry>>
+
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'MOVIE' OR format = 'MOVIE' OR format = 'movie') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    fun observeMovies(): Flow<List<AnimeEntry>>
+
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'SERIES' OR format = 'series' OR format = 'SERIES') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    fun observeWebSeries(): Flow<List<AnimeEntry>>
+
     @Query("SELECT * FROM anime_entries WHERE id = :id LIMIT 1")
     fun observeAnimeById(id: String): Flow<AnimeEntry?>
 
@@ -156,19 +165,37 @@ interface WatchlistDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertWatchlistEntry(entry: WatchlistEntry)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertWatchlistEntries(entries: List<WatchlistEntry>)
+
     @Query("DELETE FROM watchlist_entries WHERE animeId = :animeId")
     suspend fun deleteWatchlistEntry(animeId: String)
 }
 
 @Dao
 interface PlaybackHistoryDao {
-    @Query("SELECT * FROM playback_history ORDER BY lastPlayedAt DESC LIMIT 100")
+    @Query("""
+        SELECT h.id, h.animeId, h.episodeId, h.seasonNumber, h.episodeNumber, h.episodeTitle,
+               h.positionMs, h.durationMs, h.completed, h.lastPlayedAt,
+               COALESCE(h.animeTitle, a.preferredTitle) AS animeTitle,
+               COALESCE(h.posterUrl, a.posterUrl) AS posterUrl,
+               COALESCE(h.mediaType, a.format) AS mediaType
+        FROM playback_history h
+        LEFT JOIN anime_entries a ON h.animeId = a.id
+        ORDER BY h.lastPlayedAt DESC LIMIT 100
+    """)
     fun observeHistory(): Flow<List<PlaybackHistory>>
 
     @Query("""
-        SELECT * FROM playback_history 
-        WHERE completed = 0 AND positionMs > 5000 
-        ORDER BY lastPlayedAt DESC 
+        SELECT h.id, h.animeId, h.episodeId, h.seasonNumber, h.episodeNumber, h.episodeTitle,
+               h.positionMs, h.durationMs, h.completed, h.lastPlayedAt,
+               COALESCE(h.animeTitle, a.preferredTitle) AS animeTitle,
+               COALESCE(h.posterUrl, a.posterUrl) AS posterUrl,
+               COALESCE(h.mediaType, a.format) AS mediaType
+        FROM playback_history h
+        LEFT JOIN anime_entries a ON h.animeId = a.id
+        WHERE h.completed = 0 AND h.positionMs > 5000
+        ORDER BY h.lastPlayedAt DESC
         LIMIT 20
     """)
     fun observeContinueWatching(): Flow<List<PlaybackHistory>>
@@ -176,11 +203,17 @@ interface PlaybackHistoryDao {
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId AND episodeId = :episodeId LIMIT 1")
     suspend fun getHistoryForEpisode(animeId: String, episodeId: String): PlaybackHistory?
 
+    @Query("SELECT * FROM playback_history WHERE animeId = :animeId LIMIT 1")
+    suspend fun getHistoryForAnime(animeId: String): PlaybackHistory?
+
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId ORDER BY lastPlayedAt DESC LIMIT 1")
     fun observeLastPlayedForAnime(animeId: String): Flow<PlaybackHistory?>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertHistory(history: PlaybackHistory)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertHistories(histories: List<PlaybackHistory>)
 
     @Query("DELETE FROM playback_history WHERE id = :id")
     suspend fun deleteHistory(id: String)
@@ -199,4 +232,46 @@ interface UserPreferenceDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun setPref(pref: UserPreference)
+}
+
+@Dao
+interface DownloadDao {
+    @Query("SELECT * FROM download_entries ORDER BY createdAt DESC")
+    fun observeAllDownloads(): Flow<List<DownloadEntry>>
+
+    @Query("SELECT * FROM download_entries WHERE downloadStatus = 'COMPLETED' ORDER BY createdAt DESC")
+    fun observeCompletedDownloads(): Flow<List<DownloadEntry>>
+
+    @Query("SELECT * FROM download_entries WHERE downloadStatus != 'COMPLETED' ORDER BY createdAt DESC")
+    fun observeActiveDownloads(): Flow<List<DownloadEntry>>
+
+    @Query("SELECT * FROM download_entries WHERE animeId = :animeId")
+    fun observeDownloadsForAnime(animeId: String): Flow<List<DownloadEntry>>
+
+    @Query("SELECT * FROM download_entries WHERE id = :id LIMIT 1")
+    suspend fun getDownload(id: String): DownloadEntry?
+
+    @Query("SELECT * FROM download_entries WHERE id = :id LIMIT 1")
+    fun observeDownload(id: String): Flow<DownloadEntry?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDownload(entry: DownloadEntry)
+
+    @Query("UPDATE download_entries SET downloadStatus = :status, downloadedBytes = :downloaded, totalBytes = :total WHERE id = :id")
+    suspend fun updateProgress(id: String, status: String, downloaded: Long, total: Long)
+
+    @Query("DELETE FROM download_entries WHERE id = :id")
+    suspend fun deleteDownload(id: String)
+}
+
+@Dao
+interface LocalProfileDao {
+    @Query("SELECT * FROM local_profiles WHERE id = 'default_user' LIMIT 1")
+    fun observeProfile(): Flow<LocalProfile?>
+
+    @Query("SELECT * FROM local_profiles WHERE id = 'default_user' LIMIT 1")
+    suspend fun getProfile(): LocalProfile?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertProfile(profile: LocalProfile)
 }
