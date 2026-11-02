@@ -211,20 +211,7 @@ data class VersionConfig(
         "en" to "Prophecy Verse V3 with modern streaming, download manager, and enhanced player UI.",
         "bn" to "প্রফেসি ভার্স V3 আধুনিক স্ট্রিমিং ও উন্নত প্লেয়ার ইন্টারফেস।"
     ),
-    @PropertyName("update_sources") val updateSources: Map<String, Any> = mapOf(
-        "telegram" to mapOf(
-            "url" to "https://t.me/newprophecyverse",
-            "enabled" to true,
-            "priority" to 1,
-            "label" to "Telegram Channel"
-        ),
-        "website" to mapOf(
-            "url" to "https://prophecyverse.tech/download",
-            "enabled" to true,
-            "priority" to 2,
-            "label" to "Official Website"
-        )
-    ),
+    @PropertyName("update_sources") val updateSources: Map<String, Any> = emptyMap(),
     @PropertyName("downloads") val downloads: Map<String, Any> = emptyMap(),
     @ServerTimestamp @PropertyName("updated_at") val updatedAt: Timestamp? = null,
     @PropertyName("updated_by") val updatedBy: String = ""

@@ -52,23 +52,27 @@ class VersionControlRepository {
             IllegalStateException("Firebase is uninitialized. Cannot write version configuration.")
         )
         try {
-            val updateSourcesMap = if (config.updateSources.isNotEmpty()) {
-                config.updateSources
-            } else {
-                mapOf(
-                    "telegram" to mapOf(
-                        "url" to "https://t.me/newprophecyverse",
-                        "enabled" to true,
-                        "priority" to 1,
-                        "label" to "Telegram Channel"
-                    ),
-                    "website" to mapOf(
-                        "url" to "https://prophecyverse.tech/download",
-                        "enabled" to true,
-                        "priority" to 2,
-                        "label" to "Official Website"
-                    )
-                )
+            val updateSourcesMap = config.updateSources
+            require(config.enabled) { "Version publishing is disabled." }
+            require(config.latestVersionCode > 0L) { "Version code must be positive." }
+            require(config.minSupportedVersionCode in 1..config.latestVersionCode) {
+                "Minimum supported version code must be positive and no greater than the latest version code."
+            }
+            require(config.latestVersionName.isNotBlank()) { "Version name cannot be blank." }
+            require(config.packageName == "com.aistudio.prophecyverse.vykqtb") {
+                "Package name must match the User APK application ID."
+            }
+            require(config.artifactSha256.matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                "A real 64-character APK SHA-256 fingerprint is required."
+            }
+            require(config.signingCertificateSha256.replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                "A real 64-character signing certificate SHA-256 fingerprint is required."
+            }
+            val directApkUrl = ((updateSourcesMap["backup"] as? Map<*, *>)?.get("url")
+                ?: (updateSourcesMap["direct_apk"] as? Map<*, *>)?.get("url"))?.toString().orEmpty()
+            require(directApkUrl.startsWith("https://", ignoreCase = true) &&
+                directApkUrl.substringBefore('?').substringBefore('#').endsWith(".apk", ignoreCase = true)) {
+                "A valid HTTPS direct APK URL is required."
             }
 
             val payload = mutableMapOf<String, Any>(
@@ -100,17 +104,7 @@ class VersionControlRepository {
                 .set(payload, SetOptions.merge())
                 .await()
 
-            // 2. Keep app_config/version in sync
-            fs.collection("app_config").document("version")
-                .set(payload, SetOptions.merge())
-                .await()
-
-            // 3. Keep version_config/latest in sync
-            fs.collection("version_config").document("latest")
-                .set(payload, SetOptions.merge())
-                .await()
-
-            // 4. Record audit history in update_history/{uuid}
+            // Record audit history separately; the User APK reads only app_config/version_control.
             val auditId = UUID.randomUUID().toString()
             val historyPayload = HashMap(payload).apply {
                 put("release_id", auditId)

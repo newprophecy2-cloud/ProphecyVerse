@@ -63,9 +63,9 @@ fun VersionControlScreen(
     var minVersionCode by remember { mutableLongStateOf(state.config.minSupportedVersionCode) }
     var forceUpdate by remember { mutableStateOf(state.config.forceUpdate) }
     var packageName by remember { mutableStateOf(state.config.packageName) }
-    var telegramUrl by remember { mutableStateOf("https://t.me/newprophecyverse") }
-    var websiteUrl by remember { mutableStateOf("https://prophecyverse.tech/download") }
-    var directApkUrl by remember { mutableStateOf("https://cdn.prophecyverse.tech/apk/prophecyverse-v3.0.0.apk") }
+    var telegramUrl by remember { mutableStateOf(versionSourceUrl(state.config, "telegram")) }
+    var websiteUrl by remember { mutableStateOf(versionSourceUrl(state.config, "website")) }
+    var directApkUrl by remember { mutableStateOf(versionSourceUrl(state.config, "backup", "direct_apk", "apk")) }
     var changelogEn by remember { mutableStateOf(state.config.releaseNotes["en"] ?: "Prophecy Verse V3 with modern streaming, download manager, and enhanced player UI.") }
     var changelogBn by remember { mutableStateOf(state.config.releaseNotes["bn"] ?: "প্রফেসি ভার্স V3 আধুনিক স্ট্রিমিং ও উন্নত প্লেয়ার ইন্টারফেস।") }
     var sha256 by remember { mutableStateOf(state.config.artifactSha256) }
@@ -82,6 +82,9 @@ fun VersionControlScreen(
         minVersionCode = state.config.minSupportedVersionCode
         forceUpdate = state.config.forceUpdate
         packageName = state.config.packageName.ifBlank { "com.aistudio.prophecyverse.vykqtb" }
+        telegramUrl = versionSourceUrl(state.config, "telegram")
+        websiteUrl = versionSourceUrl(state.config, "website")
+        directApkUrl = versionSourceUrl(state.config, "backup", "direct_apk", "apk")
         sha256 = state.config.artifactSha256
         certSha256 = state.config.signingCertificateSha256
         changelogEn = state.config.releaseNotes["en"] ?: changelogEn
@@ -345,6 +348,27 @@ fun VersionControlScreen(
                             validationError = "Package name cannot be blank."
                             return@Button
                         }
+                        if (packageName.trim() != "com.aistudio.prophecyverse.vykqtb") {
+                            validationError = "Package name must match the User APK: com.aistudio.prophecyverse.vykqtb."
+                            return@Button
+                        }
+                        if (minVersionCode <= 0 || minVersionCode > versionCode) {
+                            validationError = "Minimum supported version code must be positive and no greater than the latest version code."
+                            return@Button
+                        }
+                        if (!directApkUrl.trim().startsWith("https://", ignoreCase = true) ||
+                            !directApkUrl.trim().substringBefore('?').substringBefore('#').endsWith(".apk", ignoreCase = true)) {
+                            validationError = "Enter a real HTTPS direct APK URL ending in .apk."
+                            return@Button
+                        }
+                        if (!sha256.trim().matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                            validationError = "Enter the actual APK SHA-256 fingerprint (64 hexadecimal characters)."
+                            return@Button
+                        }
+                        if (!certSha256.trim().replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                            validationError = "Enter the actual signing certificate SHA-256 fingerprint (64 hexadecimal characters)."
+                            return@Button
+                        }
                         showConfirmDialog = true
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = InstitutionalGreen),
@@ -370,26 +394,20 @@ fun VersionControlScreen(
             message = "This will update app_config/version_control checked by all Prophecy Verse V3 User APKs. Mandatory: $forceUpdate.",
             confirmText = "Publish Live",
             onConfirm = {
-                val sources = mapOf(
-                    "telegram" to mapOf(
-                        "url" to telegramUrl.trim(),
-                        "enabled" to true,
-                        "priority" to 1,
-                        "label" to "Telegram Channel"
-                    ),
-                    "website" to mapOf(
-                        "url" to websiteUrl.trim(),
-                        "enabled" to true,
-                        "priority" to 2,
-                        "label" to "Official Website"
-                    ),
-                    "backup" to mapOf(
-                        "url" to directApkUrl.trim(),
-                        "enabled" to true,
-                        "priority" to 3,
-                        "label" to "Direct CDN Server"
-                    )
-                )
+                val sources = buildMap<String, Any> {
+                    if (telegramUrl.isNotBlank()) put("telegram", mapOf(
+                        "url" to telegramUrl.trim(), "enabled" to true,
+                        "priority" to 1, "label" to "Telegram Channel"
+                    ))
+                    if (websiteUrl.isNotBlank()) put("website", mapOf(
+                        "url" to websiteUrl.trim(), "enabled" to true,
+                        "priority" to 2, "label" to "Official Website"
+                    ))
+                    put("backup", mapOf(
+                        "url" to directApkUrl.trim(), "enabled" to true,
+                        "priority" to 3, "label" to "Direct APK", "isDirectApk" to true
+                    ))
+                }
 
                 val newConfig = VersionConfig(
                     id = "version_control",
@@ -452,4 +470,11 @@ fun VersionControlScreen(
             }
         )
     }
+}
+
+private fun versionSourceUrl(config: VersionConfig, vararg keys: String): String {
+    val sources = config.downloads.takeIf { it.isNotEmpty() } ?: config.updateSources
+    return keys.firstNotNullOfOrNull { key ->
+        (sources[key] as? Map<*, *>)?.get("url")?.toString()?.takeIf(String::isNotBlank)
+    }.orEmpty()
 }
