@@ -393,6 +393,10 @@ fun UpdateCard(
                         }
                     }
                     Spacer(modifier = Modifier.height(14.dp))
+                    config.downloads.filter { it.isDirectApk }.forEach { source ->
+                        DownloadSourceButton(source = source, onClick = { onDownloadSourceClick(source) })
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
                 }
                 ApkDownloadState.Idle -> {
                     // Show Download Source Buttons

@@ -9,6 +9,9 @@ import android.util.Log
 import androidx.core.content.FileProvider
 import com.example.BuildConfig
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.Source
+import com.google.firebase.Timestamp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,6 +57,12 @@ data class VersionControlConfig(
     val updatedBy: String = ""
 )
 
+internal fun parseAdminUpdatedAtMillis(value: Any?): Long = when (value) {
+    is Timestamp -> value.toDate().time
+    is Number -> value.toLong()
+    else -> 0L
+}
+
 sealed class VersionCheckState {
     data object Checking : VersionCheckState()
     data class UpToDate(val config: VersionControlConfig) : VersionCheckState()
@@ -88,6 +97,7 @@ class VersionControlManager private constructor(private val context: Context) {
     val apkDownloadState: StateFlow<ApkDownloadState> = _apkDownloadState.asStateFlow()
 
     private var activeDownloadJob: Job? = null
+    private var activeCheckJob: Job? = null
 
     val currentVersionCode: Int
         get() = BuildConfig.VERSION_CODE
@@ -97,35 +107,15 @@ class VersionControlManager private constructor(private val context: Context) {
 
     fun getDefaultConfig(): VersionControlConfig {
         return VersionControlConfig(
-            enabled = true,
+            enabled = false,
             forceUpdate = false,
             latestVersionName = BuildConfig.VERSION_NAME,
             latestVersionCode = BuildConfig.VERSION_CODE,
-            minSupportedVersionCode = 1,
+            minSupportedVersionCode = BuildConfig.VERSION_CODE,
             packageName = BuildConfig.APPLICATION_ID,
-            downloads = listOf(
-                DownloadSource(
-                    id = "telegram",
-                    enabled = true,
-                    label = "Download from Telegram",
-                    url = "https://t.me/prophecyverse",
-                    priority = 1,
-                    isDirectApk = false
-                ),
-                DownloadSource(
-                    id = "website",
-                    enabled = true,
-                    label = "Download from Website",
-                    url = "https://prophecyverse.tech",
-                    priority = 2,
-                    isDirectApk = false
-                )
-            ),
+            downloads = emptyList(),
             sha256 = "",
-            releaseNotes = ReleaseNotes(
-                bn = "Welcome to Prophecy Verse V3!",
-                en = "Welcome to Prophecy Verse V3!"
-            ),
+            releaseNotes = ReleaseNotes(),
             updatedAt = System.currentTimeMillis(),
             updatedBy = "system_default"
         )
@@ -133,23 +123,27 @@ class VersionControlManager private constructor(private val context: Context) {
 
 
     fun checkForUpdates() {
-        scope.launch {
+        if (activeCheckJob?.isActive == true) return
+        activeCheckJob = scope.launch {
             try {
                 _versionState.value = VersionCheckState.Checking
 
                 val snapshot = try {
                     firestore.collection("app_config")
                         .document("version_control")
-                        .get()
+                        .get(Source.SERVER)
                         .await()
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to reach Firestore for version control: ${e.message}")
-                    null
-                }
-
-                if (snapshot == null) {
+                    val networkError = e !is FirebaseFirestoreException || e.code in setOf(
+                        FirebaseFirestoreException.Code.UNAVAILABLE,
+                        FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
+                        FirebaseFirestoreException.Code.ABORTED
+                    )
                     _versionState.value = VersionCheckState.VerificationFailed(
-                        "Unable to verify the version configuration. Check your connection and retry.", true
+                        if (networkError) "Unable to reach the version service. Check your connection and retry."
+                        else "Access to the version configuration was denied. Contact support or retry later.",
+                        networkError
                     )
                     return@launch
                 }
@@ -161,17 +155,38 @@ class VersionControlManager private constructor(private val context: Context) {
                 }
 
                 // Parse config with support for both V3 camelCase schema and V2 snake_case fallback
-                val enabled = snapshot.getBoolean("enabled") ?: false
+                val enabled = snapshot.getBoolean("enabled")
+                    ?: throw IllegalArgumentException("Missing or invalid enabled flag")
+                if (!enabled) {
+                    _versionState.value = VersionCheckState.UpToDate(
+                        VersionControlConfig(
+                            enabled = false,
+                            latestVersionName = currentVersionName,
+                            latestVersionCode = currentVersionCode,
+                            minSupportedVersionCode = currentVersionCode,
+                            packageName = BuildConfig.APPLICATION_ID
+                        )
+                    )
+                    return@launch
+                }
                 val forceUpdate = snapshot.getBoolean("force_update")
                     ?: snapshot.getBoolean("forceUpdate")
                     ?: throw IllegalArgumentException("Missing force_update")
-                val latestCode = (snapshot.getLong("latest_version_code")
+                val latestCodeLong = (snapshot.getLong("latest_version_code")
                     ?: snapshot.getLong("latestVersionCode")
-                    ?: throw IllegalArgumentException("Missing latest_version_code")).toInt()
-                val minCode = (snapshot.getLong("min_supported_version_code")
+                    ?: throw IllegalArgumentException("Missing or invalid latest_version_code"))
+                val minCodeLong = (snapshot.getLong("min_supported_version_code")
                     ?: snapshot.getLong("minSupportedVersionCode")
                     ?: snapshot.getLong("minimum_version_code")
-                    ?: throw IllegalArgumentException("Missing min_supported_version_code")).toInt()
+                    ?: throw IllegalArgumentException("Missing or invalid min_supported_version_code"))
+                require(latestCodeLong in 1L..Int.MAX_VALUE.toLong()) {
+                    "latest_version_code is outside the supported numeric range"
+                }
+                require(minCodeLong in 1L..Int.MAX_VALUE.toLong()) {
+                    "min_supported_version_code is outside the supported numeric range"
+                }
+                val latestCode = latestCodeLong.toInt()
+                val minCode = minCodeLong.toInt()
                 val latestName = snapshot.getString("latest_version_name")
                     ?: snapshot.getString("latestVersionName")
                     ?: throw IllegalArgumentException("Missing latest_version_name")
@@ -184,6 +199,12 @@ class VersionControlManager private constructor(private val context: Context) {
                     ?: snapshot.getString("signingCertificateSha256") ?: ""
                 require(latestCode >= minCode && latestCode > 0 && minCode > 0)
                 require(pkgName == BuildConfig.APPLICATION_ID)
+                require(sha256.matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                    "Missing or invalid artifact_sha256 (expected 64 hexadecimal characters)"
+                }
+                require(signingCertificateSha256.replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+                    "Missing or invalid signing_certificate_sha256 (expected 64 hexadecimal characters)"
+                }
 
                 // Release notes (map or strings)
                 val releaseNotesRaw = (snapshot.get("release_notes") ?: snapshot.get("releaseNotes")) as? Map<*, *>
@@ -207,9 +228,12 @@ class VersionControlManager private constructor(private val context: Context) {
                             val label = itemMap["label"]?.toString() ?: id.replaceFirstChar { it.uppercase() }
                             val url = itemMap["url"]?.toString() ?: ""
                             val priority = (itemMap["priority"] as? Number)?.toInt() ?: 10
-                            val isDirect = url.endsWith(".apk", ignoreCase = true) || itemMap["isDirectApk"] == true
+                            val uri = runCatching { Uri.parse(url) }.getOrNull()
+                            val validHttps = uri?.scheme == "https" && !uri.host.isNullOrBlank()
+                            val isDirect = itemMap["isDirectApk"] == true ||
+                                uri?.path?.endsWith(".apk", ignoreCase = true) == true
 
-                            if (isSourceEnabled && url.isNotBlank()) {
+                            if (isSourceEnabled && validHttps && url.isNotBlank()) {
                                 downloadsList.add(
                                     DownloadSource(
                                         id = id,
@@ -227,7 +251,10 @@ class VersionControlManager private constructor(private val context: Context) {
 
                 // If downloads map wasn't in doc, check fallback legacy fields
                 if (downloadsList.isEmpty()) {
-                    throw IllegalArgumentException("Version configuration has no enabled download sources")
+                    throw IllegalArgumentException("Version configuration has no enabled HTTPS download sources")
+                }
+                require(downloadsList.any { it.isDirectApk }) {
+                    "Version configuration has no enabled direct APK URL; no in-app Update button can be shown"
                 }
 
                 // Sort by priority ascending
@@ -244,7 +271,9 @@ class VersionControlManager private constructor(private val context: Context) {
                     sha256 = sha256,
                     releaseNotes = ReleaseNotes(bn = bnNotes, en = enNotes),
                     signingCertificateSha256 = signingCertificateSha256,
-                    updatedAt = snapshot.getLong("updated_at") ?: snapshot.getLong("updatedAt") ?: System.currentTimeMillis(),
+                    // The Admin publisher writes FieldValue.serverTimestamp(), which resolves to Timestamp.
+                    updatedAt = parseAdminUpdatedAtMillis(snapshot.get("updated_at") ?: snapshot.get("updatedAt"))
+                        .takeIf { it > 0L } ?: System.currentTimeMillis(),
                     updatedBy = snapshot.getString("updated_by") ?: snapshot.getString("updatedBy") ?: ""
                 )
 
@@ -253,7 +282,8 @@ class VersionControlManager private constructor(private val context: Context) {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to verify version configuration", e)
                 _versionState.value = VersionCheckState.VerificationFailed(
-                    "Version configuration could not be verified. Retry later.", false
+                    e.message?.let { "Version configuration is invalid: $it" }
+                        ?: "Version configuration could not be verified. Retry later.", false
                 )
             }
         }
@@ -265,12 +295,17 @@ class VersionControlManager private constructor(private val context: Context) {
      */
     fun startDirectApkDownload(source: DownloadSource, expectedConfig: VersionControlConfig) {
         val sourceUri = runCatching { Uri.parse(source.url) }.getOrNull()
-        if (sourceUri?.scheme != "https") {
+        if (sourceUri?.scheme != "https" || sourceUri.host.isNullOrBlank()) {
             _apkDownloadState.value = ApkDownloadState.Error("Update sources must use HTTPS.")
             return
         }
-        if (!source.isDirectApk && !source.url.endsWith(".apk", ignoreCase = true)) {
+        if (!source.isDirectApk && sourceUri.path?.endsWith(".apk", ignoreCase = true) != true) {
             openExternalUrl(source.url)
+            return
+        }
+        if (!expectedConfig.sha256.matches(Regex("(?i)^[a-f0-9]{64}$")) ||
+            !expectedConfig.signingCertificateSha256.replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
+            _apkDownloadState.value = ApkDownloadState.Error("Update integrity metadata is missing or invalid.")
             return
         }
 
@@ -319,17 +354,12 @@ class VersionControlManager private constructor(private val context: Context) {
                 val digest = md.digest()
                 val computedSha256 = digest.joinToString("") { "%02x".format(it) }
 
-                // Check SHA-256 if expected hash is provided and not a dummy string
-                if (expectedConfig.sha256.isNotBlank() &&
-                    !expectedConfig.sha256.equals("EXPECTED_APK_SHA256", ignoreCase = true)
-                ) {
-                    if (!computedSha256.equals(expectedConfig.sha256.trim(), ignoreCase = true)) {
-                        targetFile.delete()
-                        _apkDownloadState.value = ApkDownloadState.Error(
-                            "SHA-256 integrity verification failed: downloaded file may be corrupted."
-                        )
-                        return@launch
-                    }
+                if (!computedSha256.equals(expectedConfig.sha256.trim(), ignoreCase = true)) {
+                    targetFile.delete()
+                    _apkDownloadState.value = ApkDownloadState.Error(
+                        "SHA-256 integrity verification failed: downloaded file may be corrupted."
+                    )
+                    return@launch
                 }
 
                 // Verify package ID using package manager
@@ -353,7 +383,7 @@ class VersionControlManager private constructor(private val context: Context) {
                     @Suppress("DEPRECATION") archiveInfo.versionCode.toLong()
                 }
                 if (archiveInfo.packageName != expectedConfig.packageName ||
-                    archiveVersionCode < expectedConfig.latestVersionCode
+                    archiveVersionCode != expectedConfig.latestVersionCode.toLong()
                 ) {
                     targetFile.delete()
                     _apkDownloadState.value = ApkDownloadState.Error(
@@ -424,7 +454,10 @@ class VersionControlManager private constructor(private val context: Context) {
     }
 
     fun launchPackageInstaller(apkFile: File) {
-        if (!apkFile.exists()) return
+        if (!apkFile.exists()) {
+            _apkDownloadState.value = ApkDownloadState.Error("Verified APK file is no longer available. Download it again.")
+            return
+        }
         try {
             val contentUri = FileProvider.getUriForFile(
                 context,
@@ -439,7 +472,9 @@ class VersionControlManager private constructor(private val context: Context) {
             context.startActivity(installIntent)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to launch package installer", e)
-            openExternalUrl(apkFile.absolutePath)
+            _apkDownloadState.value = ApkDownloadState.Error(
+                "Android could not open the package installer: ${e.localizedMessage ?: "unknown installer error"}"
+            )
         }
     }
 
@@ -456,12 +491,13 @@ class VersionControlManager private constructor(private val context: Context) {
         }
 
         fun evaluateVersionState(currentCode: Int, config: VersionControlConfig?): VersionCheckState {
-            if (config == null || !config.enabled) {
+            if (config == null) {
                 return VersionCheckState.VerificationFailed(
-                    message = "Version configuration is invalid or disabled",
+                    message = "Version configuration is unavailable or invalid",
                     isNetworkError = false
                 )
             }
+            if (!config.enabled) return VersionCheckState.UpToDate(config)
             return when {
                 currentCode < config.minSupportedVersionCode -> VersionCheckState.ForceUpdate(config)
                 config.forceUpdate && currentCode < config.latestVersionCode -> VersionCheckState.ForceUpdate(config)

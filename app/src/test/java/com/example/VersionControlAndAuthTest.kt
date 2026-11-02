@@ -7,12 +7,16 @@ import com.example.data.firebase.UserProfile
 import com.example.data.firebase.VersionCheckState
 import com.example.data.firebase.VersionControlConfig
 import com.example.data.firebase.VersionControlManager
+import com.example.data.notice.parsePublishedNotice
+import com.google.firebase.Timestamp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.Date
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -69,17 +73,64 @@ class VersionControlAndAuthTest {
     }
 
     @Test
-    fun `test missing or disabled config results in VerificationFailed instead of UpToDate`() {
+    fun `test disabled config suppresses update prompt while missing config remains an error`() {
         val disabledConfig = VersionControlConfig(
             latestVersionCode = 5,
             latestVersionName = "3.0.0",
             enabled = false
         )
         val stateDisabled = VersionControlManager.evaluateVersionState(currentCode = 5, config = disabledConfig)
-        assertTrue("Disabled config must result in VerificationFailed", stateDisabled is VersionCheckState.VerificationFailed)
+        assertTrue("Explicitly disabled updates must not block or prompt", stateDisabled is VersionCheckState.UpToDate)
 
         val stateNull = VersionControlManager.evaluateVersionState(currentCode = 5, config = null)
         assertTrue("Null config must result in VerificationFailed", stateNull is VersionCheckState.VerificationFailed)
+    }
+
+    @Test
+    fun `published Admin notice maps real fields and optional action aliases`() {
+        val notice = parsePublishedNotice(
+            "notice-1",
+            mapOf(
+                "title" to "Service update",
+                "message" to "A real announcement from Firestore.",
+                "active" to true,
+                "published" to true,
+                "priority" to 7L,
+                "severity" to "warning",
+                "action_url" to "https://example.org/status",
+                "action_label" to "Status"
+            )
+        )
+        assertEquals("notice-1", notice?.id)
+        assertEquals("Service update", notice?.title)
+        assertEquals("A real announcement from Firestore.", notice?.message)
+        assertEquals(7L, notice?.priority)
+        assertEquals("warning", notice?.severity)
+        assertEquals("https://example.org/status", notice?.actionUrl)
+        assertEquals("Status", notice?.actionLabel)
+    }
+
+    @Test
+    fun `unpublished or inactive notices are excluded`() {
+        assertNull(parsePublishedNotice("unpublished", mapOf("published" to false, "active" to true)))
+        assertNull(parsePublishedNotice("inactive", mapOf("published" to true, "active" to false)))
+    }
+
+    @Test
+    fun `notice parser supports content and type compatibility mirrors`() {
+        val notice = parsePublishedNotice(
+            "legacy",
+            mapOf("published" to true, "content" to "Fallback body", "type" to "info")
+        )
+        assertEquals("Fallback body", notice?.message)
+        assertEquals("info", notice?.severity)
+    }
+
+    @Test
+    fun `Admin server timestamp is accepted as Timestamp as well as legacy numeric millis`() {
+        val timestamp = Timestamp(Date(1_700_000_000_000L))
+        assertEquals(1_700_000_000_000L, com.example.data.firebase.parseAdminUpdatedAtMillis(timestamp))
+        assertEquals(1_700_000_000_000L, com.example.data.firebase.parseAdminUpdatedAtMillis(1_700_000_000_000L))
     }
 
     @Test

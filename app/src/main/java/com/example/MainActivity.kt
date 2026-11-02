@@ -98,7 +98,6 @@ class MainActivity : ComponentActivity() {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
             com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
             com.example.data.firebase.InstallationManager.getInstance(applicationContext).initializeAndSync()
-            com.example.data.firebase.VersionControlManager.getInstance(applicationContext).checkForUpdates()
             com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
             com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
@@ -233,7 +232,14 @@ fun MainAppNav(
         }
     }
 
-    var optionalUpdateDismissed by remember { mutableStateOf(false) }
+    val updatePrefs = remember { context.getSharedPreferences("version_control_ui", android.content.Context.MODE_PRIVATE) }
+    var dismissedOptionalVersionCode by remember {
+        mutableStateOf(updatePrefs.getInt("dismissed_optional_version_code", -1))
+    }
+    val dismissOptionalUpdate: (Int) -> Unit = { versionCode ->
+        updatePrefs.edit().putInt("dismissed_optional_version_code", versionCode).apply()
+        dismissedOptionalVersionCode = versionCode
+    }
 
     when (val vState = versionState) {
         is com.example.data.firebase.VersionCheckState.ForceUpdate -> {
@@ -243,14 +249,6 @@ fun MainAppNav(
         is com.example.data.firebase.VersionCheckState.VerificationFailed -> {
             com.example.ui.screens.ForceUpdateScreen(versionState = vState)
             return
-        }
-        is com.example.data.firebase.VersionCheckState.OptionalUpdate -> {
-            if (!optionalUpdateDismissed) {
-                com.example.ui.screens.ForceUpdateScreen(
-                    versionState = vState,
-                    onDismissOptional = { optionalUpdateDismissed = true }
-                )
-            }
         }
         else -> {}
     }
@@ -417,13 +415,17 @@ fun MainAppNav(
             noticeContent = noticeContent,
             isVisible = isNoticeVisible && !isInPipMode && currentRoute?.startsWith("player/") != true,
             onDismiss = { noticeManager.dismissNotice() },
-            onTelegramClick = { noticeManager.openTelegramChannel(context) }
+            onRetry = { noticeManager.retryNotices() },
+            onAction = { url -> noticeManager.openNoticeAction(url, context) }
         )
 
-        if (versionState is com.example.data.firebase.VersionCheckState.OptionalUpdate && !optionalUpdateDismissed && !isInPipMode && currentRoute?.startsWith("player/") != true) {
+        val optionalUpdate = versionState as? com.example.data.firebase.VersionCheckState.OptionalUpdate
+        if (optionalUpdate != null &&
+            dismissedOptionalVersionCode != optionalUpdate.config.latestVersionCode &&
+            !isInPipMode && currentRoute?.startsWith("player/") != true) {
             com.example.ui.screens.ForceUpdateScreen(
-                versionState = versionState,
-                onDismissOptional = { optionalUpdateDismissed = true }
+                versionState = optionalUpdate,
+                onDismissOptional = { dismissOptionalUpdate(optionalUpdate.config.latestVersionCode) }
             )
         }
     }
