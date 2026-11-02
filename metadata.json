@@ -1,0 +1,6 @@
+{
+  "name": "Prophecy Verse",
+  "description": "Prophecy Verse V3 - Anime streaming, catalog, cloud sync, and offline downloads",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
