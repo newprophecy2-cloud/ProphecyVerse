@@ -91,21 +91,20 @@ The app strictly follows **database-first rendering**:
 
 
 
-## 6. Repaired security and release behavior
+## 6. Update, Firebase, and security behavior
 
-The Android client is user-only and contains no administrative controls. Version verification is fail-closed: missing, disabled, malformed, or unreachable remote configuration shows a retry state rather than treating the client as up to date. Mandatory updates cannot be bypassed. Direct APK updates require HTTPS, the expected package ID, an adequate version code, the configured artifact SHA-256, and the configured signing-certificate SHA-256 before the Android installer is launched.
+The client checks published metadata from `app_config/version_control` using numeric Android version codes. A disabled update channel intentionally suppresses update prompts; missing, unreachable, or malformed metadata produces an error/retry state. Older builds need actionable HTTPS download sources and a matching package ID/version code. Custom APK SHA-256 and release-certificate SHA-256 fields are not required. Android's package installer retains native package-signature continuity checks when installing an update; downloading a file is not treated as successful installation.
 
-The Android manifest disables cleartext traffic, and the FileProvider exposes only the temporary update-cache directory. The client does not create or overwrite the remote version configuration and does not write privileged suspension/download-policy fields. The local `firestore.rules` file is a proposed secure ruleset and has not been deployed to the live Firebase project.
+The manifest disables cleartext traffic, and the FileProvider exposes only the temporary update-cache directory. The client does not publish version configuration or write Admin moderation fields. The supplied Admin and User Firestore rule files use different role stores and do not match in every collection. No rules were deployed during this task; review and align the single live ruleset before relying on Admin access to installation records or user profiles.
 
 ## 7. Build and verification
 
-Use a complete JDK 21 installation with `javac`, then run:
+Use a complete JDK 21 installation with `javac` and Android SDK Platform 36, then run:
 
 ```bash
-./gradlew clean
-./gradlew :app:assembleDebug
-./gradlew :app:testDebugUnitTest
-./gradlew :app:lintDebug
+bash ./gradlew clean
+bash ./gradlew :app:assembleDebug
+bash ./gradlew :app:testDebugUnitTest
 ```
 
-The final sandbox verification used JDK 21, Android API 34, and the native ARM64 AAPT2 toolchain. APK assembly and lint passed. Robolectric unit tests remain environment-blocked because the native runtime loader cannot initialize the bundled native libraries in this ARM64 sandbox; see `FINAL_AUDIT_REPORT.md` for the test disposition and remaining external configuration.
+In this sandbox, the debug APK build and all 34 JVM/Robolectric unit tests passed with JDK 21 and Android API 36. The APK uses a sandbox-only Android debug key; it is not a production update APK. The original release keystore is not included or available here, so an authorized release build must be signed separately with the existing key. Live Firebase operations, emulator/device installation, and production update behavior were not tested. See `FINAL_AUDIT_REPORT.md` for findings and remaining requirements.
