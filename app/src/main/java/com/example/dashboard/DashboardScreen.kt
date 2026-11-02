@@ -1,6 +1,7 @@
 package com.example.dashboard
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,23 +15,29 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
@@ -46,6 +53,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.installations.InstallationListItem
 import com.example.navigation.AdminNavDestination
 import com.example.ui.components.MetricCard
 import com.example.ui.components.SectionHeader
@@ -80,7 +88,23 @@ fun DashboardScreen(
             }
         }
 
-        // Top Status Banner
+        state.errorMessage?.let { message ->
+            item {
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = message,
+                        modifier = Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
+
+        // Top Status & Quick Nav Banner
         item {
             Card(
                 shape = RoundedCornerShape(16.dp),
@@ -103,99 +127,210 @@ fun DashboardScreen(
                             )
                             val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(state.lastRefreshedAt))
                             Text(
-                                text = "Last telemetry sync: $timeStr",
+                                text = "Telemetry synchronized: $timeStr",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        StatusBadge(status = if (state.healthReport?.isReachable == true) "ONLINE" else "DISCONNECTED")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = { viewModel.refreshDashboard() }) {
+                                Icon(imageVector = Icons.Default.Refresh, contentDescription = "Refresh dashboard")
+                            }
+                            StatusBadge(status = if (state.isFirebaseConnected) "FIRESTORE LIVE" else "DATA UNAVAILABLE")
+                        }
                     }
 
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
 
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         FilledTonalButton(
-                            onClick = { onNavigate(AdminNavDestination.NoticeEditor()) },
+                            onClick = { onNavigate(AdminNavDestination.InstallationManagement) },
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f).testTag("quick_new_notice_btn")
+                            modifier = Modifier.testTag("quick_installations_btn")
                         ) {
-                            Text("New Notice", style = MaterialTheme.typography.labelMedium)
+                            Text("Installations (${state.installationStats.totalCount})")
+                        }
+                        FilledTonalButton(
+                            onClick = { onNavigate(AdminNavDestination.UserManagement) },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.testTag("quick_users_btn")
+                        ) {
+                            Text("Users (${state.totalUsersCount})")
                         }
                         FilledTonalButton(
                             onClick = { onNavigate(AdminNavDestination.VersionControl) },
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f).testTag("quick_version_btn")
+                            modifier = Modifier.testTag("quick_version_btn")
                         ) {
-                            Text("Version", style = MaterialTheme.typography.labelMedium)
+                            Text("Version Control")
                         }
                         FilledTonalButton(
-                            onClick = { onNavigate(AdminNavDestination.SchemaAudit) },
+                            onClick = { onNavigate(AdminNavDestination.NotificationManagement) },
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f).testTag("quick_schema_btn")
+                            modifier = Modifier.testTag("quick_notifications_btn")
                         ) {
-                            Text("Schema Audit", style = MaterialTheme.typography.labelMedium)
+                            Text("Push Alerts")
+                        }
+                        FilledTonalButton(
+                            onClick = { onNavigate(AdminNavDestination.NoticeManagement) },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.testTag("quick_notices_btn")
+                        ) {
+                            Text("Notices")
                         }
                     }
                 }
             }
         }
 
-        // Metrics Grid (2x2)
+        // Metrics Grid Row 1 (Installations & Users)
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 MetricCard(
-                    title = "Backend Health",
-                    value = if (state.healthReport?.isReachable == true) "200 OK" else "Unreachable",
-                    subtitle = if (state.healthReport?.isReachable == true) "${state.healthReport?.latencyMs} ms latency" else "Check API Base URL",
-                    icon = Icons.Default.Speed,
-                    badgeText = if (state.healthReport?.isReachable == true) "READY" else "OFFLINE",
-                    badgeColor = if (state.healthReport?.isReachable == true) StatusActive else StatusSuspended,
+                    title = "App Installations",
+                    value = "${state.installationStats.totalCount}",
+                    subtitle = "${state.installationStats.activeNowCount} active now (<5m)",
+                    icon = Icons.Default.Devices,
+                    badgeText = "ACTIVE",
+                    badgeColor = if (state.installationStats.activeNowCount > 0) StatusActive else InstitutionalGreen,
                     modifier = Modifier.weight(1f),
-                    onClick = { onNavigate(AdminNavDestination.Analytics) }
+                    onClick = { onNavigate(AdminNavDestination.InstallationManagement) }
                 )
                 MetricCard(
-                    title = "App Version",
-                    value = state.versionConfig?.versionName ?: "3.0.0",
-                    subtitle = "Code: ${state.versionConfig?.versionCode ?: 300}",
-                    icon = Icons.Default.SystemUpdate,
-                    badgeText = if (state.versionConfig?.isMandatory == true) "MANDATORY" else "OPTIONAL",
-                    badgeColor = if (state.versionConfig?.isMandatory == true) MaterialTheme.colorScheme.error else InstitutionalGreen,
+                    title = "Registered Users",
+                    value = "${state.totalUsersCount}",
+                    subtitle = "${state.activeUsersCount} active accounts",
+                    icon = Icons.Default.People,
+                    badgeText = "ACCOUNTS",
+                    badgeColor = InstitutionalGreen,
                     modifier = Modifier.weight(1f),
-                    onClick = { onNavigate(AdminNavDestination.VersionControl) }
+                    onClick = { onNavigate(AdminNavDestination.UserManagement) }
                 )
             }
         }
 
+        // Metrics Grid Row 2 (Version & Watch Time)
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                val config = state.versionConfig
+                val verName = config?.latestVersionName ?: "3.0.0"
+                val verCode = config?.latestVersionCode ?: 5L
+                MetricCard(
+                    title = "Version Manifest",
+                    value = "v$verName",
+                    subtitle = "Code $verCode • Min ${config?.minSupportedVersionCode ?: 5}",
+                    icon = Icons.Default.SystemUpdate,
+                    badgeText = if (config?.forceUpdate == true) "MANDATORY" else "OPTIONAL",
+                    badgeColor = if (config?.forceUpdate == true) MaterialTheme.colorScheme.error else InstitutionalGreen,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onNavigate(AdminNavDestination.VersionControl) }
+                )
+
+                val hrs = state.installationStats.totalWatchSeconds / 3600
+                val mins = (state.installationStats.totalWatchSeconds % 3600) / 60
+                val watchStr = if (hrs > 0) "${hrs}h ${mins}m" else "${mins}m"
+                MetricCard(
+                    title = "Total Watch Time",
+                    value = watchStr,
+                    subtitle = "Across all installations",
+                    icon = Icons.Default.Timer,
+                    badgeText = "STREAMED",
+                    badgeColor = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onNavigate(AdminNavDestination.Analytics) }
+                )
+            }
+        }
+
+        // Metrics Grid Row 3 (Notices & Push Notifications)
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 MetricCard(
-                    title = "Live Notices",
+                    title = "Broadcast Notices",
                     value = "${state.noticesCount}",
-                    subtitle = "${state.activeNotices.size} published to users",
+                    subtitle = "${state.activeNotices.size} active announcements",
                     icon = Icons.Default.Campaign,
-                    badgeText = if (state.isFirebaseConnected) "FIRESTORE" else "AWAITING CONFIG",
-                    badgeColor = if (state.isFirebaseConnected) StatusActive else MaterialTheme.colorScheme.tertiary,
+                    badgeText = if (state.activeNotices.isNotEmpty()) "LIVE" else "EMPTY",
+                    badgeColor = if (state.activeNotices.isNotEmpty()) StatusActive else MaterialTheme.colorScheme.outline,
                     modifier = Modifier.weight(1f),
                     onClick = { onNavigate(AdminNavDestination.NoticeManagement) }
                 )
                 MetricCard(
-                    title = "Readiness",
-                    value = if (state.readinessReport?.isReachable == true) "Ready" else "Standby",
-                    subtitle = "Endpoint: /ready",
-                    icon = if (state.readinessReport?.isReachable == true) Icons.Default.CloudDone else Icons.Default.CloudOff,
-                    badgeText = if (state.readinessReport?.isReachable == true) "READY" else "STANDBY",
-                    badgeColor = if (state.readinessReport?.isReachable == true) StatusActive else MaterialTheme.colorScheme.outline,
+                    title = "Push Notifications",
+                    value = "${state.queuedNotificationsCount}",
+                    subtitle = "Queued for FCM dispatch",
+                    icon = Icons.Default.NotificationsActive,
+                    badgeText = "FCM QUEUE",
+                    badgeColor = MaterialTheme.colorScheme.tertiary,
                     modifier = Modifier.weight(1f),
-                    onClick = { onNavigate(AdminNavDestination.Analytics) }
+                    onClick = { onNavigate(AdminNavDestination.NotificationManagement) }
+                )
+            }
+        }
+
+        // Recent Installations Feed
+        item {
+            SectionHeader(
+                title = "Recent Installations",
+                subtitle = "Latest devices running User APK",
+                action = {
+                    Button(
+                        onClick = { onNavigate(AdminNavDestination.InstallationManagement) },
+                        colors = ButtonDefaults.buttonColors(containerColor = InstitutionalGreen),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("View All (${state.installationStats.totalCount})")
+                    }
+                }
+            )
+        }
+
+        if (state.recentInstallations.isEmpty()) {
+            item {
+                OutlinedCard(
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Devices,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.outline,
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = if (state.isFirebaseConnected) "No installations recorded yet." else "Connecting to live Firestore installations...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        } else {
+            items(state.recentInstallations.take(3), key = { it.id }) { inst ->
+                InstallationListItem(
+                    record = inst,
+                    onClick = { onNavigate(AdminNavDestination.InstallationDetail(inst.id)) }
                 )
             }
         }
@@ -203,8 +338,8 @@ fun DashboardScreen(
         // Active Notices Feed
         item {
             SectionHeader(
-                title = "Active Broadcast Notices",
-                subtitle = "Broadcasting to Prophecy Verse V3 User APK",
+                title = "Active In-App Notices",
+                subtitle = "Shown in User APK notification banner",
                 action = {
                     Button(
                         onClick = { onNavigate(AdminNavDestination.NoticeManagement) },
@@ -237,7 +372,7 @@ fun DashboardScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = if (state.isFirebaseConnected) "No active notices published." else "Awaiting live Firestore connection to load active notices.",
+                            text = "No active notices published.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -245,7 +380,7 @@ fun DashboardScreen(
                 }
             }
         } else {
-            items(state.activeNotices.take(3)) { notice ->
+            items(state.activeNotices.take(3), key = { it.id }) { notice ->
                 Card(
                     shape = RoundedCornerShape(12.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -264,7 +399,7 @@ fun DashboardScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                StatusBadge(status = notice.type)
+                                StatusBadge(status = notice.effectiveSeverity)
                                 Text(
                                     text = notice.title,
                                     style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
@@ -272,17 +407,12 @@ fun DashboardScreen(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = notice.content,
+                                text = notice.displayContent,
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 2,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.outline
-                        )
                     }
                 }
             }

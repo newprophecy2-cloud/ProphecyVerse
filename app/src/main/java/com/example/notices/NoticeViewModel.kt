@@ -52,12 +52,12 @@ class NoticeViewModel(
 
     fun togglePublish(notice: NoticeItem, adminEmail: String) {
         viewModelScope.launch {
-            val result = repository.togglePublish(notice.id, notice.published)
+            val result = repository.togglePublish(notice.id, notice.isEffectivelyActive)
             if (result.isSuccess) {
-                val newPublished = result.getOrNull() ?: !notice.published
+                val newPublished = result.getOrNull() ?: !notice.isEffectivelyActive
                 _uiState.value = _uiState.value.copy(
                     notices = _uiState.value.notices.map {
-                        if (it.id == notice.id) it.copy(published = newPublished) else it
+                        if (it.id == notice.id) it.copy(active = newPublished, published = newPublished) else it
                     },
                     successMessage = "Notice ${if (newPublished) "published" else "unpublished"}."
                 )
@@ -104,7 +104,7 @@ class NoticeViewModel(
     fun saveNotice(notice: NoticeItem, adminEmail: String, onComplete: () -> Unit) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isSaving = true, errorMessage = null)
-            val result = repository.saveNotice(notice)
+            val result = repository.saveNotice(notice, adminEmail)
             if (result.isSuccess) {
                 val id = result.getOrNull() ?: notice.id
                 _uiState.value = _uiState.value.copy(
@@ -117,7 +117,7 @@ class NoticeViewModel(
                     action = if (notice.id.isBlank()) "NOTICE_CREATED" else "NOTICE_EDITED",
                     targetType = "NOTICE",
                     targetId = id,
-                    details = "Saved notice '${notice.title}' (type: ${notice.type})"
+                    details = "Saved notice '${notice.title}' (severity: ${notice.severity})"
                 )
                 loadNotices()
                 onComplete()

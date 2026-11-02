@@ -91,17 +91,18 @@ class UserViewModel(
     fun moderateUserStatus(uid: String, newStatus: String, reason: String, adminEmail: String) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isActionInProgress = true)
-            val result = repository.moderateUser(uid, newStatus, reason)
+            val normalized = newStatus.lowercase()
+            val result = repository.moderateUser(uid, normalized, reason, adminEmail)
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
                     isActionInProgress = false,
                     users = _uiState.value.users.map {
-                        if (it.uid == uid) it.copy(status = newStatus) else it
+                        if (it.uid == uid) it.copy(status = normalized, suspensionReason = reason) else it
                     },
                     selectedUser = _uiState.value.selectedUser?.let {
-                        if (it.uid == uid) it.copy(status = newStatus) else it
+                        if (it.uid == uid) it.copy(status = normalized, suspensionReason = reason) else it
                     },
-                    successMessage = "User status updated to $newStatus."
+                    successMessage = "User status updated to $normalized."
                 )
                 logRepository.logActivity(
                     adminUid = "admin",
@@ -109,7 +110,7 @@ class UserViewModel(
                     action = "USER_STATUS_CHANGE",
                     targetType = "USER",
                     targetId = uid,
-                    details = "Changed user status to $newStatus (reason: $reason)"
+                    details = "Changed user status to $normalized (reason: $reason)"
                 )
             } else {
                 _uiState.value = _uiState.value.copy(
@@ -124,15 +125,15 @@ class UserViewModel(
         viewModelScope.launch {
             val newBlocked = !currentBlocked
             _uiState.value = _uiState.value.copy(isActionInProgress = true)
-            val result = repository.toggleDownloadBlock(uid, newBlocked)
+            val result = repository.toggleDownloadBlock(uid, newBlocked, adminEmail)
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
                     isActionInProgress = false,
                     users = _uiState.value.users.map {
-                        if (it.uid == uid) it.copy(isDownloadBlocked = newBlocked) else it
+                        if (it.uid == uid) it.copy(downloadBlocked = newBlocked) else it
                     },
                     selectedUser = _uiState.value.selectedUser?.let {
-                        if (it.uid == uid) it.copy(isDownloadBlocked = newBlocked) else it
+                        if (it.uid == uid) it.copy(downloadBlocked = newBlocked) else it
                     },
                     successMessage = if (newBlocked) "Downloads blocked for user." else "Downloads restored."
                 )

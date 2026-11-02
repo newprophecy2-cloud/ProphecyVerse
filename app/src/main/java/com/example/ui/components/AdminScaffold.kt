@@ -113,9 +113,9 @@ fun AdminScaffold(
                         }
                     }
                 ) {
-                    AdminNavDestination.mainNavItems.forEach { item ->
+                    AdminNavDestination.mainNavItems.filterNotNull().forEach { item ->
                         NavigationRailItem(
-                            selected = currentDestination.route == item.route,
+                            selected = currentDestination?.route == item.route,
                             onClick = { onNavigate(item) },
                             icon = {
                                 item.icon?.let {
@@ -207,13 +207,13 @@ fun AdminScaffold(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        AdminNavDestination.mainNavItems.forEach { item ->
+                        AdminNavDestination.mainNavItems.filterNotNull().forEach { item ->
                             NavigationDrawerItem(
                                 label = { Text(item.title) },
                                 icon = {
                                     item.icon?.let { Icon(imageVector = it, contentDescription = item.title) }
                                 },
-                                selected = currentDestination.route == item.route,
+                                selected = currentDestination?.route == item.route,
                                 onClick = {
                                     scope.launch { drawerState.close() }
                                     onNavigate(item)
@@ -262,15 +262,15 @@ fun AdminScaffold(
                             containerColor = MaterialTheme.colorScheme.surface,
                             tonalElevation = 4.dp
                         ) {
-                            // Primary 4 items in bottom bar for quick mobile navigation
                             listOf(
                                 AdminNavDestination.Dashboard,
+                                AdminNavDestination.InstallationManagement,
                                 AdminNavDestination.UserManagement,
-                                AdminNavDestination.NoticeManagement,
+                                AdminNavDestination.NotificationManagement,
                                 AdminNavDestination.VersionControl
                             ).forEach { item ->
                                 NavigationBarItem(
-                                    selected = currentDestination.route == item.route,
+                                    selected = currentDestination?.route == item.route,
                                     onClick = { onNavigate(item) },
                                     icon = {
                                         item.icon?.let { Icon(imageVector = it, contentDescription = item.title) }

@@ -74,8 +74,11 @@ fun NoticeEditorScreen(
     val currentNoticeDraft = NoticeItem(
         id = noticeId ?: "",
         title = title.trim(),
+        message = content.trim(),
         content = content.trim(),
+        severity = type,
         type = type,
+        active = published,
         published = published,
         priority = priority,
         actionUrl = actionUrl.trim().ifBlank { null },

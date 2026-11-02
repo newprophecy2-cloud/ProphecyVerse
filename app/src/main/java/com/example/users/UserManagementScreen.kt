@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -44,6 +45,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.data.model.UserAccount
 import com.example.navigation.AdminNavDestination
 import com.example.ui.components.StatusBadge
@@ -85,7 +87,7 @@ fun UserManagementScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp)
                     .testTag("user_search_input"),
-                placeholder = { Text("Search by UID or Email...") },
+                placeholder = { Text("Search by UID, Email, or Installation ID...") },
                 leadingIcon = {
                     Icon(imageVector = Icons.Default.Search, contentDescription = "Search Users")
                 },
@@ -99,6 +101,19 @@ fun UserManagementScreen(
                 singleLine = true,
                 shape = RoundedCornerShape(12.dp)
             )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Registered user profiles", style = MaterialTheme.typography.titleSmall)
+                IconButton(onClick = { viewModel.loadUsers() }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Refresh users")
+                }
+            }
 
             if (state.isLoading) {
                 Box(
@@ -128,12 +143,12 @@ fun UserManagementScreen(
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                         Text(
-                            text = if (state.searchQuery.isBlank()) "No Users Found" else "No matching users for '${state.searchQuery}'",
+                            text = state.errorMessage ?: if (state.searchQuery.isBlank()) "No Firestore user profiles found" else "No matching users for '${state.searchQuery}'",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Connect google-services.json to sync live user profiles from Firestore.",
+                            text = "Profiles are read from users/{uid}. Check Admin authorization and the User APK profile-create rules if expected records are missing.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -211,9 +226,22 @@ private fun UserListItem(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        StatusBadge(status = user.status)
-                        if (user.isDownloadBlocked) {
+                        StatusBadge(status = user.status.uppercase())
+                        if (user.downloadBlocked) {
                             StatusBadge(status = "BLOCKED")
+                        }
+                        if (user.totalWatchSeconds > 0) {
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant
+                            ) {
+                                Text(
+                                    text = user.formattedWatchTime,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
                         }
                     }
                 }

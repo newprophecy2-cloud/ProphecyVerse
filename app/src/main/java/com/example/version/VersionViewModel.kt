@@ -52,20 +52,20 @@ class VersionViewModel(
     fun saveVersionConfig(newConfig: VersionConfig, adminEmail: String) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isSaving = true, errorMessage = null)
-            val result = repository.saveVersionConfig(newConfig)
+            val result = repository.saveVersionConfig(newConfig, adminEmail)
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
                     isSaving = false,
                     config = newConfig,
-                    successMessage = "Version configuration published successfully."
+                    successMessage = "Version configuration published successfully to User APK channel."
                 )
                 logRepository.logActivity(
                     adminUid = "admin",
                     adminEmail = adminEmail,
                     action = "VERSION_CONFIG_UPDATED",
                     targetType = "VERSION",
-                    targetId = newConfig.versionName,
-                    details = "Published update: v${newConfig.versionName} (code: ${newConfig.versionCode}, mandatory: ${newConfig.isMandatory})"
+                    targetId = newConfig.latestVersionName,
+                    details = "Published update: v${newConfig.latestVersionName} (code: ${newConfig.latestVersionCode}, min: ${newConfig.minSupportedVersionCode}, mandatory: ${newConfig.forceUpdate})"
                 )
             } else {
                 _uiState.value = _uiState.value.copy(

@@ -13,15 +13,7 @@ import kotlinx.coroutines.withContext
 class ActivityLogRepository {
 
     private fun getFirestore(): FirebaseFirestore? {
-        return try {
-            if (FirebaseApp.getApps(com.google.firebase.FirebaseApp.getInstance().applicationContext).isNotEmpty()) {
-                FirebaseFirestore.getInstance()
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
+        return runCatching { FirebaseFirestore.getInstance() }.getOrNull()
     }
 
     suspend fun logActivity(
@@ -37,7 +29,18 @@ class ActivityLogRepository {
             IllegalStateException("Firebase is uninitialized.")
         )
         try {
-            val payload = mapOf(
+            // 1. Write to security_logs (User APK schema: action, details, performed_by, performed_by_uid, timestamp)
+            val securityPayload = mapOf(
+                "action" to action,
+                "details" to details,
+                "performed_by" to adminEmail,
+                "performed_by_uid" to adminUid,
+                "timestamp" to FieldValue.serverTimestamp()
+            )
+            fs.collection("security_logs").add(securityPayload).await()
+
+            // 2. Write to admin_logs (Admin APK compatibility)
+            val adminPayload = mapOf(
                 "adminUid" to adminUid,
                 "adminEmail" to adminEmail,
                 "action" to action,
@@ -47,7 +50,8 @@ class ActivityLogRepository {
                 "result" to result,
                 "timestamp" to FieldValue.serverTimestamp()
             )
-            fs.collection("admin_logs").add(payload).await()
+            fs.collection("admin_logs").add(adminPayload).await()
+
             Result.success(Unit)
         } catch (e: Exception) {
             Log.e("ActivityLogRepo", "Failed to record activity log", e)
@@ -60,14 +64,48 @@ class ActivityLogRepository {
             IllegalStateException("Firebase is uninitialized. Connect google-services.json to access audit trail.")
         )
         try {
-            val snapshot = fs.collection("admin_logs")
-                .orderBy("timestamp", Query.Direction.DESCENDING)
-                .limit(limit)
-                .get()
-                .await()
+            // Try security_logs first, then admin_logs
+            val snapshot = try {
+                fs.collection("security_logs")
+                    .orderBy("timestamp", Query.Direction.DESCENDING)
+                    .limit(limit)
+                    .get()
+                    .await()
+            } catch (_: Exception) {
+                fs.collection("admin_logs")
+                    .orderBy("timestamp", Query.Direction.DESCENDING)
+                    .limit(limit)
+                    .get()
+                    .await()
+            }
 
             val logs = snapshot.documents.mapNotNull { doc ->
-                doc.toObject(AdminActivityLog::class.java)?.copy(id = doc.id)
+                try {
+                    val act = doc.getString("action").orEmpty()
+                    val det = doc.getString("details").orEmpty()
+                    val perfBy = doc.getString("performed_by") ?: doc.getString("adminEmail").orEmpty()
+                    val perfUid = doc.getString("performed_by_uid") ?: doc.getString("adminUid").orEmpty()
+                    val targetType = doc.getString("targetType").orEmpty()
+                    val targetId = doc.getString("targetId").orEmpty()
+                    val result = doc.getString("result") ?: "SUCCESS"
+                    val timestamp = doc.getTimestamp("timestamp")
+
+                    AdminActivityLog(
+                        id = doc.id,
+                        action = act,
+                        details = det,
+                        performedBy = perfBy,
+                        performedByUid = perfUid,
+                        adminUid = perfUid,
+                        adminEmail = perfBy,
+                        targetType = targetType,
+                        targetId = targetId,
+                        result = result,
+                        timestamp = timestamp
+                    )
+                } catch (e: Exception) {
+                    null
+                }
             }
             Result.success(logs)
         } catch (e: Exception) {

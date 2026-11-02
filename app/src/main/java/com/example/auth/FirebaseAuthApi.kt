@@ -43,6 +43,42 @@ object FirebaseAuthClient {
         }
     }
 
+    suspend fun signUpWithPassword(email: String, password: String): AuthResult = withContext(Dispatchers.IO) {
+        try {
+            val user = FirebaseAuth.getInstance()
+                .createUserWithEmailAndPassword(email, password)
+                .await()
+                .user
+                ?: return@withContext AuthResult(false, errorMessage = "Firebase user creation returned no user.")
+            AuthResult(
+                isSuccess = true,
+                localId = user.uid,
+                email = user.email,
+                displayName = user.displayName
+            )
+        } catch (e: Exception) {
+            AuthResult(false, errorMessage = readableAuthError(e, "Account creation failed."))
+        }
+    }
+
+    suspend fun signInWithCredential(credential: com.google.firebase.auth.AuthCredential): AuthResult = withContext(Dispatchers.IO) {
+        try {
+            val user = FirebaseAuth.getInstance()
+                .signInWithCredential(credential)
+                .await()
+                .user
+                ?: return@withContext AuthResult(false, errorMessage = "Google sign-in returned no user.")
+            AuthResult(
+                isSuccess = true,
+                localId = user.uid,
+                email = user.email,
+                displayName = user.displayName
+            )
+        } catch (e: Exception) {
+            AuthResult(false, errorMessage = readableAuthError(e, "Google Sign-In failed."))
+        }
+    }
+
     suspend fun sendPasswordReset(email: String): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             FirebaseAuth.getInstance().sendPasswordResetEmail(email).await()

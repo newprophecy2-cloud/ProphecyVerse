@@ -14,15 +14,7 @@ import kotlinx.coroutines.withContext
 class NoticeRepository {
 
     private fun getFirestore(): FirebaseFirestore? {
-        return try {
-            if (FirebaseApp.getApps(com.google.firebase.FirebaseApp.getInstance().applicationContext).isNotEmpty()) {
-                FirebaseFirestore.getInstance()
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
+        return runCatching { FirebaseFirestore.getInstance() }.getOrNull()
     }
 
     suspend fun getNotices(): Result<List<NoticeItem>> = withContext(Dispatchers.IO) {
@@ -30,12 +22,30 @@ class NoticeRepository {
             IllegalStateException("Firebase is uninitialized. Connect google-services.json to access live notices.")
         )
         try {
-            val snapshot = fs.collection("notices")
-                .orderBy("createdAt", Query.Direction.DESCENDING)
-                .get()
-                .await()
+            val snapshot = try {
+                fs.collection("notices")
+                    .orderBy("created_at", Query.Direction.DESCENDING)
+                    .get()
+                    .await()
+            } catch (_: Exception) {
+                // Fallback if index or created_at is named createdAt
+                try {
+                    fs.collection("notices")
+                        .orderBy("createdAt", Query.Direction.DESCENDING)
+                        .get()
+                        .await()
+                } catch (_: Exception) {
+                    fs.collection("notices").get().await()
+                }
+            }
+
             val list = snapshot.documents.mapNotNull { doc ->
-                doc.toObject(NoticeItem::class.java)?.copy(id = doc.id)
+                try {
+                    doc.toObject(NoticeItem::class.java)?.copy(id = doc.id)
+                } catch (e: Exception) {
+                    Log.w("NoticeRepo", "Failed to deserialize notice ${doc.id}: ${e.message}")
+                    null
+                }
             }
             Result.success(list)
         } catch (e: Exception) {
@@ -44,26 +54,47 @@ class NoticeRepository {
         }
     }
 
-    suspend fun saveNotice(notice: NoticeItem): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun saveNotice(notice: NoticeItem, adminEmail: String): Result<String> = withContext(Dispatchers.IO) {
         val fs = getFirestore() ?: return@withContext Result.failure(
             IllegalStateException("Firebase is uninitialized. Cannot write notice.")
         )
         try {
             val collection = fs.collection("notices")
             val docRef = if (notice.id.isNotBlank()) collection.document(notice.id) else collection.document()
-            val payload = mapOf(
+
+            val textContent = notice.message.ifBlank { notice.content }
+            val severityType = notice.severity.ifBlank { notice.type }
+
+            val payload = mutableMapOf<String, Any>(
+                // Primary fields matching User APK
                 "title" to notice.title,
-                "content" to notice.content,
-                "type" to notice.type,
-                "published" to notice.published,
+                "message" to textContent,
+                "content" to textContent, // compatibility mirror
+                "severity" to severityType,
+                "type" to severityType, // compatibility mirror
+                "active" to notice.active,
+                "published" to notice.active, // compatibility mirror
                 "priority" to notice.priority,
-                "actionUrl" to notice.actionUrl,
-                "actionLabel" to notice.actionLabel,
-                "targetVersion" to notice.targetVersion,
+                "created_by" to adminEmail,
+                "updated_at" to FieldValue.serverTimestamp(),
                 "updatedAt" to FieldValue.serverTimestamp()
-            ).toMutableMap()
+            )
+
+            if (!notice.actionUrl.isNullOrBlank()) {
+                payload["actionUrl"] = notice.actionUrl
+                payload["action_url"] = notice.actionUrl
+            }
+            if (!notice.actionLabel.isNullOrBlank()) {
+                payload["actionLabel"] = notice.actionLabel
+                payload["action_label"] = notice.actionLabel
+            }
+            if (!notice.targetVersion.isNullOrBlank()) {
+                payload["targetVersion"] = notice.targetVersion
+                payload["target_version"] = notice.targetVersion
+            }
 
             if (notice.id.isBlank()) {
+                payload["created_at"] = FieldValue.serverTimestamp()
                 payload["createdAt"] = FieldValue.serverTimestamp()
             }
 
@@ -96,7 +127,9 @@ class NoticeRepository {
             val newStatus = !currentPublished
             fs.collection("notices").document(id).update(
                 mapOf(
+                    "active" to newStatus,
                     "published" to newStatus,
+                    "updated_at" to FieldValue.serverTimestamp(),
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             ).await()

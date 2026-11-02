@@ -5,34 +5,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AdminPanelSettings
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -41,12 +19,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.analytics.AnalyticsScreen
 import com.example.analytics.AnalyticsViewModel
@@ -54,17 +27,21 @@ import com.example.auth.AdminAuthManager
 import com.example.auth.AuthStatus
 import com.example.dashboard.DashboardScreen
 import com.example.dashboard.DashboardViewModel
+import com.example.installations.InstallationDetailScreen
+import com.example.installations.InstallationManagementScreen
+import com.example.installations.InstallationViewModel
 import com.example.logs.ActivityLogsScreen
 import com.example.logs.LogsViewModel
 import com.example.navigation.AdminNavDestination
 import com.example.notices.NoticeEditorScreen
 import com.example.notices.NoticeManagementScreen
 import com.example.notices.NoticeViewModel
+import com.example.notifications.NotificationManagementScreen
+import com.example.notifications.NotificationViewModel
 import com.example.schema.SchemaAuditScreen
 import com.example.settings.SettingsScreen
 import com.example.settings.SettingsViewModel
 import com.example.ui.components.AdminScaffold
-import com.example.ui.theme.InstitutionalGreen
 import com.example.ui.theme.ProphecyVerseAdminTheme
 import com.example.users.UserDetailScreen
 import com.example.users.UserManagementScreen
@@ -74,12 +51,16 @@ import com.example.version.VersionViewModel
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var authManager: AdminAuthManager
+    private var authManager: AdminAuthManager? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        authManager = AdminAuthManager(applicationContext)
+        runCatching { enableEdgeToEdge() }
+        try {
+            authManager = AdminAuthManager(applicationContext)
+        } catch (t: Throwable) {
+            android.util.Log.e("MainActivity", "Failed to initialize AdminAuthManager: ${t.message}", t)
+        }
 
         setContent {
             ProphecyVerseAdminTheme {
@@ -87,7 +68,61 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    AdminAppRoot(authManager = authManager)
+                    var initError by remember { mutableStateOf<String?>(null) }
+
+                    val manager = authManager ?: remember {
+                        try {
+                            AdminAuthManager(applicationContext).also { authManager = it }
+                        } catch (t: Throwable) {
+                            initError = t.localizedMessage ?: "Failed to initialize Admin manager"
+                            null
+                        }
+                    }
+
+                    if (manager != null) {
+                        AdminAppRoot(authManager = manager)
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(24.dp),
+                            contentAlignment = androidx.compose.ui.Alignment.Center
+                        ) {
+                            androidx.compose.material3.Card(
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                androidx.compose.foundation.layout.Column(
+                                    modifier = Modifier.padding(24.dp),
+                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+                                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp)
+                                ) {
+                                    Text(
+                                        text = "Prophecy Verse Admin",
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = initError ?: "Initializing administrator services...",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    androidx.compose.material3.Button(
+                                        onClick = {
+                                            initError = null
+                                            try {
+                                                authManager = AdminAuthManager(applicationContext)
+                                            } catch (t: Throwable) {
+                                                initError = t.localizedMessage ?: "Retry failed"
+                                            }
+                                        }
+                                    ) {
+                                        Text("Retry Launch")
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -110,9 +145,11 @@ fun AdminAppRoot(authManager: AdminAuthManager) {
         com.example.auth.AuthScreen(authManager = authManager)
     } else {
         val dashboardVm: DashboardViewModel = viewModel()
+        val installationVm: InstallationViewModel = viewModel()
         val noticeVm: NoticeViewModel = viewModel()
         val userVm: UserViewModel = viewModel()
         val versionVm: VersionViewModel = viewModel()
+        val notificationVm: NotificationViewModel = viewModel()
         val analyticsVm: AnalyticsViewModel = viewModel()
         val logsVm: LogsViewModel = viewModel()
         val settingsVm: SettingsViewModel = viewModel()
@@ -121,6 +158,7 @@ fun AdminAppRoot(authManager: AdminAuthManager) {
         if (currentDestination !in AdminNavDestination.mainNavItems) {
             BackHandler {
                 when (currentDestination) {
+                    is AdminNavDestination.InstallationDetail -> currentDestination = AdminNavDestination.InstallationManagement
                     is AdminNavDestination.UserDetail -> currentDestination = AdminNavDestination.UserManagement
                     is AdminNavDestination.NoticeEditor -> currentDestination = AdminNavDestination.NoticeManagement
                     else -> currentDestination = AdminNavDestination.Dashboard
@@ -138,8 +176,10 @@ fun AdminAppRoot(authManager: AdminAuthManager) {
             onRefresh = {
                 when (currentDestination) {
                     is AdminNavDestination.Dashboard -> dashboardVm.refreshDashboard()
-                    is AdminNavDestination.NoticeManagement -> noticeVm.loadNotices()
+                    is AdminNavDestination.InstallationManagement -> installationVm.refreshAll()
                     is AdminNavDestination.UserManagement -> userVm.loadUsers()
+                    is AdminNavDestination.NotificationManagement -> notificationVm.loadNotifications()
+                    is AdminNavDestination.NoticeManagement -> noticeVm.loadNotices()
                     is AdminNavDestination.VersionControl -> versionVm.loadVersionConfig()
                     is AdminNavDestination.Analytics -> analyticsVm.fetchAnalytics()
                     is AdminNavDestination.ActivityLogs -> logsVm.loadLogs()
@@ -154,6 +194,17 @@ fun AdminAppRoot(authManager: AdminAuthManager) {
                     viewModel = dashboardVm,
                     onNavigate = { currentDestination = it }
                 )
+                is AdminNavDestination.InstallationManagement -> InstallationManagementScreen(
+                    viewModel = installationVm,
+                    onNavigate = { currentDestination = it }
+                )
+                is AdminNavDestination.InstallationDetail -> InstallationDetailScreen(
+                    installationDocId = dest.id,
+                    viewModel = installationVm,
+                    adminEmail = activeAdminEmail,
+                    onBack = { currentDestination = AdminNavDestination.InstallationManagement },
+                    onNavigateToUser = { uid -> currentDestination = AdminNavDestination.UserDetail(uid) }
+                )
                 is AdminNavDestination.UserManagement -> UserManagementScreen(
                     viewModel = userVm,
                     onNavigate = { currentDestination = it }
@@ -162,7 +213,12 @@ fun AdminAppRoot(authManager: AdminAuthManager) {
                     uid = dest.uid,
                     viewModel = userVm,
                     adminEmail = activeAdminEmail,
-                    onBack = { currentDestination = AdminNavDestination.UserManagement }
+                    onBack = { currentDestination = AdminNavDestination.UserManagement },
+                    onNavigateToInstallation = { instId -> currentDestination = AdminNavDestination.InstallationDetail(instId) }
+                )
+                is AdminNavDestination.NotificationManagement -> NotificationManagementScreen(
+                    viewModel = notificationVm,
+                    adminEmail = activeAdminEmail
                 )
                 is AdminNavDestination.NoticeManagement -> NoticeManagementScreen(
                     viewModel = noticeVm,

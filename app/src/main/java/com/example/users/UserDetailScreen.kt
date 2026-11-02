@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FileDownloadOff
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -44,8 +45,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.navigation.AdminNavDestination
 import com.example.ui.components.ConfirmationDialog
 import com.example.ui.components.StatusBadge
 import com.example.ui.theme.InstitutionalGreen
@@ -56,7 +60,8 @@ fun UserDetailScreen(
     uid: String,
     viewModel: UserViewModel,
     adminEmail: String,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onNavigateToInstallation: (String) -> Unit = {}
 ) {
     val state by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -85,7 +90,7 @@ fun UserDetailScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("User Profile") },
+                title = { Text("User Account Profile") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -131,36 +136,61 @@ fun UserDetailScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = user.displayName.ifBlank { "User Account" },
-                                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
-                            )
-                            StatusBadge(status = user.status)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = user.displayName.ifBlank { "User Account" },
+                                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                                )
+                                Text(
+                                    text = user.email.ifBlank { "Anonymous / Guest User" },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            StatusBadge(status = user.status.uppercase())
                         }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(12.dp))
 
-                        Text(
-                            text = "Email: ${user.email.ifBlank { "No email associated" }}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        DetailRow("UID", user.uid, isMonospace = true)
+                        DetailRow("Account Type", if (user.isAnonymous) "Guest / Anonymous" else "Registered Email User")
+                        DetailRow("App Version", "${user.appVersion} (Code ${user.appVersionCode})")
+                        DetailRow("Registered", user.formattedCreatedAt)
+                        DetailRow("Last Login", user.formattedLastLogin)
+                        DetailRow("Total Watch Time", user.formattedWatchTime)
 
-                        Spacer(modifier = Modifier.height(4.dp))
+                        if (user.installationId.isNotBlank()) {
+                            DetailRow("Last Device Installation", user.installationId, isMonospace = true)
+                            Spacer(modifier = Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = { onNavigateToInstallation(user.installationId) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Inspect Linked Installation")
+                            }
+                        }
 
-                        Text(
-                            text = "UID: ${user.uid}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.outline
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        Text(
-                            text = "Platform: ${user.platform} • App Version: ${user.clientVersion.ifBlank { "Unknown" }}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        if (user.isSuspended && user.suspensionReason.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.errorContainer,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(
+                                        text = "Suspension Reason:",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Text(
+                                        text = user.suspensionReason,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -173,7 +203,7 @@ fun UserDetailScreen(
                 ) {
                     Column(
                         modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -191,12 +221,12 @@ fun UserDetailScreen(
                         }
 
                         Text(
-                            text = "Administrative actions are logged to the tamper-resistant audit trail. In accordance with zero-trust architecture, sensitive account changes are verified by server-side rules.",
+                            text = "Actions update the user's status and download_blocked flags in Firestore. The User APK's AuthManager automatically observes status updates in real time.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
 
                         // Suspend / Restore Action
                         Row(
@@ -206,11 +236,11 @@ fun UserDetailScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Account Access",
+                                    text = "Account Standing",
                                     style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
                                 )
                                 Text(
-                                    text = if (user.status == "ACTIVE") "Account is in good standing" else "Account is currently suspended",
+                                    text = if (user.isActive) "Account is in good standing" else "Account is currently suspended",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -218,12 +248,12 @@ fun UserDetailScreen(
                             Button(
                                 onClick = { showSuspendConfirm = true },
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (user.status == "ACTIVE") MaterialTheme.colorScheme.error else InstitutionalGreen
+                                    containerColor = if (user.isActive) MaterialTheme.colorScheme.error else InstitutionalGreen
                                 ),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.testTag("toggle_suspend_btn")
                             ) {
-                                Text(if (user.status == "ACTIVE") "Suspend" else "Restore")
+                                Text(if (user.isActive) "Suspend" else "Restore")
                             }
                         }
 
@@ -239,7 +269,7 @@ fun UserDetailScreen(
                                     style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
                                 )
                                 Text(
-                                    text = if (user.isDownloadBlocked) "Downloads blocked" else "Downloads permitted",
+                                    text = if (user.downloadBlocked) "Downloads are blocked" else "Downloads are permitted",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -249,7 +279,7 @@ fun UserDetailScreen(
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.testTag("toggle_download_block_btn")
                             ) {
-                                Text(if (user.isDownloadBlocked) "Allow Downloads" else "Block Downloads")
+                                Text(if (user.downloadBlocked) "Allow Downloads" else "Block Downloads")
                             }
                         }
                     }
@@ -260,11 +290,11 @@ fun UserDetailScreen(
 
     // Confirmation dialogs
     if (showSuspendConfirm && user != null) {
-        val willSuspend = user.status == "ACTIVE"
+        val willSuspend = user.isActive
         ConfirmationDialog(
             title = if (willSuspend) "Suspend User Account" else "Restore User Account",
             message = if (willSuspend)
-                "Are you sure you want to suspend UID ${user.uid}? The user will be locked out of Prophecy Verse services."
+                "Suspend UID ${user.uid}? The user's account will be restricted on Prophecy Verse V3."
             else
                 "Restore full application access for UID ${user.uid}?",
             confirmText = if (willSuspend) "Suspend User" else "Restore User",
@@ -272,7 +302,7 @@ fun UserDetailScreen(
             onConfirm = {
                 viewModel.moderateUserStatus(
                     uid = user.uid,
-                    newStatus = if (willSuspend) "SUSPENDED" else "ACTIVE",
+                    newStatus = if (willSuspend) "suspended" else "active",
                     reason = "Administrative review by $adminEmail",
                     adminEmail = adminEmail
                 )
@@ -283,7 +313,7 @@ fun UserDetailScreen(
     }
 
     if (showDownloadBlockConfirm && user != null) {
-        val willBlock = !user.isDownloadBlocked
+        val willBlock = !user.downloadBlocked
         ConfirmationDialog(
             title = if (willBlock) "Block Offline Downloads" else "Restore Download Access",
             message = "Update download permission for user ${user.uid}?",
@@ -292,12 +322,35 @@ fun UserDetailScreen(
             onConfirm = {
                 viewModel.toggleDownloadBlock(
                     uid = user.uid,
-                    currentBlocked = user.isDownloadBlocked,
+                    currentBlocked = user.downloadBlocked,
                     adminEmail = adminEmail
                 )
                 showDownloadBlockConfirm = false
             },
             onDismiss = { showDownloadBlockConfirm = false }
+        )
+    }
+}
+
+@Composable
+private fun DetailRow(label: String, value: String, isMonospace: Boolean = false) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+            fontFamily = if (isMonospace) FontFamily.Monospace else FontFamily.Default,
+            maxLines = 1
         )
     }
 }

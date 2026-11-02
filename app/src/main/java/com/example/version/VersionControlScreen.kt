@@ -13,9 +13,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -44,6 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -59,27 +58,34 @@ fun VersionControlScreen(
     val state by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    var versionName by remember { mutableStateOf(state.config.versionName) }
-    var versionCode by remember { mutableLongStateOf(state.config.versionCode) }
+    var versionName by remember { mutableStateOf(state.config.latestVersionName) }
+    var versionCode by remember { mutableLongStateOf(state.config.latestVersionCode) }
     var minVersionCode by remember { mutableLongStateOf(state.config.minSupportedVersionCode) }
-    var isMandatory by remember { mutableStateOf(state.config.isMandatory) }
-    var updateUrl by remember { mutableStateOf(state.config.updateUrl) }
-    var updateMessage by remember { mutableStateOf(state.config.updateMessage) }
-    var sha256 by remember { mutableStateOf(state.config.sha256) }
+    var forceUpdate by remember { mutableStateOf(state.config.forceUpdate) }
+    var packageName by remember { mutableStateOf(state.config.packageName) }
+    var telegramUrl by remember { mutableStateOf("https://t.me/newprophecyverse") }
+    var websiteUrl by remember { mutableStateOf("https://prophecyverse.tech/download") }
+    var directApkUrl by remember { mutableStateOf("https://cdn.prophecyverse.tech/apk/prophecyverse-v3.0.0.apk") }
+    var changelogEn by remember { mutableStateOf(state.config.releaseNotes["en"] ?: "Prophecy Verse V3 with modern streaming, download manager, and enhanced player UI.") }
+    var changelogBn by remember { mutableStateOf(state.config.releaseNotes["bn"] ?: "প্রফেসি ভার্স V3 আধুনিক স্ট্রিমিং ও উন্নত প্লেয়ার ইন্টারফেস।") }
+    var sha256 by remember { mutableStateOf(state.config.artifactSha256) }
+    var certSha256 by remember { mutableStateOf(state.config.signingCertificateSha256) }
 
     var showConfirmDialog by remember { mutableStateOf(false) }
     var showPreviewDialog by remember { mutableStateOf(false) }
     var validationError by remember { mutableStateOf<String?>(null) }
 
-    // Sync local form state when remote config loads
+    // Sync form when config is loaded
     LaunchedEffect(state.config) {
-        versionName = state.config.versionName
-        versionCode = state.config.versionCode
+        versionName = state.config.latestVersionName
+        versionCode = state.config.latestVersionCode
         minVersionCode = state.config.minSupportedVersionCode
-        isMandatory = state.config.isMandatory
-        updateUrl = state.config.updateUrl
-        updateMessage = state.config.updateMessage
-        sha256 = state.config.sha256
+        forceUpdate = state.config.forceUpdate
+        packageName = state.config.packageName.ifBlank { "com.aistudio.prophecyverse.vykqtb" }
+        sha256 = state.config.artifactSha256
+        certSha256 = state.config.signingCertificateSha256
+        changelogEn = state.config.releaseNotes["en"] ?: changelogEn
+        changelogBn = state.config.releaseNotes["bn"] ?: changelogBn
     }
 
     LaunchedEffect(state.errorMessage, state.successMessage) {
@@ -129,7 +135,7 @@ fun VersionControlScreen(
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Configures remote version checks for the User APK. Dual-writes to app_config/version and version_config/latest.",
+                        text = "Configures remote version checks for the User APK. Writes to app_config/version_control and logs release to update_history.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -158,8 +164,7 @@ fun VersionControlScreen(
                             versionName = it
                             validationError = null
                         },
-                        label = { Text("Version Name *") },
-                        placeholder = { Text("e.g., 3.1.0") },
+                        label = { Text("Version Name * (e.g. 3.0.0)") },
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("version_name_input"),
@@ -189,12 +194,22 @@ fun VersionControlScreen(
                             onValueChange = {
                                 minVersionCode = it.toLongOrNull() ?: minVersionCode
                             },
-                            label = { Text("Min Version Code") },
+                            label = { Text("Min Version Code *") },
                             modifier = Modifier.weight(1f),
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true
                         )
                     }
+
+                    OutlinedTextField(
+                        value = packageName,
+                        onValueChange = { packageName = it },
+                        label = { Text("User APK Package Name *") },
+                        placeholder = { Text("com.aistudio.prophecyverse.vykqtb") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                    )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -203,25 +218,25 @@ fun VersionControlScreen(
                     ) {
                         Column {
                             Text(
-                                text = "Mandatory Update",
+                                text = "Force / Mandatory Update",
                                 style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
                             )
                             Text(
-                                text = "Forces users to upgrade before opening app",
+                                text = "Forces user client lock until update is installed",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Switch(
-                            checked = isMandatory,
-                            onCheckedChange = { isMandatory = it },
+                            checked = forceUpdate,
+                            onCheckedChange = { forceUpdate = it },
                             modifier = Modifier.testTag("mandatory_switch")
                         )
                     }
                 }
             }
 
-            // Distribution & Security Checksum
+            // Distribution URLs
             Card(
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -233,41 +248,62 @@ fun VersionControlScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "Distribution & Integrity",
+                        text = "Distribution Channels",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                     )
 
                     OutlinedTextField(
-                        value = updateUrl,
-                        onValueChange = {
-                            updateUrl = it
-                            validationError = null
-                        },
-                        label = { Text("Update Download URL *") },
-                        placeholder = { Text("https://github.com/prophecyverse/releases/download/...") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("update_url_input"),
+                        value = telegramUrl,
+                        onValueChange = { telegramUrl = it },
+                        label = { Text("Telegram Channel Download Link") },
+                        modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
 
                     OutlinedTextField(
-                        value = updateMessage,
-                        onValueChange = { updateMessage = it },
-                        label = { Text("Changelog / Update Message") },
-                        placeholder = { Text("What's new in this release...") },
+                        value = websiteUrl,
+                        onValueChange = { websiteUrl = it },
+                        label = { Text("Website Download Link") },
                         modifier = Modifier.fillMaxWidth(),
-                        minLines = 3
+                        singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = directApkUrl,
+                        onValueChange = { directApkUrl = it },
+                        label = { Text("Direct CDN APK Download Link") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = changelogEn,
+                        onValueChange = { changelogEn = it },
+                        label = { Text("Changelog / Release Notes (English)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2
+                    )
+
+                    OutlinedTextField(
+                        value = changelogBn,
+                        onValueChange = { changelogBn = it },
+                        label = { Text("Changelog / Release Notes (Bengali)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2
                     )
 
                     OutlinedTextField(
                         value = sha256,
-                        onValueChange = {
-                            sha256 = it.trim()
-                            validationError = null
-                        },
-                        label = { Text("APK SHA-256 Checksum (Hex)") },
-                        placeholder = { Text("64-character hex hash for integrity check") },
+                        onValueChange = { sha256 = it.trim() },
+                        label = { Text("Artifact SHA-256 (64 hex characters)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = certSha256,
+                        onValueChange = { certSha256 = it.trim() },
+                        label = { Text("Release Certificate SHA-256") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
@@ -305,12 +341,8 @@ fun VersionControlScreen(
                             validationError = "Version code must be a positive integer."
                             return@Button
                         }
-                        if (!updateUrl.startsWith("http://") && !updateUrl.startsWith("https://")) {
-                            validationError = "Update URL must be a valid http or https URL."
-                            return@Button
-                        }
-                        if (sha256.isNotBlank() && sha256.length != 64) {
-                            validationError = "SHA-256 checksum must be exactly 64 hexadecimal characters."
+                        if (packageName.isBlank()) {
+                            validationError = "Package name cannot be blank."
                             return@Button
                         }
                         showConfirmDialog = true
@@ -335,20 +367,46 @@ fun VersionControlScreen(
     if (showConfirmDialog) {
         ConfirmationDialog(
             title = "Publish Version $versionName?",
-            message = "This will update the version manifest checked by all Prophecy Verse V3 User APKs. Mandatory: $isMandatory.",
+            message = "This will update app_config/version_control checked by all Prophecy Verse V3 User APKs. Mandatory: $forceUpdate.",
             confirmText = "Publish Live",
             onConfirm = {
+                val sources = mapOf(
+                    "telegram" to mapOf(
+                        "url" to telegramUrl.trim(),
+                        "enabled" to true,
+                        "priority" to 1,
+                        "label" to "Telegram Channel"
+                    ),
+                    "website" to mapOf(
+                        "url" to websiteUrl.trim(),
+                        "enabled" to true,
+                        "priority" to 2,
+                        "label" to "Official Website"
+                    ),
+                    "backup" to mapOf(
+                        "url" to directApkUrl.trim(),
+                        "enabled" to true,
+                        "priority" to 3,
+                        "label" to "Direct CDN Server"
+                    )
+                )
+
                 val newConfig = VersionConfig(
-                    id = "version",
-                    versionName = versionName.trim(),
-                    versionCode = versionCode,
+                    id = "version_control",
+                    enabled = true,
+                    forceUpdate = forceUpdate,
+                    latestVersionCode = versionCode,
+                    latestVersionName = versionName.trim(),
                     minSupportedVersionCode = minVersionCode,
-                    isMandatory = isMandatory,
-                    updateUrl = updateUrl.trim(),
-                    updateMessage = updateMessage.trim(),
-                    sha256 = sha256.trim(),
-                    updateSources = listOf("DIRECT", "GITHUB"),
-                    downloads = listOf(updateUrl.trim())
+                    packageName = packageName.trim(),
+                    artifactSha256 = sha256.trim(),
+                    signingCertificateSha256 = certSha256.trim(),
+                    releaseNotes = mapOf(
+                        "en" to changelogEn.trim(),
+                        "bn" to changelogBn.trim()
+                    ),
+                    updateSources = sources,
+                    downloads = sources
                 )
                 viewModel.saveVersionConfig(newConfig, adminEmail)
                 showConfirmDialog = false
@@ -361,26 +419,26 @@ fun VersionControlScreen(
     if (showPreviewDialog) {
         AlertDialog(
             onDismissRequest = { showPreviewDialog = false },
-            title = { Text("Update Prompt Preview") },
+            title = { Text("User APK Prompt Preview") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = if (isMandatory) "Mandatory Update Required" else "Update Available",
+                        text = if (forceUpdate) "Mandatory Update Required" else "Update Available",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = if (isMandatory) MaterialTheme.colorScheme.error else InstitutionalGreen
+                        color = if (forceUpdate) MaterialTheme.colorScheme.error else InstitutionalGreen
                     )
                     Text(
-                        text = "Prophecy Verse v$versionName (build $versionCode) is now ready to install.",
+                        text = "Prophecy Verse v$versionName (build $versionCode) is ready to install.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = updateMessage.ifBlank { "Performance updates and bug fixes." },
+                        text = changelogEn.ifBlank { "Performance updates and bug fixes." },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     if (sha256.isNotBlank()) {
                         Text(
-                            text = "SHA-256 Verified: ${sha256.take(16)}...",
+                            text = "SHA-256: ${sha256.take(16)}...",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.outline
                         )
