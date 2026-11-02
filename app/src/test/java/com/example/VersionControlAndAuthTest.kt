@@ -7,9 +7,11 @@ import com.example.data.firebase.UserProfile
 import com.example.data.firebase.VersionCheckState
 import com.example.data.firebase.VersionControlConfig
 import com.example.data.firebase.VersionControlManager
+import com.example.data.firebase.requiresDownloadMetadata
 import com.example.data.notice.parsePublishedNotice
 import com.google.firebase.Timestamp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -44,6 +46,9 @@ class VersionControlAndAuthTest {
         )
         val state = VersionControlManager.evaluateVersionState(currentCode = 5, config = config)
         assertTrue("Client on build 5 must be UpToDate", state is VersionCheckState.UpToDate)
+        assertFalse("Current build must not need download integrity fields", requiresDownloadMetadata(5, 5, 5))
+        assertTrue("Older build needs update metadata", requiresDownloadMetadata(4, 5, 5))
+        assertTrue("Below-minimum build needs mandatory update metadata", requiresDownloadMetadata(5, 6, 6))
     }
 
     @Test

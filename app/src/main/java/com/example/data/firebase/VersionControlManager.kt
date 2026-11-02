@@ -63,6 +63,9 @@ internal fun parseAdminUpdatedAtMillis(value: Any?): Long = when (value) {
     else -> 0L
 }
 
+internal fun requiresDownloadMetadata(currentCode: Int, latestCode: Int, minimumCode: Int): Boolean =
+    currentCode < latestCode || currentCode < minimumCode
+
 sealed class VersionCheckState {
     data object Checking : VersionCheckState()
     data class UpToDate(val config: VersionControlConfig) : VersionCheckState()
@@ -199,6 +202,25 @@ class VersionControlManager private constructor(private val context: Context) {
                     ?: snapshot.getString("signingCertificateSha256") ?: ""
                 require(latestCode >= minCode && latestCode > 0 && minCode > 0)
                 require(pkgName == BuildConfig.APPLICATION_ID)
+
+                // A current/supported installation does not need release-download fields to determine
+                // its state. Older builds still require fully verified download metadata before prompting.
+                if (!requiresDownloadMetadata(currentVersionCode, latestCode, minCode)) {
+                    _versionState.value = VersionCheckState.UpToDate(
+                        VersionControlConfig(
+                            enabled = enabled,
+                            forceUpdate = forceUpdate,
+                            latestVersionName = latestName,
+                            latestVersionCode = latestCode,
+                            minSupportedVersionCode = minCode,
+                            packageName = pkgName,
+                            updatedAt = parseAdminUpdatedAtMillis(
+                                snapshot.get("updated_at") ?: snapshot.get("updatedAt")
+                            )
+                        )
+                    )
+                    return@launch
+                }
                 require(sha256.matches(Regex("(?i)^[a-f0-9]{64}$"))) {
                     "Missing or invalid artifact_sha256 (expected 64 hexadecimal characters)"
                 }
