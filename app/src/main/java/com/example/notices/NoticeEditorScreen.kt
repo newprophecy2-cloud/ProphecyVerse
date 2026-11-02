@@ -60,9 +60,9 @@ fun NoticeEditorScreen(
     val existingNotice = state.notices.find { it.id == noticeId }
 
     var title by remember { mutableStateOf(existingNotice?.title ?: "") }
-    var content by remember { mutableStateOf(existingNotice?.content ?: "") }
-    var type by remember { mutableStateOf(existingNotice?.type ?: "info") }
-    var published by remember { mutableStateOf(existingNotice?.published ?: true) }
+    var content by remember { mutableStateOf(existingNotice?.displayContent ?: "") }
+    var type by remember { mutableStateOf(existingNotice?.effectiveSeverity ?: "info") }
+    var published by remember { mutableStateOf(existingNotice?.isEffectivelyActive ?: true) }
     var priority by remember { mutableLongStateOf(existingNotice?.priority ?: 0L) }
     var actionUrl by remember { mutableStateOf(existingNotice?.actionUrl ?: "") }
     var actionLabel by remember { mutableStateOf(existingNotice?.actionLabel ?: "") }

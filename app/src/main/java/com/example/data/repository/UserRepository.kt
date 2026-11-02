@@ -2,19 +2,25 @@ package com.example.data.repository
 
 import android.util.Log
 import com.example.data.model.UserAccount
-import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FieldPath
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.DocumentSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import com.google.firebase.firestore.DocumentSnapshot
 
 data class UserCounts(
     val total: Int = 0,
     val active: Int = 0,
     val suspended: Int = 0
+)
+
+data class UserPage(
+    val users: List<UserAccount>,
+    val lastDocument: DocumentSnapshot?,
+    val hasMore: Boolean
 )
 
 class UserRepository {
@@ -23,24 +29,39 @@ class UserRepository {
         return runCatching { FirebaseFirestore.getInstance() }.getOrNull()
     }
 
-    suspend fun getUsers(pageSize: Long = 50): Result<List<UserAccount>> = withContext(Dispatchers.IO) {
+    suspend fun getUsers(pageSize: Long = 50): Result<List<UserAccount>> =
+        getUserPage(pageSize = pageSize).map { it.users }
+
+    suspend fun getUserPage(
+        pageSize: Long = 50,
+        startAfter: DocumentSnapshot? = null
+    ): Result<UserPage> = withContext(Dispatchers.IO) {
         val fs = getFirestore() ?: return@withContext Result.failure(
             IllegalStateException("Firebase is uninitialized. Connect google-services.json to view real users.")
         )
         try {
-            // Do not order by last_login_at: Firestore omits documents without that field.
-            // Older valid user records must remain visible even when the field is absent.
-            val snapshot = fs.collection("users").limit(pageSize).get().await()
+            // Use the document ID as a stable cursor; do not order by last_login_at,
+            // because that would omit valid profiles where AuthManager hasn't written it yet.
+            var query: Query = fs.collection("users")
+                .orderBy(FieldPath.documentId(), Query.Direction.ASCENDING)
+                .limit(pageSize + 1)
+            startAfter?.let { query = query.startAfter(it) }
+            val snapshot = query.get().await()
+            val hasMore = snapshot.documents.size.toLong() > pageSize
+            val pageDocuments = snapshot.documents.take(pageSize.toInt())
 
-            val users = snapshot.documents.mapNotNull { doc ->
-                try {
-                    doc.toObject(UserAccount::class.java)?.copy(uid = doc.id)
-                } catch (e: Exception) {
-                    Log.w("UserRepository", "Failed to deserialize user doc ${doc.id}: ${e.message}")
-                    null
-                }
+            val users = pageDocuments.mapNotNull { doc ->
+                runCatching { parseUserAccount(doc) }
+                    .onFailure { Log.w("UserRepository", "Failed to read user doc ${doc.id}: ${it.message}") }
+                    .getOrNull()
             }
-            Result.success(users.sortedByDescending { it.lastLoginMillis })
+            Result.success(
+                UserPage(
+                    users = users.sortedByDescending { it.lastLoginMillis },
+                    lastDocument = pageDocuments.lastOrNull().takeIf { hasMore },
+                    hasMore = hasMore
+                )
+            )
         } catch (e: Exception) {
             Log.e("UserRepository", "Failed to fetch users", e)
             Result.failure(e)
@@ -56,7 +77,9 @@ class UserRepository {
             var suspended = 0
             var cursor: DocumentSnapshot? = null
             while (true) {
-                var query: Query = fs.collection("users").limit(500)
+                var query: Query = fs.collection("users")
+                    .orderBy(FieldPath.documentId(), Query.Direction.ASCENDING)
+                    .limit(500)
                 cursor?.let { query = query.startAfter(it) }
                 val snapshot = query.get().await()
                 if (snapshot.isEmpty) break
@@ -87,10 +110,7 @@ class UserRepository {
             // 1. Direct document lookup by UID
             val doc = fs.collection("users").document(cleanQuery).get().await()
             if (doc.exists()) {
-                val user = doc.toObject(UserAccount::class.java)?.copy(uid = doc.id)
-                if (user != null) {
-                    return@withContext Result.success(listOf(user))
-                }
+                return@withContext Result.success(listOf(parseUserAccount(doc)))
             }
 
             // 2. Search by email prefix
@@ -106,7 +126,7 @@ class UserRepository {
             }
 
             val found = emailSnapshot?.documents?.mapNotNull { d ->
-                d.toObject(UserAccount::class.java)?.copy(uid = d.id)
+                runCatching { parseUserAccount(d) }.getOrNull()
             }.orEmpty()
 
             if (found.isNotEmpty()) {
@@ -116,7 +136,7 @@ class UserRepository {
             // 3. Fallback in-memory search over current collection
             val allSnapshot = fs.collection("users").limit(100).get().await()
             val matches = allSnapshot.documents.mapNotNull { d ->
-                d.toObject(UserAccount::class.java)?.copy(uid = d.id)
+                runCatching { parseUserAccount(d) }.getOrNull()
             }.filter { u ->
                 u.email.contains(cleanQuery, ignoreCase = true) ||
                 u.uid.contains(cleanQuery, ignoreCase = true) ||
@@ -137,12 +157,8 @@ class UserRepository {
         )
         try {
             val doc = fs.collection("users").document(uid).get().await()
-            val user = doc.toObject(UserAccount::class.java)?.copy(uid = doc.id)
-            if (user != null) {
-                Result.success(user)
-            } else {
-                Result.failure(NoSuchElementException("User document $uid not found"))
-            }
+            if (!doc.exists()) return@withContext Result.failure(NoSuchElementException("User document $uid not found"))
+            Result.success(parseUserAccount(doc))
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -202,4 +218,39 @@ class UserRepository {
             Result.failure(e)
         }
     }
+}
+
+/**
+ * Decode fields actually written by AuthManager/AppAnalytics, plus admin-controlled
+ * moderation fields. UID is the Firestore document ID; fields such as display_name
+ * and created_at are optional because the User APK does not currently write them.
+ */
+private fun parseUserAccount(doc: DocumentSnapshot): UserAccount {
+    fun number(vararg keys: String): Long = keys.firstNotNullOfOrNull { key ->
+        (doc.get(key) as? Number)?.toLong()
+    } ?: 0L
+
+    return UserAccount(
+        uid = doc.id,
+        email = doc.getString("email").orEmpty(),
+        displayName = doc.getString("display_name") ?: doc.getString("displayName").orEmpty(),
+        status = doc.getString("status") ?: "active",
+        suspensionReason = doc.getString("suspension_reason")
+            ?: doc.getString("moderationReason").orEmpty(),
+        downloadBlocked = doc.getBoolean("download_blocked")
+            ?: doc.getBoolean("isDownloadBlocked") ?: false,
+        isAnonymous = doc.getBoolean("is_anonymous")
+            ?: doc.getBoolean("isAnonymous") ?: false,
+        installationId = doc.getString("installation_id").orEmpty(),
+        appVersion = doc.getString("app_version")
+            ?: doc.getString("clientVersion").orEmpty(),
+        appVersionCode = number("app_version_code").toInt(),
+        totalWatchSeconds = number("total_watch_seconds"),
+        createdAtRaw = doc.get("created_at") ?: doc.get("createdAt"),
+        lastLoginAtRaw = doc.get("last_login_at") ?: doc.get("lastLoginAt"),
+        statusUpdatedAt = doc.getTimestamp("status_updated_at")
+            ?: doc.getTimestamp("statusUpdatedAt"),
+        statusUpdatedBy = doc.getString("status_updated_by")
+            ?: doc.getString("statusUpdatedBy").orEmpty()
+    )
 }

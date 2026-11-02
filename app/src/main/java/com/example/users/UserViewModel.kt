@@ -5,6 +5,9 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.model.UserAccount
 import com.example.data.repository.ActivityLogRepository
 import com.example.data.repository.UserRepository
+import com.google.firebase.firestore.DocumentSnapshot
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -12,6 +15,8 @@ import kotlinx.coroutines.launch
 
 data class UserUiState(
     val isLoading: Boolean = false,
+    val isLoadingMore: Boolean = false,
+    val hasMoreUsers: Boolean = false,
     val users: List<UserAccount> = emptyList(),
     val selectedUser: UserAccount? = null,
     val searchQuery: String = "",
@@ -27,15 +32,71 @@ class UserViewModel(
 
     private val _uiState = MutableStateFlow(UserUiState(isLoading = true))
     val uiState: StateFlow<UserUiState> = _uiState.asStateFlow()
+    private var lastUserDocument: DocumentSnapshot? = null
+    private var searchDebounceJob: Job? = null
 
     init {
         loadUsers()
     }
 
     fun loadUsers() {
+        loadUserPage(reset = true)
+    }
+
+    fun loadMoreUsers() {
+        if (_uiState.value.searchQuery.isBlank() &&
+            !_uiState.value.isLoading &&
+            !_uiState.value.isLoadingMore &&
+            _uiState.value.hasMoreUsers
+        ) {
+            loadUserPage(reset = false)
+        }
+    }
+
+    private fun loadUserPage(reset: Boolean) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
-            val result = repository.getUsers()
+            val before = _uiState.value
+            _uiState.value = before.copy(
+                isLoading = reset,
+                isLoadingMore = !reset,
+                users = if (reset) emptyList() else before.users,
+                hasMoreUsers = if (reset) false else before.hasMoreUsers,
+                errorMessage = null
+            )
+            if (reset) lastUserDocument = null
+            val result = repository.getUserPage(startAfter = if (reset) null else lastUserDocument)
+            if (result.isSuccess) {
+                val page = result.getOrNull()!!
+                lastUserDocument = page.lastDocument
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    isLoadingMore = false,
+                    users = if (reset) page.users else (_uiState.value.users + page.users).distinctBy { it.uid },
+                    hasMoreUsers = page.hasMore,
+                    errorMessage = null
+                )
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    isLoadingMore = false,
+                    errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Failed to fetch users"
+                )
+            }
+        }
+    }
+
+    fun onSearchQueryChanged(query: String) {
+        _uiState.value = _uiState.value.copy(searchQuery = query, errorMessage = null, hasMoreUsers = false)
+        searchDebounceJob?.cancel()
+        searchDebounceJob = viewModelScope.launch {
+            delay(300)
+            if (query.isBlank()) {
+                loadUserPage(reset = true)
+                return@launch
+            }
+            _uiState.value = _uiState.value.copy(isLoading = true, users = emptyList())
+            val result = repository.searchUsers(query)
+            if (_uiState.value.searchQuery != query) return@launch
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
@@ -45,26 +106,8 @@ class UserViewModel(
             } else {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
-                    errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Failed to fetch users"
-                )
-            }
-        }
-    }
-
-    fun onSearchQueryChanged(query: String) {
-        _uiState.value = _uiState.value.copy(searchQuery = query)
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true)
-            val result = repository.searchUsers(query)
-            if (result.isSuccess) {
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    users = result.getOrNull() ?: emptyList()
-                )
-            } else {
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    errorMessage = result.exceptionOrNull()?.localizedMessage
+                    users = emptyList(),
+                    errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Failed to search users"
                 )
             }
         }
@@ -72,7 +115,7 @@ class UserViewModel(
 
     fun loadUserDetails(uid: String) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true)
+            _uiState.value = _uiState.value.copy(isLoading = true, selectedUser = null, errorMessage = null)
             val result = repository.getUserDetails(uid)
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(

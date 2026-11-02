@@ -78,7 +78,7 @@ match /watch_history/{userId}/episodes/{episodeId} {
 }
 ```
 
-The `notices` rule already permits published notices to be read and Admin-authorized writes. However, inspection of the current `apk-V3` source shows that its `NoticeManager` does not read Firestore notices at all; deploying notice rules alone will **not** make Admin-published notices appear in that User APK. A separate User APK source change is needed for that feature.
+The `notices` rule permits published notices to be read and Admin-authorized writes. The checked-in User APK `NoticeManager` now queries `notices` with `published == true`, then filters `active == true`; Admin-created documents must therefore write those fields and the `message` body it consumes. This proposal remains unapplied and does not grant public writes.
 
 ## Deployment cautions
 

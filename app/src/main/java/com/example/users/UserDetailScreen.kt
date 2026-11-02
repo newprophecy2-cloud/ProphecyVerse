@@ -117,9 +117,20 @@ fun UserDetailScreen(
                         modifier = Modifier.padding(24.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        CircularProgressIndicator(color = InstitutionalGreen)
+                        if (state.isLoading) {
+                            CircularProgressIndicator(color = InstitutionalGreen)
+                        }
                         Spacer(modifier = Modifier.height(12.dp))
-                        Text("Loading user profile for UID: $uid")
+                        Text(
+                            if (state.isLoading) "Loading user profile for UID: $uid"
+                            else state.errorMessage ?: "User profile $uid was not found."
+                        )
+                        if (!state.isLoading) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(onClick = { viewModel.loadUserDetails(uid) }) {
+                                Text("Retry")
+                            }
+                        }
                     }
                 }
             } else {

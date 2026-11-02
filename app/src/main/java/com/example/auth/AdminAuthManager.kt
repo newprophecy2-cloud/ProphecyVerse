@@ -352,27 +352,6 @@ class AdminAuthManager(private val context: Context) {
             return
         }
 
-        // App-side allowlists do not grant Firestore access. Confirm that the active
-        // database rules permit the telemetry reads this console actually needs.
-        try {
-            fs.collection("installations").limit(1).get().await()
-        } catch (e: Exception) {
-            Log.w("AdminAuthManager", "Firestore rejected the Admin telemetry read", e)
-            if (e is com.google.firebase.firestore.FirebaseFirestoreException &&
-                e.code == com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED
-            ) {
-                denySession(
-                    email,
-                    "Sign-in succeeded, but Firestore denied Admin access to installations. Provision this UID in admin_users with is_admin=true, or align the deployed rules with the Admin role model."
-                )
-            } else {
-                _authStatus.value = AuthStatus.AuthError(
-                    "Could not verify Firestore Admin access: ${e.localizedMessage ?: "connection failed"}. Check the network and retry."
-                )
-            }
-            return
-        }
-
         val finalRole = when {
             isPrimaryOwner -> "SUPER_ADMIN"
             roleRecordFromDb != null -> roleRecordFromDb.role

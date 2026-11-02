@@ -28,6 +28,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -165,6 +166,25 @@ fun UserManagementScreen(
                             user = user,
                             onClick = { onNavigate(AdminNavDestination.UserDetail(user.uid)) }
                         )
+                    }
+                    if (state.hasMoreUsers) {
+                        item {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (state.isLoadingMore) {
+                                    CircularProgressIndicator(color = InstitutionalGreen)
+                                } else {
+                                    OutlinedButton(
+                                        onClick = { viewModel.loadMoreUsers() },
+                                        modifier = Modifier.testTag("load_more_users_btn")
+                                    ) {
+                                        Text("Load More Users")
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

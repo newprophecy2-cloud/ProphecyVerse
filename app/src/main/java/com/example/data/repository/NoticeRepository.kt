@@ -77,7 +77,14 @@ class NoticeRepository {
                 "priority" to notice.priority,
                 "created_by" to adminEmail,
                 "updated_at" to FieldValue.serverTimestamp(),
-                "updatedAt" to FieldValue.serverTimestamp()
+                "updatedAt" to FieldValue.serverTimestamp(),
+                // Remove stale values when an editor intentionally clears an optional field.
+                "actionUrl" to FieldValue.delete(),
+                "action_url" to FieldValue.delete(),
+                "actionLabel" to FieldValue.delete(),
+                "action_label" to FieldValue.delete(),
+                "targetVersion" to FieldValue.delete(),
+                "target_version" to FieldValue.delete()
             )
 
             if (!notice.actionUrl.isNullOrBlank()) {

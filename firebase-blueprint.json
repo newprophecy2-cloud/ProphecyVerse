@@ -2,17 +2,20 @@
   "entities": {
     "UserAccount": {
       "collection": "users",
-      "documentId": "uid",
+      "documentId": "Firebase Auth UID (User APK does not duplicate uid in the profile)",
       "fields": {
-        "uid": { "type": "string", "required": true },
-        "displayName": { "type": "string", "required": false },
-        "email": { "type": "string", "required": true },
-        "status": { "type": "string", "required": true, "enum": ["ACTIVE", "SUSPENDED", "PENDING_REVIEW"] },
-        "isDownloadBlocked": { "type": "boolean", "required": true },
-        "clientVersion": { "type": "string", "required": false },
-        "platform": { "type": "string", "required": true },
-        "createdAt": { "type": "timestamp", "required": false },
-        "updatedAt": { "type": "timestamp", "required": false }
+        "email": { "type": "string", "required": false, "writer": "AuthManager" },
+        "is_anonymous": { "type": "boolean", "required": false, "writer": "AuthManager" },
+        "installation_id": { "type": "string", "required": false, "writer": "AuthManager" },
+        "last_login_at": { "type": "epoch_milliseconds", "required": false, "writer": "AuthManager" },
+        "app_version": { "type": "string", "required": false, "writer": "AuthManager" },
+        "app_version_code": { "type": "integer", "required": false, "writer": "AuthManager" },
+        "total_watch_seconds": { "type": "integer", "required": false, "writer": "AppAnalytics" },
+        "status": { "type": "string", "required": false, "writer": "Admin moderation; User APK defaults to active" },
+        "suspension_reason": { "type": "string", "required": false, "writer": "Admin moderation" },
+        "download_blocked": { "type": "boolean", "required": false, "writer": "Admin moderation; User APK defaults to false" },
+        "status_updated_at": { "type": "timestamp", "required": false, "writer": "Admin moderation" },
+        "status_updated_by": { "type": "string", "required": false, "writer": "Admin moderation" }
       }
     },
     "NoticeItem": {
@@ -20,30 +23,34 @@
       "documentId": "auto",
       "fields": {
         "title": { "type": "string", "required": true },
-        "content": { "type": "string", "required": true },
-        "type": { "type": "string", "required": true, "enum": ["info", "warning", "alert", "maintenance"] },
-        "published": { "type": "boolean", "required": true },
+        "message": { "type": "string", "required": true, "reader": "NoticeManager" },
+        "severity": { "type": "string", "required": true, "reader": "NoticeManager" },
+        "active": { "type": "boolean", "required": true },
+        "published": { "type": "boolean", "required": true, "reader_query": "NoticeManager where published == true" },
         "priority": { "type": "integer", "required": true },
         "actionUrl": { "type": "string", "required": false },
         "actionLabel": { "type": "string", "required": false },
         "targetVersion": { "type": "string", "required": false },
-        "createdAt": { "type": "timestamp", "required": false },
-        "updatedAt": { "type": "timestamp", "required": false }
+        "created_by": { "type": "string", "required": false },
+        "created_at": { "type": "timestamp", "required": false },
+        "updated_at": { "type": "timestamp", "required": false }
       }
     },
     "VersionConfig": {
       "collection": "app_config",
-      "documentId": "version",
+      "documentId": "version_control",
       "fields": {
-        "versionName": { "type": "string", "required": true },
-        "versionCode": { "type": "integer", "required": true },
-        "minSupportedVersionCode": { "type": "integer", "required": true },
-        "isMandatory": { "type": "boolean", "required": true },
-        "updateUrl": { "type": "string", "required": true },
-        "updateMessage": { "type": "string", "required": false },
-        "sha256": { "type": "string", "required": false },
-        "updateSources": { "type": "array", "required": false },
-        "downloads": { "type": "array", "required": false }
+        "enabled": { "type": "boolean", "required": true },
+        "force_update": { "type": "boolean", "required": true },
+        "latest_version_name": { "type": "string", "required": true },
+        "latest_version_code": { "type": "integer", "required": true },
+        "min_supported_version_code": { "type": "integer", "required": true },
+        "package_name": { "type": "string", "required": true },
+        "release_notes": { "type": "map<string,string>", "required": false },
+        "update_sources": { "type": "map<string,map>", "required": true },
+        "downloads": { "type": "map<string,map>", "required": true },
+        "updated_at": { "type": "timestamp", "required": false },
+        "updated_by": { "type": "string", "required": false }
       }
     },
     "AdminRoleRecord": {

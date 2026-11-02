@@ -58,10 +58,15 @@ class InstallationViewModel(
             if (res.isSuccess) {
                 _uiState.value = _uiState.value.copy(
                     isLoadingStats = false,
-                    stats = res.getOrNull() ?: InstallationStats()
+                    stats = res.getOrNull() ?: InstallationStats(),
+                    errorMessage = null
                 )
             } else {
-                _uiState.value = _uiState.value.copy(isLoadingStats = false)
+                _uiState.value = _uiState.value.copy(
+                    isLoadingStats = false,
+                    errorMessage = res.exceptionOrNull()?.localizedMessage
+                        ?: "Firestore denied or failed the installation statistics read."
+                )
             }
         }
     }

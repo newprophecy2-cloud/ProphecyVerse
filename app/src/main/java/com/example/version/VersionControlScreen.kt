@@ -1,5 +1,6 @@
 package com.example.version
 
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -68,9 +69,6 @@ fun VersionControlScreen(
     var directApkUrl by remember { mutableStateOf(versionSourceUrl(state.config, "backup", "direct_apk", "apk")) }
     var changelogEn by remember { mutableStateOf(state.config.releaseNotes["en"] ?: "Prophecy Verse V3 with modern streaming, download manager, and enhanced player UI.") }
     var changelogBn by remember { mutableStateOf(state.config.releaseNotes["bn"] ?: "প্রফেসি ভার্স V3 আধুনিক স্ট্রিমিং ও উন্নত প্লেয়ার ইন্টারফেস।") }
-    var sha256 by remember { mutableStateOf(state.config.artifactSha256) }
-    var certSha256 by remember { mutableStateOf(state.config.signingCertificateSha256) }
-
     var showConfirmDialog by remember { mutableStateOf(false) }
     var showPreviewDialog by remember { mutableStateOf(false) }
     var validationError by remember { mutableStateOf<String?>(null) }
@@ -85,8 +83,6 @@ fun VersionControlScreen(
         telegramUrl = versionSourceUrl(state.config, "telegram")
         websiteUrl = versionSourceUrl(state.config, "website")
         directApkUrl = versionSourceUrl(state.config, "backup", "direct_apk", "apk")
-        sha256 = state.config.artifactSha256
-        certSha256 = state.config.signingCertificateSha256
         changelogEn = state.config.releaseNotes["en"] ?: changelogEn
         changelogBn = state.config.releaseNotes["bn"] ?: changelogBn
     }
@@ -295,21 +291,6 @@ fun VersionControlScreen(
                         minLines = 2
                     )
 
-                    OutlinedTextField(
-                        value = sha256,
-                        onValueChange = { sha256 = it.trim() },
-                        label = { Text("Artifact SHA-256 (64 hex characters)") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-
-                    OutlinedTextField(
-                        value = certSha256,
-                        onValueChange = { certSha256 = it.trim() },
-                        label = { Text("Release Certificate SHA-256") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
                 }
             }
 
@@ -344,6 +325,10 @@ fun VersionControlScreen(
                             validationError = "Version code must be a positive integer."
                             return@Button
                         }
+                        if (versionCode > Int.MAX_VALUE.toLong()) {
+                            validationError = "Version code exceeds the User APK's supported numeric range."
+                            return@Button
+                        }
                         if (packageName.isBlank()) {
                             validationError = "Package name cannot be blank."
                             return@Button
@@ -356,17 +341,11 @@ fun VersionControlScreen(
                             validationError = "Minimum supported version code must be positive and no greater than the latest version code."
                             return@Button
                         }
-                        if (!directApkUrl.trim().startsWith("https://", ignoreCase = true) ||
-                            !directApkUrl.trim().substringBefore('?').substringBefore('#').endsWith(".apk", ignoreCase = true)) {
+                        val parsedApkUrl = runCatching { Uri.parse(directApkUrl.trim()) }.getOrNull()
+                        if (parsedApkUrl?.scheme?.equals("https", ignoreCase = true) != true ||
+                            parsedApkUrl?.host.isNullOrBlank() ||
+                            !parsedApkUrl?.path.orEmpty().endsWith(".apk", ignoreCase = true)) {
                             validationError = "Enter a real HTTPS direct APK URL ending in .apk."
-                            return@Button
-                        }
-                        if (!sha256.trim().matches(Regex("(?i)^[a-f0-9]{64}$"))) {
-                            validationError = "Enter the actual APK SHA-256 fingerprint (64 hexadecimal characters)."
-                            return@Button
-                        }
-                        if (!certSha256.trim().replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
-                            validationError = "Enter the actual signing certificate SHA-256 fingerprint (64 hexadecimal characters)."
                             return@Button
                         }
                         showConfirmDialog = true
@@ -417,8 +396,6 @@ fun VersionControlScreen(
                     latestVersionName = versionName.trim(),
                     minSupportedVersionCode = minVersionCode,
                     packageName = packageName.trim(),
-                    artifactSha256 = sha256.trim(),
-                    signingCertificateSha256 = certSha256.trim(),
                     releaseNotes = mapOf(
                         "en" to changelogEn.trim(),
                         "bn" to changelogBn.trim()
@@ -454,13 +431,6 @@ fun VersionControlScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    if (sha256.isNotBlank()) {
-                        Text(
-                            text = "SHA-256: ${sha256.take(16)}...",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.outline
-                        )
-                    }
                 }
             },
             confirmButton = {

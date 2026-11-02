@@ -205,8 +205,6 @@ data class VersionConfig(
     @PropertyName("latest_version_name") val latestVersionName: String = "3.0.0",
     @PropertyName("min_supported_version_code") val minSupportedVersionCode: Long = 5L,
     @PropertyName("package_name") val packageName: String = "com.aistudio.prophecyverse.vykqtb",
-    @PropertyName("artifact_sha256") val artifactSha256: String = "",
-    @PropertyName("signing_certificate_sha256") val signingCertificateSha256: String = "",
     @PropertyName("release_notes") val releaseNotes: Map<String, String> = mapOf(
         "en" to "Prophecy Verse V3 with modern streaming, download manager, and enhanced player UI.",
         "bn" to "প্রফেসি ভার্স V3 আধুনিক স্ট্রিমিং ও উন্নত প্লেয়ার ইন্টারফেস।"
