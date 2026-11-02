@@ -246,17 +246,6 @@ class PlayerManager(
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
-        // Unmute device media stream if muted
-        try {
-            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-            audioManager?.let { am ->
-                val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
-                if (max > 0) {
-                    am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, max, 0)
-                }
-            }
-        } catch (_: Exception) {}
-
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
 
         // Resolve container MIME type:

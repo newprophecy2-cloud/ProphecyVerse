@@ -267,13 +267,21 @@ fun PlayerScreen(
         audioManager?.let { am ->
             val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             maxVolume = max
-            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            val step = if (delta > 0) 1 else -1
-            val next = (cur + step).coerceIn(0, max)
-            if (next != cur) {
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, next, 0)
+            if (max > 0 && delta != 0f) {
+                val direction = if (delta > 0f) {
+                    AudioManager.ADJUST_RAISE
+                } else {
+                    AudioManager.ADJUST_LOWER
+                }
+                // Use the same native operation as the physical volume buttons. Android
+                // owns the system volume panel lifecycle and dismisses it normally.
+                am.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    direction,
+                    AudioManager.FLAG_SHOW_UI
+                )
             }
-            volumeLevel = next
+            volumeLevel = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             showVolumeHud = true
         }
     }
