@@ -343,7 +343,7 @@ fun UpdateCard(
                                     fontSize = 13.sp
                                 )
                                 Text(
-                                    text = "Checking SHA-256 and package signature",
+                                    text = "Checking APK package and version; Android will verify the app signature",
                                     color = TextMuted,
                                     fontSize = 11.sp
                                 )
@@ -379,7 +379,7 @@ fun UpdateCard(
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(
-                                text = "Download Verification Failed",
+                                text = "Update Download Failed",
                                 color = ErrorRed,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp
@@ -393,7 +393,7 @@ fun UpdateCard(
                         }
                     }
                     Spacer(modifier = Modifier.height(14.dp))
-                    config.downloads.filter { it.isDirectApk }.forEach { source ->
+                    config.downloads.forEach { source ->
                         DownloadSourceButton(source = source, onClick = { onDownloadSourceClick(source) })
                         Spacer(modifier = Modifier.height(8.dp))
                     }

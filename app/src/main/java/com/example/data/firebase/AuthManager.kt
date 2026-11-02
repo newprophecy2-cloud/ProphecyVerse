@@ -258,10 +258,15 @@ class AuthManager private constructor(private val context: Context) {
                 )
                 user.email?.let { data["email"] = it }
 
-                firestore.collection("users")
-                    .document(user.uid)
-                    .set(data, SetOptions.merge())
-                    .await()
+                val userDocument = firestore.collection("users").document(user.uid)
+                val existingProfile = userDocument.get().await()
+                if (!existingProfile.exists()) {
+                    // The deployed user rules require safe initial values on create. Do not include
+                    // these fields for existing profiles, where owner updates cannot change them.
+                    data["status"] = "active"
+                    data["download_blocked"] = false
+                }
+                userDocument.set(data, SetOptions.merge()).await()
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync user profile to Firestore: ${e.message}")
             }

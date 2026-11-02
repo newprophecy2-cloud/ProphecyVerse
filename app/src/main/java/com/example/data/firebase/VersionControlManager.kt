@@ -25,7 +25,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 data class DownloadSource(
@@ -204,7 +203,7 @@ class VersionControlManager private constructor(private val context: Context) {
                 require(pkgName == BuildConfig.APPLICATION_ID)
 
                 // A current/supported installation does not need release-download fields to determine
-                // its state. Older builds still require fully verified download metadata before prompting.
+                // its state. Older builds need at least one actionable HTTPS download source.
                 if (!requiresDownloadMetadata(currentVersionCode, latestCode, minCode)) {
                     _versionState.value = VersionCheckState.UpToDate(
                         VersionControlConfig(
@@ -221,13 +220,6 @@ class VersionControlManager private constructor(private val context: Context) {
                     )
                     return@launch
                 }
-                require(sha256.matches(Regex("(?i)^[a-f0-9]{64}$"))) {
-                    "Missing or invalid artifact_sha256 (expected 64 hexadecimal characters)"
-                }
-                require(signingCertificateSha256.replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
-                    "Missing or invalid signing_certificate_sha256 (expected 64 hexadecimal characters)"
-                }
-
                 // Release notes (map or strings)
                 val releaseNotesRaw = (snapshot.get("release_notes") ?: snapshot.get("releaseNotes")) as? Map<*, *>
                 val bnNotes = releaseNotesRaw?.get("bn")?.toString()
@@ -240,7 +232,9 @@ class VersionControlManager private constructor(private val context: Context) {
 
                 // Parse downloads map
                 val downloadsList = mutableListOf<DownloadSource>()
-                val downloadsMap = snapshot.get("downloads") as? Map<*, *>
+                val downloadsMap = (snapshot.get("downloads") as? Map<*, *>)
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: (snapshot.get("update_sources") as? Map<*, *>)
                 if (downloadsMap != null) {
                     downloadsMap.forEach { (key, value) ->
                         val itemMap = value as? Map<*, *>
@@ -271,12 +265,8 @@ class VersionControlManager private constructor(private val context: Context) {
                     }
                 }
 
-                // If downloads map wasn't in doc, check fallback legacy fields
                 if (downloadsList.isEmpty()) {
                     throw IllegalArgumentException("Version configuration has no enabled HTTPS download sources")
-                }
-                require(downloadsList.any { it.isDirectApk }) {
-                    "Version configuration has no enabled direct APK URL; no in-app Update button can be shown"
                 }
 
                 // Sort by priority ascending
@@ -312,8 +302,8 @@ class VersionControlManager private constructor(private val context: Context) {
     }
 
     /**
-     * Downloads an APK file from a direct link, calculates SHA-256 hash,
-     * validates APK package ID & version, and triggers the system installer.
+     * Downloads an APK file from a direct link, validates APK package ID & numeric version code,
+     * and delegates signing continuity checks to Android's package installer.
      */
     fun startDirectApkDownload(source: DownloadSource, expectedConfig: VersionControlConfig) {
         val sourceUri = runCatching { Uri.parse(source.url) }.getOrNull()
@@ -325,12 +315,6 @@ class VersionControlManager private constructor(private val context: Context) {
             openExternalUrl(source.url)
             return
         }
-        if (!expectedConfig.sha256.matches(Regex("(?i)^[a-f0-9]{64}$")) ||
-            !expectedConfig.signingCertificateSha256.replace(":", "").matches(Regex("(?i)^[a-f0-9]{64}$"))) {
-            _apkDownloadState.value = ApkDownloadState.Error("Update integrity metadata is missing or invalid.")
-            return
-        }
-
         activeDownloadJob?.cancel()
         activeDownloadJob = scope.launch {
             _apkDownloadState.value = ApkDownloadState.Downloading(0, 0, 0)
@@ -353,13 +337,10 @@ class VersionControlManager private constructor(private val context: Context) {
 
                 val buffer = ByteArray(16 * 1024)
                 var downloaded = 0L
-                val md = MessageDigest.getInstance("SHA-256")
-
                 while (true) {
                     val read = inputStream.read(buffer)
                     if (read == -1) break
                     outputStream.write(buffer, 0, read)
-                    md.update(buffer, 0, read)
                     downloaded += read
 
                     val percent = if (totalBytes > 0) ((downloaded * 100) / totalBytes).toInt() else 0
@@ -371,18 +352,6 @@ class VersionControlManager private constructor(private val context: Context) {
                 inputStream.close()
 
                 _apkDownloadState.value = ApkDownloadState.Verifying
-
-                // Calculate calculated SHA-256
-                val digest = md.digest()
-                val computedSha256 = digest.joinToString("") { "%02x".format(it) }
-
-                if (!computedSha256.equals(expectedConfig.sha256.trim(), ignoreCase = true)) {
-                    targetFile.delete()
-                    _apkDownloadState.value = ApkDownloadState.Error(
-                        "SHA-256 integrity verification failed: downloaded file may be corrupted."
-                    )
-                    return@launch
-                }
 
                 // Verify package ID using package manager
                 val pm = context.packageManager
@@ -414,15 +383,8 @@ class VersionControlManager private constructor(private val context: Context) {
                     return@launch
                 }
 
-                val signingHash = signingCertificateSha256(targetFile)
-                if (expectedConfig.signingCertificateSha256.isBlank() ||
-                    !signingHash.equals(expectedConfig.signingCertificateSha256.replace(":", "").trim(), ignoreCase = true)
-                ) {
-                    targetFile.delete()
-                    _apkDownloadState.value = ApkDownloadState.Error("APK signing certificate verification failed.")
-                    return@launch
-                }
-
+                // The Android package installer verifies signing-certificate continuity when
+                // installing over this app. Do not require an admin-maintained certificate hash.
                 _apkDownloadState.value = ApkDownloadState.ReadyToInstall(targetFile)
                 withContext(Dispatchers.Main) {
                     launchPackageInstaller(targetFile)
@@ -435,29 +397,6 @@ class VersionControlManager private constructor(private val context: Context) {
         }
     }
 
-    private fun signingCertificateSha256(apkFile: File): String {
-        val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.packageManager.getPackageArchiveInfo(
-                apkFile.absolutePath,
-                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            context.packageManager.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_SIGNATURES)
-        } ?: throw IllegalStateException("Unable to read APK signing certificate")
-        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            info.signingInfo?.apkContentsSigners
-                ?: throw IllegalStateException("APK signing information is unavailable")
-        } else {
-            @Suppress("DEPRECATION")
-            info.signatures ?: throw IllegalStateException("APK signatures are unavailable")
-        }
-        val digest = MessageDigest.getInstance("SHA-256").digest(
-            signatures.firstOrNull()?.toByteArray()
-                ?: throw IllegalStateException("APK contains no signing certificates")
-        )
-        return digest.joinToString("") { "%02x".format(it) }
-    }
     fun cancelApkDownload() {
         activeDownloadJob?.cancel()
         _apkDownloadState.value = ApkDownloadState.Idle

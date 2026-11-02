@@ -66,6 +66,19 @@ class VersionControlAndAuthTest {
     }
 
     @Test
+    fun `update availability follows numeric versionCode rather than version name ordering`() {
+        val config = VersionControlConfig(
+            latestVersionCode = 10,
+            latestVersionName = "3.10.0",
+            minSupportedVersionCode = 8,
+            forceUpdate = false
+        )
+        val state = VersionControlManager.evaluateVersionState(currentCode = 9, config = config)
+        assertTrue("Build 9 must be offered build 10 regardless of version-name formatting", state is VersionCheckState.OptionalUpdate)
+        assertEquals(10, (state as VersionCheckState.OptionalUpdate).config.latestVersionCode)
+    }
+
+    @Test
     fun `test force update when latest is 6 and forceUpdate is true`() {
         val config = VersionControlConfig(
             latestVersionCode = 6,
