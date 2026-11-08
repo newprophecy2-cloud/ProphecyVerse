@@ -104,6 +104,7 @@ fun DetailScreen(
     val watchlistEntry by viewModel.watchlistEntry.collectAsStateWithLifecycle()
     val lastPlayed by viewModel.lastPlayed.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val syncError by viewModel.syncError.collectAsStateWithLifecycle()
 
     val selectedEpisodeForSources by viewModel.selectedEpisodeForSources.collectAsStateWithLifecycle()
     val episodeSources by viewModel.episodeSources.collectAsStateWithLifecycle()
@@ -116,6 +117,7 @@ fun DetailScreen(
         if (anime != null) downloadManager.observeDownloadsForAnime(anime!!.id)
         else kotlinx.coroutines.flow.flowOf(emptyList())
     }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val downloadsByEpisode = remember(downloads) { downloads.associateBy { it.episodeId } }
 
     var isSynopsisExpanded by remember { mutableStateOf(false) }
     val authManager = remember { com.example.data.firebase.AuthManager.getInstance(context) }
@@ -542,6 +544,37 @@ fun DetailScreen(
                                         )
                                     }
                                 }
+                            } else if (syncError != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 20.dp, vertical = 24.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Card(
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(20.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text("Catalog sync failed", color = TextPrimary, fontWeight = FontWeight.Bold)
+                                            Text(syncError ?: "Unable to load episodes.", color = TextMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
+                                            Button(
+                                                onClick = { viewModel.refreshDetails() },
+                                                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Retry", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 Box(
                                     modifier = Modifier
@@ -604,7 +637,7 @@ fun DetailScreen(
                         }
                     } else {
                         items(episodes, key = { it.id }) { ep ->
-                            val downloadEntry = downloads.firstOrNull { it.episodeId == ep.id }
+                            val downloadEntry = downloadsByEpisode[ep.id]
                             EpisodeRow(
                                 episode = ep,
                                 isPlayed = lastPlayed?.episodeId == ep.id,

@@ -164,7 +164,7 @@ fun PlayerScreen(
     val availableSources by viewModel.availableSources.collectAsStateWithLifecycle()
     val activeSource by viewModel.activeSource.collectAsStateWithLifecycle()
 
-    val audioTracks by viewModel.playerManager.availableAudioTracks.collectAsStateWithLifecycle()
+    val audioTracks by viewModel.unifiedAudioTracks.collectAsStateWithLifecycle()
     val subTracks by viewModel.playerManager.availableSubtitles.collectAsStateWithLifecycle()
     val qualities by viewModel.playerManager.availableQualities.collectAsStateWithLifecycle()
 
@@ -518,7 +518,7 @@ fun PlayerScreen(
                     qualities = qualities,
                     playbackSpeed = playbackSpeed,
                     onSwitchSource = { viewModel.switchSource(it) },
-                    onSelectAudioTrack = { viewModel.playerManager.selectTrack(it) },
+                    onSelectAudioTrack = { viewModel.selectAudioTrack(it) },
                     onSelectSubTrack = { viewModel.playerManager.selectTrack(it) },
                     onSelectQualityTrack = { viewModel.playerManager.selectTrack(it) },
                     onSetSpeed = { viewModel.playerManager.setSpeed(it) }
@@ -1030,7 +1030,7 @@ fun PlayerScreen(
                     qualities = qualities,
                     playbackSpeed = playbackSpeed,
                     onSwitchSource = { viewModel.switchSource(it) },
-                    onSelectAudioTrack = { viewModel.playerManager.selectTrack(it) },
+                    onSelectAudioTrack = { viewModel.selectAudioTrack(it) },
                     onSelectSubTrack = { viewModel.playerManager.selectTrack(it) },
                     onSelectQualityTrack = { viewModel.playerManager.selectTrack(it) },
                     onSetSpeed = { viewModel.playerManager.setSpeed(it) }

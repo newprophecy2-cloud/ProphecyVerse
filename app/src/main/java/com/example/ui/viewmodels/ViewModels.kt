@@ -211,6 +211,11 @@ class DetailViewModel(
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
+    private val _syncError = MutableStateFlow<String?>(null)
+    val syncError: StateFlow<String?> = _syncError.asStateFlow()
+    private var refreshJob: Job? = null
+    private var sourceDiscoveryJob: Job? = null
+
     // In-memory episode source selection
     private val _episodeSources = MutableStateFlow<List<ProphecySourceDto>>(emptyList())
     val episodeSources: StateFlow<List<ProphecySourceDto>> = _episodeSources.asStateFlow()
@@ -248,13 +253,18 @@ class DetailViewModel(
     }
 
     fun refreshDetails() {
-        viewModelScope.launch {
+        if (refreshJob?.isActive == true) return
+        refreshJob = viewModelScope.launch {
             _isLoading.value = true
+            _syncError.value = null
             com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
                 "anime_view",
                 mapOf("anime_id" to animeId)
             )
-            repository.refreshAnimeDetails(animeId)
+            val result = repository.refreshAnimeDetails(animeId)
+            if (result.isFailure) {
+                _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+            }
             _isLoading.value = false
         }
     }
@@ -264,6 +274,8 @@ class DetailViewModel(
     }
 
     fun openSourceChooser(episode: EpisodeEntry) {
+        if (_selectedEpisodeForSources.value?.id == episode.id && _episodeSources.value.isNotEmpty()) return
+        sourceDiscoveryJob?.cancel()
         _selectedEpisodeForSources.value = episode
         _sourceError.value = null
         val current = animeEntry.value
@@ -274,7 +286,7 @@ class DetailViewModel(
             return
         }
 
-        viewModelScope.launch {
+        sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
             val res = repository.fetchEpisodeSources(backendId, episode.id)
             if (res.isSuccess) {
@@ -410,6 +422,24 @@ class PlayerViewModel(
     private var allCandidates: List<ProphecySourceDto> = emptyList()
     private var currentCandidateIndex: Int = 0
 
+    val unifiedAudioTracks: StateFlow<List<PlayerManager.TrackOption>> = combine(
+        _availableSources,
+        _activeSource,
+        playerManager.availableAudioTracks
+    ) { sources, active, embeddedTracks ->
+        val sourceTracks = sources.mapNotNull { source ->
+            val language = source.language?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            PlayerManager.TrackOption(
+                id = "source_audio:${source.id}",
+                label = "$language • ${source.label ?: source.id}",
+                isSelected = source.id == active?.id,
+                isSupported = true
+            )
+        }.distinctBy { it.label.substringBefore(" • ").trim().lowercase() }
+        val inStreamTracks = embeddedTracks.filterNot { it.id == "auto_audio" }
+        (sourceTracks + inStreamTracks).distinctBy { it.label.substringBefore(" • ").trim().lowercase() }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     init {
         playerManager.onPlaybackEndedCallback = {
             flushProgress()
@@ -492,7 +522,11 @@ class PlayerViewModel(
         _selectedSeason.value = sNum
     }
 
-    fun startPlaybackForEpisode(episode: EpisodeEntry, preferredSourceId: String? = null) {
+    fun startPlaybackForEpisode(
+        episode: EpisodeEntry,
+        preferredSourceId: String? = null,
+        startPositionOverrideMs: Long? = null
+    ) {
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
         _isResolving.value = true
@@ -518,8 +552,8 @@ class PlayerViewModel(
                     _isResolving.value = false
                     _activeSource.value = null
                     val lastSavedPos = try {
-                        db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
-                    } catch (_: Exception) { 0L }
+                        startPositionOverrideMs ?: db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { startPositionOverrideMs ?: 0L }
 
                     val directData = DirectPlayData(
                         mode = "offline",
@@ -559,8 +593,8 @@ class PlayerViewModel(
                     _isResolving.value = false
 
                     val lastSavedPos = try {
-                        db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
-                    } catch (_: Exception) { 0L }
+                        startPositionOverrideMs ?: db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { startPositionOverrideMs ?: 0L }
 
                     playerManager.initializePlayer(
                         directData = prepared.directData,
@@ -580,7 +614,7 @@ class PlayerViewModel(
                         }
                     )
 
-                    // Slide pre-resolve queue forward for next 17 episodes
+                    // Slide the bounded pre-resolve queue forward.
                     preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
                     return@launch
                 }
@@ -601,22 +635,57 @@ class PlayerViewModel(
                 sources
             }
 
-            resolveWithFallback(backendId, episode, candidates, 0)
+            resolveWithFallback(
+                backendId,
+                episode,
+                candidates,
+                0,
+                prioritize = preferredSourceId == null,
+                startPositionOverrideMs = startPositionOverrideMs
+            )
         }
+    }
+
+    private fun prioritizeSources(sources: List<ProphecySourceDto>): List<ProphecySourceDto> {
+        val preferred = com.example.data.preferences.AudioPreferences.getInstance(getApplication())
+            .getPreferredAudioLanguageCodes()
+            .map { it.lowercase() }
+        fun rank(source: ProphecySourceDto): Int {
+            val rawLanguage = source.language?.lowercase()?.trim() ?: return Int.MAX_VALUE
+            val language = when {
+                rawLanguage.contains("hindi") -> "hi"
+                rawLanguage.contains("english") -> "en"
+                rawLanguage.contains("japanese") -> "ja"
+                rawLanguage.contains("tamil") -> "ta"
+                rawLanguage.contains("telugu") -> "te"
+                rawLanguage.contains("spanish") -> "es"
+                else -> rawLanguage
+            }
+            val match = preferred.indexOfFirst { code ->
+                language == code || language.startsWith("$code-") || language.contains(code)
+            }
+            return if (match >= 0) match else Int.MAX_VALUE
+        }
+        return sources.withIndex()
+            .sortedWith(compareBy<IndexedValue<ProphecySourceDto>> { rank(it.value) }.thenBy { it.index })
+            .map { it.value }
     }
 
     private suspend fun resolveWithFallback(
         backendId: String,
         episode: EpisodeEntry,
         candidates: List<ProphecySourceDto>,
-        startIndex: Int = 0
+        startIndex: Int = 0,
+        prioritize: Boolean = false,
+        startPositionOverrideMs: Long? = null
     ) {
-        allCandidates = candidates
-        _availableSources.value = candidates
+        val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
+        allCandidates = orderedCandidates
+        _availableSources.value = orderedCandidates
         var lastError: String? = null
 
-        for (i in startIndex until candidates.size) {
-            val source = candidates[i]
+        for (i in startIndex until orderedCandidates.size) {
+            val source = orderedCandidates[i]
             currentCandidateIndex = i
             activeSourceId = source.id
             _activeSource.value = source
@@ -628,11 +697,12 @@ class PlayerViewModel(
                 activeDirectData = directData
                 _isResolving.value = false
 
-                // Fetch last saved position from database
+                // Fetch last saved position from database unless a source switch supplied it.
                 val lastSavedPos = try {
+                    if (startPositionOverrideMs != null) startPositionOverrideMs else
                     AppDatabase.getInstance(getApplication()).playbackHistoryDao()
                         .getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
-                } catch (e: Exception) { 0L }
+                } catch (e: Exception) { startPositionOverrideMs ?: 0L }
 
                 // Initialize Media3 ExoPlayer with direct URL and headers
                 playerManager.initializePlayer(
@@ -672,7 +742,19 @@ class PlayerViewModel(
 
     fun switchSource(sourceId: String) {
         val ep = _currentEpisode.value ?: return
-        startPlaybackForEpisode(ep, preferredSourceId = sourceId)
+        startPlaybackForEpisode(
+            ep,
+            preferredSourceId = sourceId,
+            startPositionOverrideMs = playerManager.currentPosition.value
+        )
+    }
+
+    fun selectAudioTrack(option: PlayerManager.TrackOption) {
+        if (option.id.startsWith("source_audio:")) {
+            switchSource(option.id.removePrefix("source_audio:"))
+        } else {
+            playerManager.selectTrack(option)
+        }
     }
 
     fun playNextEpisode() {
