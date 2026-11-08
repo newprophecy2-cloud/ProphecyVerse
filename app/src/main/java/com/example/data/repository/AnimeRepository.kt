@@ -47,9 +47,18 @@ class AnimeRepository(
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
 
-    // Transient in-memory cache for source candidates during the active episode session
-    // Strictly NOT persisted in Room or logs
-    private val memorySourcesCache = mutableMapOf<String, List<ProphecySourceDto>>()
+    private data class SourceCacheEntry(
+        val sources: List<ProphecySourceDto>,
+        val fetchedAtMs: Long
+    )
+
+    // Transient in-memory cache for source candidates during the active episode session.
+    // Strictly NOT persisted in Room or logs. The cache identity includes both catalog and episode.
+    private val memorySourcesCache = mutableMapOf<String, SourceCacheEntry>()
+    private val sourceCacheMutex = Mutex()
+    private val sourceFetchMutex = Mutex()
+    private val searchMutex = Mutex()
+    private val sourceCacheTtlMs = 2 * 60 * 1000L
 
     private val homeRefreshMutex = Mutex()
     private var lastHomeRefreshTimestamp: Long = 0L
@@ -339,6 +348,25 @@ class AnimeRepository(
      *    and update Room.
      * Never marks an item as playable unless a valid playable source has actually been confirmed.
      */
+    private suspend fun fetchAllProphecySearchResults(query: String): List<com.example.data.remote.ProphecySearchResultItem> {
+        val results = LinkedHashMap<String, com.example.data.remote.ProphecySearchResultItem>()
+        var cursor: String? = null
+        val seenCursors = mutableSetOf<String?>()
+        var page = 0
+        do {
+            if (!seenCursors.add(cursor) || page >= 10 || results.size >= 500) break
+            val response = prophecyApi.searchAnime(query = query, limit = 50, cursor = cursor)
+            if (!response.isSuccessful) break
+            val body = response.body() ?: break
+            body.results.forEach { item -> results.putIfAbsent(item.id, item) }
+            val next = body.nextCursor?.takeIf { it.isNotBlank() }
+            val shouldContinue = body.partial == true || next != null
+            cursor = if (shouldContinue) next else null
+            page++
+        } while (cursor != null && results.size < 500)
+        return results.values.toList()
+    }
+
     suspend fun searchAnime(query: String): Result<Int> = withContext(Dispatchers.IO) {
         val normQuery = TitleMatcher.normalize(query)
         if (normQuery.isBlank()) return@withContext Result.success(0)
@@ -354,12 +382,18 @@ class AnimeRepository(
         }
 
         try {
-            coroutineScope {
+            searchMutex.withLock {
+                // Re-check after waiting for an in-flight identical search.
+                val lockedCachedTime = searchCache.get(normQuery)
+                if (lockedCachedTime != null && System.currentTimeMillis() - lockedCachedTime < 3 * 60 * 1000L) {
+                    val existingCount = searchDao.getSearchQuery(normQuery)?.totalResults ?: 0
+                    if (existingCount > 0) return@withLock Result.success(existingCount)
+                }
+                coroutineScope {
                 // Launch both queries in parallel with bounded concurrency
                 val prophecyDeferred = async {
                     try {
-                        val resp = prophecyApi.searchAnime(query = query, limit = 20)
-                        if (resp.isSuccessful) resp.body()?.results ?: emptyList() else emptyList()
+                            fetchAllProphecySearchResults(query)
                     } catch (_: Exception) {
                         emptyList()
                     }
@@ -509,15 +543,18 @@ class AnimeRepository(
                 }
 
                 if (entriesToUpsert.isNotEmpty()) {
-                    animeDao.upsertAnimeList(entriesToUpsert)
+                    val uniqueEntries = entriesToUpsert.distinctBy { it.id }
+                    val uniqueRefs = finalRefs.distinctBy { it.animeId }
+                    animeDao.upsertAnimeList(uniqueEntries)
                     animeDao.insertAliases(aliasesToInsert)
                     searchDao.clearSearchResultsForQuery(normQuery)
-                    searchDao.insertSearchResultRefs(finalRefs)
-                    searchDao.upsertSearchQuery(SearchQuery(query = normQuery, totalResults = finalRefs.size))
+                    searchDao.insertSearchResultRefs(uniqueRefs.mapIndexed { index, ref -> ref.copy(rankIndex = index) })
+                    searchDao.upsertSearchQuery(SearchQuery(query = normQuery, totalResults = uniqueRefs.size))
                     searchCache.put(normQuery, System.currentTimeMillis())
                 }
 
-                Result.success(finalRefs.size.coerceAtLeast(prophecyItems.size))
+                    Result.success(finalRefs.distinctBy { it.animeId }.size.coerceAtLeast(prophecyItems.size))
+                }
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -610,12 +647,19 @@ class AnimeRepository(
 
             // Fetch ProphecyVerse details and episodes if backendId is available
             if (backendId != null) {
-                val detailResp = try {
-                    prophecyApi.getAnimeDetails(backendId)
-                } catch (e: Exception) { null }
+                val (detailResp, epResp) = coroutineScope {
+                    val detailDeferred = async {
+                        try { prophecyApi.getAnimeDetails(backendId) } catch (_: Exception) { null }
+                    }
+                    val episodesDeferred = async {
+                        try { prophecyApi.getAnimeEpisodes(backendId) } catch (_: Exception) { null }
+                    }
+                    detailDeferred.await() to episodesDeferred.await()
+                }
 
                 val seasonsList = mutableListOf<SeasonEntry>()
                 val episodesList = mutableListOf<EpisodeEntry>()
+                var episodeSnapshotComplete = false
 
                 if (detailResp?.isSuccessful == true && detailResp.body() != null) {
                     val body = detailResp.body()!!
@@ -637,6 +681,7 @@ class AnimeRepository(
                     )
                     animeDao.upsertAnime(updatedEntry)
 
+                    episodeSnapshotComplete = body.seasons?.any { !it.episodes.isNullOrEmpty() } == true
                     body.seasons?.forEach { s ->
                         val sNum = if (s.number > 0) s.number else 1
                         val seasonKey = "${animeId}_s$sNum"
@@ -665,12 +710,8 @@ class AnimeRepository(
                     }
                 }
 
-                // Dedicated episodes endpoint: ALWAYS query /episodes to ensure complete episode sequence (e.g. full 17 episodes)
-                val epResp = try {
-                    prophecyApi.getAnimeEpisodes(backendId)
-                } catch (e: Exception) { null }
-
                 if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
+                    episodeSnapshotComplete = true
                     val dtoList = epResp.body()!!
                     val seasonsSet = mutableSetOf<Int>()
                     val defaultSeason = seasonsList.firstOrNull()?.seasonNumber ?: 1
@@ -732,11 +773,8 @@ class AnimeRepository(
                     )
                 }
 
-                if (seasonsList.isNotEmpty()) {
-                    episodeDao.upsertSeasons(seasonsList)
-                }
-                if (episodesList.isNotEmpty()) {
-                    episodeDao.upsertEpisodes(episodesList)
+                if (episodeSnapshotComplete && seasonsList.isNotEmpty() && episodesList.isNotEmpty()) {
+                    episodeDao.replaceEpisodeSnapshot(animeId, seasonsList.distinctBy { it.id }, episodesList.distinctBy { it.id })
                 }
             }
 
@@ -783,17 +821,38 @@ class AnimeRepository(
         backendAnimeId: String,
         episodeId: String
     ): Result<List<ProphecySourceDto>> = withContext(Dispatchers.IO) {
-        try {
-            val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
-            if (!response.isSuccessful || response.body() == null) {
-                return@withContext Result.failure(Exception("Failed to get episode sources: ${response.code()}"))
+        val cacheKey = "$backendAnimeId::$episodeId"
+        sourceCacheMutex.withLock {
+            val cached = memorySourcesCache[cacheKey]
+            if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs <= sourceCacheTtlMs) {
+                return@withContext Result.success(cached.sources)
             }
+            if (cached != null) memorySourcesCache.remove(cacheKey)
+        }
+        sourceFetchMutex.withLock {
+            // A second caller may have been waiting while the first request completed.
+            sourceCacheMutex.withLock {
+                val cached = memorySourcesCache[cacheKey]
+                if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs <= sourceCacheTtlMs) {
+                    return@withContext Result.success(cached.sources)
+                }
+            }
+            try {
+                val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
+                if (!response.isSuccessful || response.body() == null) {
+                    return@withContext Result.failure(Exception("Failed to get episode sources: ${response.code()}"))
+                }
 
-            val sources = response.body()?.sources ?: emptyList()
-            memorySourcesCache[episodeId] = sources
-            Result.success(sources)
-        } catch (e: Exception) {
-            Result.failure(e)
+                val sources = response.body()?.sources ?: emptyList()
+                if (sources.isNotEmpty()) {
+                    sourceCacheMutex.withLock {
+                        memorySourcesCache[cacheKey] = SourceCacheEntry(sources, System.currentTimeMillis())
+                    }
+                }
+                Result.success(sources)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
         }
     }
 

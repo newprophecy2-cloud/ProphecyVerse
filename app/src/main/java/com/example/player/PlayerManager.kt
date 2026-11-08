@@ -50,6 +50,7 @@ class PlayerManager(
 ) {
     private var exoPlayer: ExoPlayer? = null
     private var tickerJob: Job? = null
+    private var playbackGeneration: Long = 0L
 
     private val _exoPlayerInstance = MutableStateFlow<ExoPlayer?>(null)
     val exoPlayerInstance: StateFlow<ExoPlayer?> = _exoPlayerInstance.asStateFlow()
@@ -116,6 +117,7 @@ class PlayerManager(
         onRetryNeeded: () -> Unit
     ): ExoPlayer {
         release()
+        val generation = playbackGeneration
         onRetryRequested = onRetryNeeded
         onPlaybackFailedCallback = onPlaybackFailed
         _errorMessage.value = null
@@ -300,6 +302,7 @@ class PlayerManager(
 
         player.addListener(object : Player.Listener {
             override fun onEvents(player: Player, events: Player.Events) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 val dur = player.duration
                 if (dur > 0 && dur != C.TIME_UNSET) {
                     _duration.value = dur
@@ -311,12 +314,14 @@ class PlayerManager(
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
                         _isBuffering.value = true
                     }
                     Player.STATE_READY -> {
                         _isBuffering.value = false
+                        _errorMessage.value = null
                         val dur = player.duration
                         if (dur > 0 && dur != C.TIME_UNSET) {
                             _duration.value = dur
@@ -339,6 +344,7 @@ class PlayerManager(
             }
 
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 val dur = player.duration
                 if (dur > 0 && dur != C.TIME_UNSET) {
                     _duration.value = dur
@@ -346,6 +352,7 @@ class PlayerManager(
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 _isPlaying.value = isPlaying
                 val dur = player.duration
                 if (dur > 0 && dur != C.TIME_UNSET) {
@@ -354,6 +361,7 @@ class PlayerManager(
             }
 
             override fun onTracksChanged(tracks: Tracks) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 extractTracks(tracks)
                 val dur = player.duration
                 if (dur > 0 && dur != C.TIME_UNSET) {
@@ -362,12 +370,14 @@ class PlayerManager(
             }
 
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 if (videoSize.height > 0) {
                     _videoResolution.value = "${videoSize.height}p"
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 _isBuffering.value = false
                 Log.e(TAG, "ExoPlayer error [${error.errorCode}]: ${error.message}", error)
 
@@ -678,6 +688,7 @@ class PlayerManager(
     }
 
     fun release() {
+        playbackGeneration++
         tickerJob?.cancel()
         tickerJob = null
         exoPlayer?.let { player ->

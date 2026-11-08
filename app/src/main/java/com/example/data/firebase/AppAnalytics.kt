@@ -34,11 +34,12 @@ class AppAnalytics private constructor(private val context: Context) {
                 }
                 firebaseAnalytics.logEvent(eventName, bundle)
 
-                val user = AuthManager.getInstance(context).currentUser ?: return@launch
+                val user = AuthManager.getInstance(context).currentUser
+                val installation = InstallationManager.getInstance(context)
                 val eventDoc = hashMapOf<String, Any>(
                     "event_name" to eventName,
-                    "installation_id" to InstallationManager.getInstance(context).installationId,
-                    "user_id" to user.uid,
+                    "installation_id" to installation.installationId,
+                    "user_id" to (user?.uid ?: "guest_${installation.installationId}"),
                     "timestamp" to System.currentTimeMillis(),
                     "params" to params
                 )
@@ -56,9 +57,9 @@ class AppAnalytics private constructor(private val context: Context) {
         if (secondsWatched <= 0L) return
         scope.launch {
             try {
-                val user = AuthManager.getInstance(context).currentUser ?: return@launch
+                val user = AuthManager.getInstance(context).currentUser
                 InstallationManager.getInstance(context).recordWatchTime(secondsWatched)
-                if (!user.isAnonymous) {
+                if (user != null && !user.isAnonymous) {
                     firestore.collection("users")
                         .document(user.uid)
                         .set(

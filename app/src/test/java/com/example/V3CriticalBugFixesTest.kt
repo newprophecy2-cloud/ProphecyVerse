@@ -28,7 +28,7 @@ class V3CriticalBugFixesTest {
     // --- P1: Version Verification ---
     @Test
     fun versionMetadata_matchesV3ReleaseSpecs() {
-        assertEquals("Installed version name must be 3.0.0", "3.0.0", BuildConfig.VERSION_NAME)
+        assertEquals("Installed version name must be 3.0.1", "3.0.1", BuildConfig.VERSION_NAME)
         assertEquals("Installed version code must be 5", 5, BuildConfig.VERSION_CODE)
         assertEquals("Application ID must match project namespace", "com.aistudio.prophecyverse.vykqtb", BuildConfig.APPLICATION_ID)
     }
@@ -119,9 +119,9 @@ class V3CriticalBugFixesTest {
         assertEquals("Playback position must be strictly preserved", startPosition, currentPosition)
     }
 
-    // --- P0: 17-Episode Resolution Sequence ---
+    // --- P0: Bounded Resolution Sequence ---
     @Test
-    fun episodeSequence_supportsFull17EpisodesIndependently() = runTest {
+    fun episodeSequence_boundsPreResolveWindowWithoutChangingEpisodeIdentity() = runTest {
         val testDispatcher = UnconfinedTestDispatcher(testScheduler)
         val scope = TestScope(testDispatcher)
 
@@ -140,11 +140,10 @@ class V3CriticalBugFixesTest {
         assertEquals("Episode list must have exactly 17 episodes", 17, episodes.size)
 
         // Verify window sliding does not crash or restrict to 2 episodes
-        val window = episodes.take(5) // sliding window of 5 ahead
-        assertTrue("Sliding window covers more than 2 episodes", window.size > 2)
-        assertEquals(5, window.size)
+        val window = episodes.take(PreResolveQueueManager.WINDOW_SIZE)
+        assertEquals("Pre-resolve window must be bounded to two episodes", 2, window.size)
         assertEquals("ep_1", window.first().id)
-        assertEquals("ep_5", window.last().id)
+        assertEquals("ep_2", window.last().id)
 
         // Verify individual episode identifiers are distinct
         val ids = episodes.map { it.id }.toSet()

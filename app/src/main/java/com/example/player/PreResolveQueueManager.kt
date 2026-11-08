@@ -18,8 +18,8 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 17-Episode Sliding Pre-resolve Queue System (Section 10).
- * Pre-fetches sources and pre-resolves direct playback data for up to 17 sequential episodes
+ * Bounded sliding pre-resolve queue.
+ * Pre-fetches sources and pre-resolves direct playback data for up to two sequential episodes
  * following the active episode.
  *
  * Runs exclusively on a single background worker (Dispatchers.IO.limitedParallelism(1))
@@ -31,7 +31,7 @@ class PreResolveQueueManager(
 ) {
     companion object {
         private const val TAG = "PreResolveQueueManager"
-        const val WINDOW_SIZE = 17
+        const val WINDOW_SIZE = 2
         const val CACHE_TTL_MS = 25 * 60 * 1000L // 25-minute TTL
     }
 
@@ -68,7 +68,7 @@ class PreResolveQueueManager(
 
     /**
      * Slides the resolution window based on the currently active episode.
-     * Selects up to 17 upcoming episodes in sequential order across seasons.
+     * Selects up to two upcoming episodes in sequential order across seasons.
      */
     fun slideWindow(
         backendAnimeId: String,
@@ -107,9 +107,8 @@ class PreResolveQueueManager(
                 preparedCache.remove(it)
             }
 
-            // Process all 17 episodes in the sliding window:
-            // Immediate next 2 episodes are resolved eagerly for instantaneous playback transition.
-            // Episodes 3 to 17 are pre-resolved cooperatively with brief delay to avoid network congestion.
+            // Resolve only the immediate next two episodes so pre-resolution cannot compete
+            // with active playback or consume unnecessary network/CPU resources.
             for ((index, ep) in targetEpisodes.withIndex()) {
                 if (!isActive) break
 

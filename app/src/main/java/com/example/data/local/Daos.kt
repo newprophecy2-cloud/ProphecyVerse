@@ -114,6 +114,18 @@ interface EpisodeDao {
 
     @Query("DELETE FROM season_entries WHERE animeId = :animeId")
     suspend fun deleteSeasonsForAnime(animeId: String)
+
+    @Transaction
+    suspend fun replaceEpisodeSnapshot(
+        animeId: String,
+        seasons: List<SeasonEntry>,
+        episodes: List<EpisodeEntry>
+    ) {
+        deleteEpisodesForAnime(animeId)
+        deleteSeasonsForAnime(animeId)
+        upsertSeasons(seasons)
+        upsertEpisodes(episodes)
+    }
 }
 
 @Dao

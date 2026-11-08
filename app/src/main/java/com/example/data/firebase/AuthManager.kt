@@ -195,9 +195,6 @@ class AuthManager private constructor(private val context: Context) {
 
     suspend fun loginWithEmail(email: String, pass: String): Result<FirebaseUser> {
         return try {
-            if (auth.currentUser?.isAnonymous == true) {
-                InstallationManager.getInstance(context).deleteCurrentRegistration()
-            }
             val normalizedEmail = email.trim()
             val result = auth.signInWithEmailAndPassword(normalizedEmail, pass).await()
             val user = result.user ?: throw IllegalStateException("Login returned null user")

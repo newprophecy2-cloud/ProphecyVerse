@@ -42,7 +42,7 @@ class InstallationManager private constructor(private val context: Context) {
     fun initializeAndSync() {
         scope.launch {
             try {
-                val ownerUid = auth.currentUser?.uid ?: return@launch
+                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
                 val refreshedToken = try {
                     FirebaseMessaging.getInstance().token.await()
                 } catch (e: Exception) {
@@ -109,7 +109,7 @@ class InstallationManager private constructor(private val context: Context) {
     fun recordHeartbeat() {
         scope.launch {
             try {
-                val ownerUid = auth.currentUser?.uid ?: return@launch
+                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
                 val now = System.currentTimeMillis()
                 val cachedCountry = NoticeManager.getInstance(context).detectedCountry.value
                     ?: Locale.getDefault().country.ifBlank { "BD" }
@@ -139,7 +139,7 @@ class InstallationManager private constructor(private val context: Context) {
         if (secondsWatched <= 0L) return
         scope.launch {
             try {
-                val ownerUid = auth.currentUser?.uid ?: return@launch
+                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
                 firestore.collection("installations")
                     .document(registrationDocumentId(ownerUid))
                     .set(
