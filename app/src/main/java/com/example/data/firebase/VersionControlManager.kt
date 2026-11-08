@@ -44,9 +44,9 @@ data class ReleaseNotes(
 data class VersionControlConfig(
     val enabled: Boolean = true,
     val forceUpdate: Boolean = false,
-    val latestVersionName: String = "3.0.0",
-    val latestVersionCode: Int = 5,
-    val minSupportedVersionCode: Int = 5,
+    val latestVersionName: String = "3.0.1",
+    val latestVersionCode: Int = 6,
+    val minSupportedVersionCode: Int = 6,
     val packageName: String = "com.aistudio.prophecyverse.vykqtb",
     val downloads: List<DownloadSource> = emptyList(),
     val sha256: String = "",

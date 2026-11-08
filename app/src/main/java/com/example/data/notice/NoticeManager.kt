@@ -123,6 +123,7 @@ class NoticeManager private constructor(private val context: Context) {
                         hasLoaded = true,
                         errorMessage = null
                     )
+                    LocalNotificationScheduler.schedule(context, notices)
                     if (notices.isNotEmpty() && !sessionDismissed) {
                         _isNoticeVisible.value = true
                     }

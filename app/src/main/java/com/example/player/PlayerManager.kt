@@ -85,6 +85,14 @@ class PlayerManager(
     private val _activeAudioDecoder = MutableStateFlow<String?>(null)
     val activeAudioDecoder: StateFlow<String?> = _activeAudioDecoder.asStateFlow()
 
+    fun clearTrackSelections() {
+        _availableAudioTracks.value = emptyList()
+        _availableSubtitles.value = emptyList()
+        _availableQualities.value = emptyList()
+        _activeAudioDecoder.value = null
+        _videoResolution.value = null
+    }
+
     private val _videoResolution = MutableStateFlow<String?>(null)
     val videoResolution: StateFlow<String?> = _videoResolution.asStateFlow()
 

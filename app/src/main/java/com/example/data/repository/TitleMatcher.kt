@@ -20,10 +20,6 @@ object TitleMatcher {
             .lowercase(Locale.ROOT)
     }
 
-    const val ONE_PIECE_ANILIST_ID = 21
-    const val ONE_PIECE_ANIME_BACKEND_ID = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MjUzLyIsInMiOjAsImUiOjB9"
-    const val ONE_PIECE_LIVE_ACTION_BACKEND_ID = "eyJwIjoiZm91cmtoZGh1YiIsInYiOiIvb25lLXBpZWNlLXNlcmllcy02MzgvIiwicyI6MCwiZSI6MH0"
-
     /**
      * Determines whether a title, mediaType, or year denotes a Live Action production.
      */
@@ -37,10 +33,6 @@ object TitleMatcher {
         val normMedia = mediaType?.lowercase(Locale.ROOT) ?: ""
         if (normMedia == "live_action" || normMedia == "live action") return true
         if (normTitle.contains("live action") || normTitle.contains("liveaction")) return true
-        // Specifically detect 2023 Netflix One Piece Live Action series
-        if (normTitle == "one piece" && (year == "2023" || (seasonCount != null && seasonCount in 1..2 && year != "1999"))) {
-            return true
-        }
         return false
     }
 
@@ -52,19 +44,6 @@ object TitleMatcher {
         aniListMedia: AniListMedia,
         prophecyItem: ProphecySearchResultItem
     ): Float {
-        // 1. Guaranteed stable identifier check for One Piece anime
-        if (aniListMedia.id == ONE_PIECE_ANILIST_ID) {
-            if (prophecyItem.id == ONE_PIECE_ANIME_BACKEND_ID) {
-                return 1.0f
-            }
-            if (prophecyItem.id == ONE_PIECE_LIVE_ACTION_BACKEND_ID || prophecyItem.year == "2023") {
-                return 0f
-            }
-            if (normalize(prophecyItem.title) == "one piece" && (prophecyItem.year == "1999" || (prophecyItem.seasonCount ?: 0) > 2)) {
-                return 1.0f
-            }
-        }
-
         val normProphecy = normalize(prophecyItem.title)
         if (normProphecy.isBlank()) return 0f
 
@@ -147,22 +126,6 @@ object TitleMatcher {
         entry: com.example.data.local.AnimeEntry,
         prophecyItem: ProphecySearchResultItem
     ): Float {
-        // 1. Guaranteed stable identifier check for One Piece
-        if (entry.aniListId == ONE_PIECE_ANILIST_ID || normalize(entry.preferredTitle) == "one piece") {
-            val isEntryLiveAction = isLiveAction(entry.preferredTitle, entry.format, entry.year)
-            if (!isEntryLiveAction) {
-                if (prophecyItem.id == ONE_PIECE_ANIME_BACKEND_ID) {
-                    return 1.0f
-                }
-                if (prophecyItem.id == ONE_PIECE_LIVE_ACTION_BACKEND_ID || prophecyItem.year == "2023") {
-                    return 0f
-                }
-                if (normalize(prophecyItem.title) == "one piece" && (prophecyItem.year == "1999" || (prophecyItem.seasonCount ?: 0) > 2)) {
-                    return 1.0f
-                }
-            }
-        }
-
         val normProphecy = normalize(prophecyItem.title)
         if (normProphecy.isBlank()) return 0f
 

@@ -35,6 +35,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import android.util.LruCache
 import java.util.Calendar
+import java.util.concurrent.ConcurrentHashMap
+import java.time.Instant
 
 class AnimeRepository(
     private val database: AppDatabase,
@@ -56,7 +58,10 @@ class AnimeRepository(
     // Strictly NOT persisted in Room or logs. The cache identity includes both catalog and episode.
     private val memorySourcesCache = mutableMapOf<String, SourceCacheEntry>()
     private val sourceCacheMutex = Mutex()
-    private val sourceFetchMutex = Mutex()
+    private val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
+    private data class ResolvedCacheEntry(val data: DirectPlayData, val cachedAtMs: Long)
+    private val resolvedPlaybackCache = ConcurrentHashMap<String, ResolvedCacheEntry>()
+    private val resolveMutexes = ConcurrentHashMap<String, Mutex>()
     private val searchMutex = Mutex()
     private val sourceCacheTtlMs = 2 * 60 * 1000L
 
@@ -570,26 +575,6 @@ class AnimeRepository(
             var currentEntry = animeDao.getAnimeById(animeId)
             var backendId = currentEntry?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
-            // Explicit stable mapping for One Piece (AniList ID 21) to 1999 Anime backend ID
-            if (animeId == "anilist_${TitleMatcher.ONE_PIECE_ANILIST_ID}" ||
-                currentEntry?.aniListId == TitleMatcher.ONE_PIECE_ANILIST_ID ||
-                (currentEntry?.preferredTitle?.equals("One Piece", ignoreCase = true) == true &&
-                 currentEntry?.format?.contains("live", ignoreCase = true) != true)
-            ) {
-                backendId = TitleMatcher.ONE_PIECE_ANIME_BACKEND_ID
-                if (currentEntry != null) {
-                    currentEntry = currentEntry.copy(backendAnimeId = backendId, isPlayable = true)
-                    animeDao.upsertAnime(currentEntry)
-                    animeDao.upsertMapping(
-                        CatalogMapping(
-                            aniListId = TitleMatcher.ONE_PIECE_ANILIST_ID,
-                            backendAnimeId = backendId,
-                            confidence = 1.0f
-                        )
-                    )
-                }
-            }
-
             // Check existing catalog mapping table first
             if (backendId == null && currentEntry?.aniListId != null) {
                 val mapping = animeDao.getMappingForAniList(currentEntry.aniListId!!)
@@ -829,7 +814,7 @@ class AnimeRepository(
             }
             if (cached != null) memorySourcesCache.remove(cacheKey)
         }
-        sourceFetchMutex.withLock {
+        sourceFetchMutexes.computeIfAbsent(cacheKey) { Mutex() }.withLock {
             // A second caller may have been waiting while the first request completed.
             sourceCacheMutex.withLock {
                 val cached = memorySourcesCache[cacheKey]
@@ -843,7 +828,12 @@ class AnimeRepository(
                     return@withContext Result.failure(Exception("Failed to get episode sources: ${response.code()}"))
                 }
 
-                val sources = response.body()?.sources ?: emptyList()
+                val sources = response.body()?.sources.orEmpty()
+                    .filter { source ->
+                        source.id.isNotBlank() &&
+                            (!source.expiresAt.isNullOrBlank() && !isExpired(source.expiresAt) || source.expiresAt.isNullOrBlank())
+                    }
+                    .distinctBy { it.id }
                 if (sources.isNotEmpty()) {
                     sourceCacheMutex.withLock {
                         memorySourcesCache[cacheKey] = SourceCacheEntry(sources, System.currentTimeMillis())
@@ -864,6 +854,13 @@ class AnimeRepository(
      * Kept in-memory only; never persisted or logged.
      */
     suspend fun resolveDirectPlayback(sourceId: String): Result<DirectPlayData> = withContext(Dispatchers.IO) {
+        if (sourceId.isBlank()) return@withContext Result.failure(Exception("Source ID is blank"))
+        resolveMutexes.computeIfAbsent(sourceId) { Mutex() }.withLock {
+            val cached = resolvedPlaybackCache[sourceId]
+            if (cached != null && !isExpired(cached.data.expiresAt) &&
+                System.currentTimeMillis() - cached.cachedAtMs <= 20 * 60 * 1000L) {
+                return@withContext Result.success(cached.data)
+            }
         try {
             val response = prophecyApi.resolveDirectPlay(DirectPlayRequest(sourceId = sourceId))
             if (!response.isSuccessful || response.body() == null) {
@@ -875,10 +872,26 @@ class AnimeRepository(
                 return@withContext Result.failure(Exception("Source not compatible or unverified"))
             }
 
-            Result.success(body.data)
+            val data = body.data
+            if (data.sourceId != sourceId || !isPlayableUrl(data.playbackUrl) || isExpired(data.expiresAt)) {
+                return@withContext Result.failure(Exception("Resolved playback data is invalid or expired"))
+            }
+            resolvedPlaybackCache[sourceId] = ResolvedCacheEntry(data, System.currentTimeMillis())
+            Result.success(data)
         } catch (e: Exception) {
             Result.failure(e)
         }
+        }
+    }
+
+    private fun isPlayableUrl(url: String): Boolean {
+        val lower = url.trim().lowercase()
+        return lower.startsWith("https://") || lower.startsWith("http://") || lower.startsWith("file://")
+    }
+
+    private fun isExpired(expiresAt: String?): Boolean {
+        if (expiresAt.isNullOrBlank()) return false
+        return runCatching { Instant.parse(expiresAt).isBefore(Instant.now()) }.getOrDefault(false)
     }
 
     // Watchlist methods

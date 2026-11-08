@@ -15,6 +15,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 import java.util.UUID
 
@@ -23,6 +25,7 @@ class InstallationManager private constructor(private val context: Context) {
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val auth: FirebaseAuth by lazy { FirebaseAuth.getInstance() }
     private val scope = CoroutineScope(Dispatchers.IO)
+    private val syncMutex = Mutex()
 
     val installationId: String
     val currentSessionId: String = UUID.randomUUID().toString()
@@ -41,7 +44,9 @@ class InstallationManager private constructor(private val context: Context) {
 
     fun initializeAndSync() {
         scope.launch {
-            try {
+            syncMutex.withLock {
+                prefs.edit().putBoolean(KEY_PENDING_SYNC, true).apply()
+                try {
                 val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
                 val refreshedToken = try {
                     FirebaseMessaging.getInstance().token.await()
@@ -94,8 +99,12 @@ class InstallationManager private constructor(private val context: Context) {
                     .document(registrationDocumentId(ownerUid))
                     .set(docData, SetOptions.merge())
                     .await()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to sync installation metadata: ${e.message}")
+                    prefs.edit().putBoolean(KEY_PENDING_SYNC, false).apply()
+                } catch (e: Exception) {
+                    // Keep the pending marker so the next launch/heartbeat retries the same
+                    // stable installation record without creating a second identity.
+                    Log.w(TAG, "Failed to sync installation metadata: ${e.message}")
+                }
             }
         }
     }
@@ -183,6 +192,7 @@ class InstallationManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "InstallationManager"
+        private const val KEY_PENDING_SYNC = "pending_installation_sync"
 
         @Volatile
         private var instance: InstallationManager? = null

@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
+import java.time.Instant
 
 /**
  * Bounded sliding pre-resolve queue.
@@ -44,6 +45,7 @@ class PreResolveQueueManager(
     }
 
     data class PreparedEpisode(
+        val backendAnimeId: String,
         val episodeId: String,
         val source: ProphecySourceDto,
         val directData: DirectPlayData,
@@ -54,6 +56,8 @@ class PreResolveQueueManager(
 
     // In-memory cache for resolved stream data
     private val preparedCache = ConcurrentHashMap<String, PreparedEpisode>()
+
+    private fun cacheKey(backendAnimeId: String, episodeId: String): String = "$backendAnimeId::$episodeId"
 
     // Observable status map for UI badges / indicators
     private val _queueStatus = MutableStateFlow<Map<String, ResolutionStatus>>(emptyMap())
@@ -91,7 +95,7 @@ class PreResolveQueueManager(
             updateStatuses { current ->
                 val updated = current.toMutableMap()
                 targetEpisodes.forEach { ep ->
-                    val existingPrepared = preparedCache[ep.id]
+                    val existingPrepared = preparedCache[cacheKey(backendAnimeId, ep.id)]
                     if (existingPrepared != null && !existingPrepared.isExpired()) {
                         updated[ep.id] = ResolutionStatus.READY
                     } else if (updated[ep.id] != ResolutionStatus.READY) {
@@ -102,8 +106,8 @@ class PreResolveQueueManager(
             }
 
             // Clean up cache for episodes that slipped out of window and are not the current episode
-            val targetIds = targetEpisodes.map { it.id }.toSet()
-            preparedCache.keys.filter { it != currentEpisodeId && !targetIds.contains(it) }.forEach {
+            val targetIds = targetEpisodes.map { cacheKey(backendAnimeId, it.id) }.toSet()
+            preparedCache.keys.filter { it !in targetIds }.forEach {
                 preparedCache.remove(it)
             }
 
@@ -112,7 +116,7 @@ class PreResolveQueueManager(
             for ((index, ep) in targetEpisodes.withIndex()) {
                 if (!isActive) break
 
-                val cached = preparedCache[ep.id]
+                val cached = preparedCache[cacheKey(backendAnimeId, ep.id)]
                 if (cached != null && !cached.isExpired()) {
                     updateStatusFor(ep.id, ResolutionStatus.READY)
                     continue
@@ -152,7 +156,18 @@ class PreResolveQueueManager(
                     val directRes = repository.resolveDirectPlayback(source.id)
                     val directData = directRes.getOrNull()
                     if (directData != null && !directData.playbackUrl.isNullOrBlank()) {
-                        preparedCache[episodeId] = PreparedEpisode(
+                        if (!directData.playbackUrl.startsWith("https://") &&
+                            !directData.playbackUrl.startsWith("http://") &&
+                            !directData.playbackUrl.startsWith("file://")) {
+                            continue
+                        }
+                        if (!directData.expiresAt.isNullOrBlank() &&
+                            runCatching { Instant.parse(directData.expiresAt).isBefore(Instant.now()) }.getOrDefault(false)) {
+                            continue
+                        }
+                        if (directData.sourceId != source.id) continue
+                        preparedCache[cacheKey(backendAnimeId, episodeId)] = PreparedEpisode(
+                            backendAnimeId = backendAnimeId,
                             episodeId = episodeId,
                             source = source,
                             directData = directData,
@@ -173,10 +188,10 @@ class PreResolveQueueManager(
     /**
      * Retrieves pre-resolved DirectPlayData and source if available and still fresh (< 25 min TTL).
      */
-    fun getPreparedSource(episodeId: String): PreparedEpisode? {
-        val prepared = preparedCache[episodeId] ?: return null
+    fun getPreparedSource(backendAnimeId: String, episodeId: String): PreparedEpisode? {
+        val prepared = preparedCache[cacheKey(backendAnimeId, episodeId)] ?: return null
         return if (!prepared.isExpired()) prepared else {
-            preparedCache.remove(episodeId)
+            preparedCache.remove(cacheKey(backendAnimeId, episodeId))
             null
         }
     }

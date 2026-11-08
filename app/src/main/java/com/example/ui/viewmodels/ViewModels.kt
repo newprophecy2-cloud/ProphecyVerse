@@ -529,6 +529,13 @@ class PlayerViewModel(
     ) {
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
+        _availableSources.value = emptyList()
+        _activeSource.value = null
+        activeDirectData = null
+        activeSourceId = null
+        allCandidates = emptyList()
+        currentCandidateIndex = 0
+        playerManager.clearTrackSelections()
         _isResolving.value = true
         _resolutionError.value = null
 
@@ -584,7 +591,7 @@ class PlayerViewModel(
 
             // 3. Fast-Path: Check 17-episode pre-resolve cache for instant start (< 25m TTL)
             if (preferredSourceId == null) {
-                val prepared = preResolveManager.getPreparedSource(episode.id)
+                val prepared = preResolveManager.getPreparedSource(backendId, episode.id)
                 if (prepared != null) {
                     _activeSource.value = prepared.source
                     _availableSources.value = listOf(prepared.source)
