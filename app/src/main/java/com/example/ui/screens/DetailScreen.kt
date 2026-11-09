@@ -95,7 +95,7 @@ import com.example.ui.viewmodels.DetailViewModel
 fun DetailScreen(
     viewModel: DetailViewModel,
     onBackClick: () -> Unit,
-    onPlayEpisode: (String, String) -> Unit // animeId, episodeId
+    onPlayEpisode: (String, String, String?) -> Unit // animeId, episodeId, preferredSourceId
 ) {
     val anime by viewModel.animeEntry.collectAsStateWithLifecycle()
     val seasons by viewModel.seasons.collectAsStateWithLifecycle()
@@ -284,7 +284,7 @@ fun DetailScreen(
                             val firstOrResume = episodes.firstOrNull { it.id == lastPlayed?.episodeId }
                                 ?: episodes.first()
                             Button(
-                                onClick = { onPlayEpisode(item.id, firstOrResume.id) },
+                                onClick = { onPlayEpisode(item.id, firstOrResume.id, null) },
                                 colors = ButtonDefaults.buttonColors(containerColor = PlayableGreen),
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier
@@ -420,7 +420,7 @@ fun DetailScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 16.dp, vertical = 6.dp)
-                                    .clickable { onPlayEpisode(item.id, lastPlayed!!.episodeId) }
+                                    .clickable { onPlayEpisode(item.id, lastPlayed!!.episodeId, null) }
                                     .testTag("detail_resume_card")
                             ) {
                                 Row(
@@ -467,7 +467,7 @@ fun DetailScreen(
                                     }
                                     Spacer(modifier = Modifier.width(12.dp))
                                     Button(
-                                        onClick = { onPlayEpisode(item.id, lastPlayed!!.episodeId) },
+                                        onClick = { onPlayEpisode(item.id, lastPlayed!!.episodeId, null) },
                                         colors = ButtonDefaults.buttonColors(containerColor = PlayableGreen),
                                         shape = RoundedCornerShape(8.dp),
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
@@ -642,7 +642,7 @@ fun DetailScreen(
                                 episode = ep,
                                 isPlayed = lastPlayed?.episodeId == ep.id,
                                 downloadEntry = downloadEntry,
-                                onPlayClick = { onPlayEpisode(item.id, ep.id) },
+                                onPlayClick = { onPlayEpisode(item.id, ep.id, null) },
                                 onSourcesClick = { viewModel.openSourceChooser(ep) },
                                 onDownloadClick = {
                                     val eligibility = authManager.checkDownloadEligibility()
@@ -778,7 +778,7 @@ fun DetailScreen(
                                     source = src,
                                     onClick = {
                                         viewModel.closeSourceChooser()
-                                        onPlayEpisode(anime!!.id, ep.id)
+                                        onPlayEpisode(anime!!.id, ep.id, src.id)
                                     }
                                 )
                             }

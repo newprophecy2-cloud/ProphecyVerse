@@ -13,7 +13,11 @@ sealed class Screen(val route: String, val title: String) {
         fun createRoute(animeId: String) = "detail/$animeId"
     }
 
-    data object Player : Screen("player/{animeId}/{episodeId}", "Player") {
-        fun createRoute(animeId: String, episodeId: String) = "player/$animeId/$episodeId"
+    data object Player : Screen("player/{animeId}/{episodeId}?preferredSourceId={preferredSourceId}", "Player") {
+        fun createRoute(animeId: String, episodeId: String, preferredSourceId: String? = null): String {
+            val route = "player/$animeId/$episodeId"
+            return if (preferredSourceId.isNullOrBlank()) route
+            else "$route?preferredSourceId=${android.net.Uri.encode(preferredSourceId)}"
+        }
     }
 }

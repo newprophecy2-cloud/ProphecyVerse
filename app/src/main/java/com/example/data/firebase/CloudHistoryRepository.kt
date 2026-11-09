@@ -2,6 +2,7 @@ package com.example.data.firebase
 
 import android.content.Context
 import android.util.Log
+import androidx.room.withTransaction
 import com.example.data.local.AppDatabase
 import com.example.data.local.PlaybackHistory
 import com.example.data.local.WatchlistEntry
@@ -42,8 +43,14 @@ class CloudHistoryRepository private constructor(private val context: Context) {
 
         scope.launch {
             try {
-                // 1. Save locally in Room
-                database.playbackHistoryDao().upsertHistory(history)
+                // 1. Save locally only if this progress is not older than the stored episode state.
+                database.withTransaction {
+                    val dao = database.playbackHistoryDao()
+                    val local = dao.getHistoryForEpisode(animeId, episodeId)
+                    if (local == null || history.lastPlayedAt >= local.lastPlayedAt) {
+                        dao.upsertHistory(history.copy(completed = history.completed || (local?.completed == true)))
+                    }
+                }
 
                 // 2. Sync to Firestore if authenticated
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
@@ -62,12 +69,20 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                     "owner_key" to ownerKey
                 )
 
-                firestore.collection("watch_history")
+                val historyRef = firestore.collection("watch_history")
                     .document(ownerKey)
                     .collection("episodes")
                     .document(history.id)
-                    .set(docData, SetOptions.merge())
-                    .await()
+                firestore.runTransaction { transaction ->
+                    val remote = transaction.get(historyRef)
+                    val remoteTimestamp = remote.getLong("last_played_at") ?: Long.MIN_VALUE
+                    if (!remote.exists() || history.lastPlayedAt >= remoteTimestamp) {
+                        val merged = docData.toMutableMap()
+                        merged["completed"] = completed || (remote.getBoolean("completed") == true)
+                        transaction.set(historyRef, merged, SetOptions.merge())
+                    }
+                    null
+                }.await()
             } catch (e: Exception) {
                 Log.w("CloudHistoryRepository", "Failed to sync progress to cloud: ${e.message}")
             }
@@ -146,11 +161,18 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 }
 
                 if (cloudHistories.isNotEmpty()) {
-                    database.playbackHistoryDao().upsertHistories(
+                    database.withTransaction {
+                        val dao = database.playbackHistoryDao()
                         cloudHistories
                             .map { it.copy(id = "history_${it.animeId}_${it.episodeId}") }
                             .distinctBy { it.id }
-                    )
+                            .forEach { cloud ->
+                                val local = dao.getHistoryForEpisode(cloud.animeId, cloud.episodeId)
+                                if (local == null || cloud.lastPlayedAt >= local.lastPlayedAt) {
+                                    dao.upsertHistory(cloud.copy(completed = cloud.completed || (local?.completed == true)))
+                                }
+                            }
+                    }
                 }
 
                 // Pull cloud watchlist

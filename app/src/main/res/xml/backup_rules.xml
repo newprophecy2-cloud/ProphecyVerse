@@ -6,8 +6,6 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- Installation UUID and cached FCM token are device-scoped; do not restore to another install. -->
+    <exclude domain="sharedpref" path="prophecy_install_prefs.xml" />
 </full-backup-content>

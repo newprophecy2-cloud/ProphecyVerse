@@ -29,8 +29,20 @@ class V3CriticalBugFixesTest {
     @Test
     fun versionMetadata_matchesV3ReleaseSpecs() {
         assertEquals("Installed version name must be 3.0.1", "3.0.1", BuildConfig.VERSION_NAME)
-        assertEquals("Installed version code must be 5", 5, BuildConfig.VERSION_CODE)
+        assertEquals("Installed version code must be 6", 6, BuildConfig.VERSION_CODE)
         assertEquals("Application ID must match project namespace", "com.aistudio.prophecyverse.vykqtb", BuildConfig.APPLICATION_ID)
+    }
+
+    @Test
+    fun playerRoute_preservesSelectedSourceId() {
+        assertEquals(
+            "player/anime-1/episode-2?preferredSourceId=provider%2Fsource-3",
+            com.example.ui.navigation.Screen.Player.createRoute("anime-1", "episode-2", "provider/source-3")
+        )
+        assertEquals(
+            "player/anime-1/episode-2",
+            com.example.ui.navigation.Screen.Player.createRoute("anime-1", "episode-2")
+        )
     }
 
     // --- P0: Audio Tracks & Decoder Support ---

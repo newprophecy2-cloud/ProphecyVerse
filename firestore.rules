@@ -7,6 +7,12 @@ service cloud.firestore {
       return signedIn() && exists(/databases/$(database)/documents/admin_users/$(request.auth.uid))
         && get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.is_admin == true;
     }
+    function ownsInstallation(installationId) {
+      let installationPath = /databases/$(database)/documents/installations/$(request.auth.uid + '_' + installationId);
+      return exists(installationPath)
+        && get(installationPath).data.owner_uid == request.auth.uid
+        && get(installationPath).data.installation_id == installationId;
+    }
     match /admin_users/{uid} { allow read, write: if admin(); }
     match /users/{uid} {
       allow read: if owner(uid) || admin();
@@ -21,10 +27,21 @@ service cloud.firestore {
     }
     match /installations/{id} {
       allow read: if admin() || (signedIn() && resource.data.owner_uid == request.auth.uid);
-      allow create, update: if signedIn() && request.resource.data.owner_uid == request.auth.uid
+      allow create: if signedIn()
+        && request.resource.data.owner_uid == request.auth.uid
+        && request.resource.data.installation_id is string
+        && request.resource.data.keys().hasAll(['owner_uid', 'installation_id'])
+        && request.resource.data.keys().hasOnly([
+          'owner_uid','installation_id','session_id','session_start_at','device_manufacturer','device_model','device_brand',
+          'android_version','sdk_int','app_version_name','app_version_code','locale','country_code','installed_at',
+          'last_active_at','last_heartbeat_at','activity_status','fcm_status','fcm_token','total_watch_seconds'
+        ]);
+      allow update: if signedIn()
+        && resource.data.owner_uid == request.auth.uid
+        && request.resource.data.owner_uid == request.auth.uid
         && request.resource.data.installation_id is string
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'owner_uid','installation_id','session_id','session_start_at','device_manufacturer','device_model','device_brand',
+          'installation_id','session_id','session_start_at','device_manufacturer','device_model','device_brand',
           'android_version','sdk_int','app_version_name','app_version_code','locale','country_code','installed_at',
           'last_active_at','last_heartbeat_at','activity_status','fcm_status','fcm_token','total_watch_seconds'
         ]);
@@ -36,7 +53,27 @@ service cloud.firestore {
     match /notices/{id} { allow read: if true; allow write: if admin(); }
     match /notifications/{id} { allow read, write: if admin(); }
     match /security_logs/{id} { allow read: if admin(); allow create: if admin(); allow update, delete: if false; }
-    match /analytics_events/{id} { allow create: if signedIn() && request.resource.data.installation_id is string; allow read: if admin(); allow update, delete: if false; }
+    match /analytics_events/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(['event_name', 'installation_id', 'user_id', 'timestamp', 'params'])
+        && request.resource.data.keys().hasOnly(['event_name', 'installation_id', 'user_id', 'timestamp', 'params'])
+        && request.resource.data.event_name in [
+          'anime_view', 'episode_play', 'app_open', 'notification_permission_granted', 'register_success', 'login_success'
+        ]
+        && request.resource.data.installation_id is string
+        && request.resource.data.installation_id.size() <= 128
+        && request.resource.data.user_id == request.auth.uid
+        && request.resource.data.timestamp is int
+        && request.resource.data.timestamp > 0
+        && request.resource.data.params is map
+        && request.resource.data.params.keys().hasOnly(['anime_id', 'episode_id', 'episode_number'])
+        && (!('anime_id' in request.resource.data.params.keys()) || (request.resource.data.params.anime_id is string && request.resource.data.params.anime_id.size() <= 256))
+        && (!('episode_id' in request.resource.data.params.keys()) || (request.resource.data.params.episode_id is string && request.resource.data.params.episode_id.size() <= 256))
+        && (!('episode_number' in request.resource.data.params.keys()) || request.resource.data.params.episode_number is int)
+        && ownsInstallation(request.resource.data.installation_id);
+      allow read: if admin();
+      allow update, delete: if false;
+    }
     match /update_history/{id} { allow read, write: if admin(); }
     match /analytics_daily/{id} { allow read, write: if admin(); }
     match /admin_settings/{id} { allow read, write: if admin(); }

@@ -301,10 +301,39 @@ class DownloadManager private constructor(private val context: Context) {
             reqBuilder.header("Range", "bytes=$downloadedBytes-")
         }
 
-        val response = okHttpClient.newCall(reqBuilder.build()).execute()
+        var response = okHttpClient.newCall(reqBuilder.build()).execute()
+        if (downloadedBytes > 0L && response.isSuccessful && response.code != 206) {
+            // The server ignored Range (or returned a non-partial success). Restart from byte zero.
+            response.close()
+            tempFile.delete()
+            downloadedBytes = 0L
+            response = okHttpClient.newCall(
+                Request.Builder().url(url).apply {
+                    headers.forEach { if (it.size >= 2) header(it[0], it[1]) }
+                }.build()
+            ).execute()
+        }
+        if (downloadedBytes > 0L && response.code == 206) {
+            val returnedOffset = response.header("Content-Range")
+                ?.substringAfter("bytes ", "")
+                ?.substringBefore('-')
+                ?.toLongOrNull()
+            if (returnedOffset != downloadedBytes) {
+                // Never append bytes unless the server confirms the exact requested offset.
+                response.close()
+                tempFile.delete()
+                downloadedBytes = 0L
+                response = okHttpClient.newCall(
+                    Request.Builder().url(url).apply {
+                        headers.forEach { if (it.size >= 2) header(it[0], it[1]) }
+                    }.build()
+                ).execute()
+            }
+        }
         if (!response.isSuccessful && response.code != 206) {
             // If range not satisfiable, restart from 0
             if (response.code == 416) {
+                response.close()
                 tempFile.delete()
                 downloadedBytes = 0L
                 val restartResp = okHttpClient.newCall(

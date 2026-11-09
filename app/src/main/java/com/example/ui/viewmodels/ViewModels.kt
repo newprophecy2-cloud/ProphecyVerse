@@ -337,7 +337,8 @@ class DetailViewModel(
 class PlayerViewModel(
     application: Application,
     val animeId: String,
-    val initialEpisodeId: String
+    val initialEpisodeId: String,
+    private val initialPreferredSourceId: String? = null
 ) : AndroidViewModel(application) {
     private val repository = AnimeRepository(AppDatabase.getInstance(application))
     val playerManager = PlayerManager(application, viewModelScope)
@@ -419,8 +420,8 @@ class PlayerViewModel(
     // In-memory active direct playback data
     private var activeDirectData: DirectPlayData? = null
     private var activeSourceId: String? = null
-    private var allCandidates: List<ProphecySourceDto> = emptyList()
-    private var currentCandidateIndex: Int = 0
+    private var playbackResolutionJob: Job? = null
+    private var playbackGeneration: Long = 0L
 
     val unifiedAudioTracks: StateFlow<List<PlayerManager.TrackOption>> = combine(
         _availableSources,
@@ -453,7 +454,10 @@ class PlayerViewModel(
                         val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
                         _currentEpisode.value = target
                         _selectedSeason.value = target.seasonNumber
-                        startPlaybackForEpisode(target)
+                        startPlaybackForEpisode(
+                            target,
+                            preferredSourceId = if (target.id == initialEpisodeId) initialPreferredSourceId else null
+                        )
                     } else {
                         val current = _currentEpisode.value
                         val anime = AppDatabase.getInstance(application).animeDao().getAnimeById(animeId) ?: animeEntry.value
@@ -527,14 +531,14 @@ class PlayerViewModel(
         preferredSourceId: String? = null,
         startPositionOverrideMs: Long? = null
     ) {
+        val requestGeneration = ++playbackGeneration
+        playbackResolutionJob?.cancel()
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
         _availableSources.value = emptyList()
         _activeSource.value = null
         activeDirectData = null
         activeSourceId = null
-        allCandidates = emptyList()
-        currentCandidateIndex = 0
         playerManager.clearTrackSelections()
         _isResolving.value = true
         _resolutionError.value = null
@@ -548,11 +552,12 @@ class PlayerViewModel(
             )
         )
 
-        viewModelScope.launch {
+        playbackResolutionJob = viewModelScope.launch {
             val db = AppDatabase.getInstance(getApplication())
 
             // 1. Check if episode is downloaded for offline playback
             val download = db.downloadDao().getDownload(episode.id)
+            if (requestGeneration != playbackGeneration) return@launch
             if (download != null && download.downloadStatus == "COMPLETED" && download.localFilePath != null) {
                 val file = java.io.File(download.localFilePath)
                 if (file.exists() && file.length() > 0) {
@@ -581,6 +586,7 @@ class PlayerViewModel(
 
             // 2. Online playback flow using ProphecyVerse catalog
             val anime = db.animeDao().getAnimeById(animeId) ?: animeEntry.value
+            if (requestGeneration != playbackGeneration) return@launch
             val backendId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
             if (backendId == null) {
@@ -592,31 +598,36 @@ class PlayerViewModel(
             // 3. Fast-Path: Check 17-episode pre-resolve cache for instant start (< 25m TTL)
             if (preferredSourceId == null) {
                 val prepared = preResolveManager.getPreparedSource(backendId, episode.id)
+                if (requestGeneration != playbackGeneration) return@launch
                 if (prepared != null) {
+                    val lastSavedPos = try {
+                        startPositionOverrideMs ?: db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    } catch (_: Exception) { startPositionOverrideMs ?: 0L }
+                    if (requestGeneration != playbackGeneration) return@launch
                     _activeSource.value = prepared.source
                     _availableSources.value = listOf(prepared.source)
                     activeDirectData = prepared.directData
                     activeSourceId = prepared.source.id
                     _isResolving.value = false
 
-                    val lastSavedPos = try {
-                        startPositionOverrideMs ?: db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
-                    } catch (_: Exception) { startPositionOverrideMs ?: 0L }
-
                     playerManager.initializePlayer(
                         directData = prepared.directData,
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = {
-                            viewModelScope.launch {
+                            if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
                                 val freshSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
-                                resolveWithFallback(backendId, episode, freshSources, 0)
+                                if (requestGeneration == playbackGeneration) {
+                                    resolveWithFallback(backendId, episode, freshSources, 0, requestGeneration = requestGeneration)
+                                }
                             }
                         },
                         onRetryNeeded = {
-                            viewModelScope.launch {
+                            if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
                                 val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
-                                resolveWithFallback(backendId, episode, refreshedSources, 0)
+                                if (requestGeneration == playbackGeneration) {
+                                    resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
+                                }
                             }
                         }
                     )
@@ -629,6 +640,7 @@ class PlayerViewModel(
 
             // Route D: Get sources for the selected episode
             val sourcesRes = repository.fetchEpisodeSources(backendId, episode.id)
+            if (requestGeneration != playbackGeneration) return@launch
             if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
                 _resolutionError.value = "No playable sources found for this episode."
                 _isResolving.value = false
@@ -637,7 +649,13 @@ class PlayerViewModel(
 
             val sources = sourcesRes.getOrNull()!!
             val candidates = if (preferredSourceId != null) {
-                listOfNotNull(sources.firstOrNull { it.id == preferredSourceId }) + sources.filter { it.id != preferredSourceId }
+                val selected = sources.firstOrNull { it.id == preferredSourceId }
+                if (selected == null) {
+                    _resolutionError.value = "The selected source is not available for this episode."
+                    _isResolving.value = false
+                    return@launch
+                }
+                listOf(selected) + sources.filter { it.id != preferredSourceId }
             } else {
                 sources
             }
@@ -648,7 +666,8 @@ class PlayerViewModel(
                 candidates,
                 0,
                 prioritize = preferredSourceId == null,
-                startPositionOverrideMs = startPositionOverrideMs
+                startPositionOverrideMs = startPositionOverrideMs,
+                requestGeneration = requestGeneration
             )
         }
     }
@@ -684,25 +703,30 @@ class PlayerViewModel(
         candidates: List<ProphecySourceDto>,
         startIndex: Int = 0,
         prioritize: Boolean = false,
-        startPositionOverrideMs: Long? = null
+        startPositionOverrideMs: Long? = null,
+        requestGeneration: Long
     ) {
+        if (requestGeneration != playbackGeneration) return
         val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
-        allCandidates = orderedCandidates
         _availableSources.value = orderedCandidates
         var lastError: String? = null
 
         for (i in startIndex until orderedCandidates.size) {
+            if (requestGeneration != playbackGeneration) return
             val source = orderedCandidates[i]
-            currentCandidateIndex = i
             activeSourceId = source.id
             _activeSource.value = source
 
             // Route E: The ONE AND ONLY playback route: POST /api/v1/play/direct
             val playRes = repository.resolveDirectPlayback(source.id)
+            if (requestGeneration != playbackGeneration) return
             if (playRes.isSuccess && playRes.getOrNull() != null) {
                 val directData = playRes.getOrNull()!!
+                if (directData.sourceId != source.id) {
+                    lastError = "Resolved source identity did not match the selected provider source."
+                    continue
+                }
                 activeDirectData = directData
-                _isResolving.value = false
 
                 // Fetch last saved position from database unless a source switch supplied it.
                 val lastSavedPos = try {
@@ -710,6 +734,8 @@ class PlayerViewModel(
                     AppDatabase.getInstance(getApplication()).playbackHistoryDao()
                         .getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
                 } catch (e: Exception) { startPositionOverrideMs ?: 0L }
+                if (requestGeneration != playbackGeneration) return
+                _isResolving.value = false
 
                 // Initialize Media3 ExoPlayer with direct URL and headers
                 playerManager.initializePlayer(
@@ -717,20 +743,34 @@ class PlayerViewModel(
                     startPositionMs = lastSavedPos,
                     onPlaybackFailed = {
                         // Automatically try next source candidate if playback fails
-                        if (currentCandidateIndex + 1 < allCandidates.size) {
-                            viewModelScope.launch {
+                        if (requestGeneration == playbackGeneration && i + 1 < orderedCandidates.size) {
+                            _isResolving.value = true
+                            playbackResolutionJob?.cancel()
+                            playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
-                                resolveWithFallback(backendId, episode, allCandidates, currentCandidateIndex + 1)
+                                resolveWithFallback(
+                                    backendId, episode, orderedCandidates, i + 1,
+                                    startPositionOverrideMs = lastSavedPos,
+                                    requestGeneration = requestGeneration
+                                )
                             }
                         }
                     },
                     onRetryNeeded = {
-                        viewModelScope.launch {
+                        if (requestGeneration == playbackGeneration) {
+                            playbackResolutionJob?.cancel()
+                            playbackResolutionJob = viewModelScope.launch {
                             // Link expired (e.g. Google UserContent signed URL expiration):
                             // Request fresh sources and resolve afresh
                             val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                            if (requestGeneration != playbackGeneration) return@launch
                             val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
-                            resolveWithFallback(backendId, episode, newCandidates, 0)
+                            resolveWithFallback(
+                                backendId, episode, newCandidates, 0,
+                                startPositionOverrideMs = lastSavedPos,
+                                requestGeneration = requestGeneration
+                            )
+                            }
                         }
                     }
                 )

@@ -383,8 +383,8 @@ fun MainAppNav(
                 DetailScreen(
                     viewModel = detailViewModel,
                     onBackClick = { navController.popBackStack() },
-                    onPlayEpisode = { aId, eId ->
-                        navController.navigate(Screen.Player.createRoute(aId, eId))
+                    onPlayEpisode = { aId, eId, sourceId ->
+                        navController.navigate(Screen.Player.createRoute(aId, eId, sourceId))
                     }
                 )
             }
@@ -393,18 +393,24 @@ fun MainAppNav(
                 route = Screen.Player.route,
                 arguments = listOf(
                     navArgument("animeId") { type = NavType.StringType },
-                    navArgument("episodeId") { type = NavType.StringType }
+                    navArgument("episodeId") { type = NavType.StringType },
+                    navArgument("preferredSourceId") {
+                        type = NavType.StringType
+                        nullable = true
+                        defaultValue = null
+                    }
                 )
             ) { backStackEntry ->
                 val animeId = backStackEntry.arguments?.getString("animeId") ?: return@composable
                 val episodeId = backStackEntry.arguments?.getString("episodeId") ?: return@composable
+                val preferredSourceId = backStackEntry.arguments?.getString("preferredSourceId")
 
                 val playerViewModel = viewModel<PlayerViewModel>(
                     key = "player_${animeId}_$episodeId",
                     factory = object : androidx.lifecycle.ViewModelProvider.Factory {
                         @Suppress("UNCHECKED_CAST")
                         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
-                            return PlayerViewModel(app, animeId, episodeId) as T
+                            return PlayerViewModel(app, animeId, episodeId, preferredSourceId) as T
                         }
                     }
                 )

@@ -107,4 +107,4 @@ bash ./gradlew :app:assembleDebug
 bash ./gradlew :app:testDebugUnitTest
 ```
 
-In this sandbox, the debug APK build and all 34 JVM/Robolectric unit tests passed with JDK 21 and Android API 36. The APK uses a sandbox-only Android debug key; it is not a production update APK. The original release keystore is not included or available here, so an authorized release build must be signed separately with the existing key. Live Firebase operations, emulator/device installation, and production update behavior were not tested. See `FINAL_AUDIT_REPORT.md` for findings and remaining requirements.
+Historical validation recorded for an earlier checkout: a debug APK build and 34 JVM/Robolectric unit tests passed with JDK 21 and Android API 36. This is not validation of the current checkout. The earlier APK used a sandbox-only Android debug key; it is not a production update APK. The original release keystore was not included in that validation environment. Live Firebase operations, emulator/device installation, and production update behavior were not tested. See `FINAL_AUDIT_REPORT.md` for that historical report and remaining requirements.
