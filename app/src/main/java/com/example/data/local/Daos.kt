@@ -97,8 +97,19 @@ interface EpisodeDao {
     @Query("SELECT * FROM episode_entries WHERE animeId = :animeId AND seasonNumber = :seasonNumber ORDER BY episodeNumber ASC")
     fun observeEpisodes(animeId: String, seasonNumber: Int): Flow<List<EpisodeEntry>>
 
+    @Query("SELECT * FROM episode_entries WHERE animeId = :animeId AND seasonNumber = :seasonNumber AND episodeNumber >= :firstEpisode AND episodeNumber < :episodeLimit ORDER BY episodeNumber ASC, id ASC")
+    fun observeEpisodeWindow(
+        animeId: String,
+        seasonNumber: Int,
+        firstEpisode: Int,
+        episodeLimit: Int
+    ): Flow<List<EpisodeEntry>>
+
     @Query("SELECT * FROM episode_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC, episodeNumber ASC")
     fun observeAllEpisodes(animeId: String): Flow<List<EpisodeEntry>>
+
+    @Query("SELECT * FROM episode_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC, episodeNumber ASC, id ASC LIMIT 1")
+    fun observeFirstEpisode(animeId: String): Flow<EpisodeEntry?>
 
     @Query("SELECT * FROM episode_entries WHERE id = :episodeId LIMIT 1")
     suspend fun getEpisodeById(episodeId: String): EpisodeEntry?

@@ -59,7 +59,9 @@ data class ProphecyEpisodeFullResponse(
 
 @JsonClass(generateAdapter = true)
 data class ProphecySourceDto(
-    @Json(name = "id") val id: String,
+    // Some partial responses omit the ID. Preserve the candidate for accurate display, but
+    // callers must not send a blank ID to the direct-play endpoint.
+    @Json(name = "id") val id: String = "",
     @Json(name = "label") val label: String? = null,
     @Json(name = "quality") val quality: String? = null,
     @Json(name = "codec") val codec: String? = null,
@@ -67,7 +69,16 @@ data class ProphecySourceDto(
     @Json(name = "size_bytes") val sizeBytes: Long? = null,
     @Json(name = "downloadable") val downloadable: Boolean? = null,
     @Json(name = "expires_at") val expiresAt: String? = null
-)
+) {
+    /** Stable key for Compose rows that distinguishes same-ID candidates with different metadata. */
+    val stableIdentity: String
+        get() = listOf(id, label, quality, codec, language, sizeBytes, downloadable, expiresAt)
+            .joinToString("\u001f") { it?.toString().orEmpty() }
+
+    /** The backend's existing label is the only provider-like display field in this contract. */
+    val displayProviderName: String
+        get() = label?.takeIf { it.isNotBlank() } ?: "Unknown provider"
+}
 
 @JsonClass(generateAdapter = true)
 data class DirectPlayRequest(

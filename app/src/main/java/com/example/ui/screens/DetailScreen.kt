@@ -54,6 +54,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -101,6 +102,8 @@ fun DetailScreen(
     val seasons by viewModel.seasons.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val episodes by viewModel.episodes.collectAsStateWithLifecycle()
+    val episodeSourceStates by viewModel.episodeSourceStates.collectAsStateWithLifecycle()
+    val episodeWindowStart by viewModel.episodeWindowStart.collectAsStateWithLifecycle()
     val watchlistEntry by viewModel.watchlistEntry.collectAsStateWithLifecycle()
     val lastPlayed by viewModel.lastPlayed.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
@@ -522,6 +525,25 @@ fun DetailScreen(
                         }
                     }
 
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (episodeWindowStart > 1) {
+                                TextButton(onClick = { viewModel.loadPreviousEpisodeWindow() }) {
+                                    Text("Previous episodes", color = AccentCyan)
+                                }
+                            } else {
+                                Spacer(modifier = Modifier.width(1.dp))
+                            }
+                            TextButton(onClick = { viewModel.loadNextEpisodeWindow() }) {
+                                Text("Next episodes", color = AccentCyan)
+                            }
+                        }
+                    }
+
                     // Episodes List
                     if (episodes.isEmpty()) {
                         item {
@@ -642,8 +664,25 @@ fun DetailScreen(
                                 episode = ep,
                                 isPlayed = lastPlayed?.episodeId == ep.id,
                                 downloadEntry = downloadEntry,
-                                onPlayClick = { onPlayEpisode(item.id, ep.id, null) },
-                                onSourcesClick = { viewModel.openSourceChooser(ep) },
+                                onPlayClick = {
+                                    viewModel.focusEpisodeWindow(ep)
+                                    onPlayEpisode(item.id, ep.id, null)
+                                },
+                                onSourcesClick = {
+                                    viewModel.focusEpisodeWindow(ep)
+                                    viewModel.openSourceChooser(ep)
+                                },
+                                sourceStateLabel = episodeSourceStates[ep.id]?.let { state ->
+                                    when (state) {
+                                        DetailViewModel.EpisodeSourceState.NOT_CHECKED -> null
+                                        DetailViewModel.EpisodeSourceState.LOADING -> "Sources · loading"
+                                        DetailViewModel.EpisodeSourceState.AVAILABLE -> "Sources · ready"
+                                        DetailViewModel.EpisodeSourceState.EMPTY -> "Sources · none"
+                                        DetailViewModel.EpisodeSourceState.PARTIAL -> "Sources · partial"
+                                        DetailViewModel.EpisodeSourceState.FAILED -> "Sources · retry"
+                                        DetailViewModel.EpisodeSourceState.UNKNOWN -> "Sources · unchecked"
+                                    }
+                                },
                                 onDownloadClick = {
                                     val eligibility = authManager.checkDownloadEligibility()
                                     when (eligibility) {
@@ -764,16 +803,34 @@ fun DetailScreen(
                         ) {
                             CircularProgressIndicator(color = AccentCyan)
                         }
-                    } else if (sourceError != null) {
-                        Text(
-                            text = sourceError!!,
-                            color = AccentCoral,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(vertical = 16.dp)
-                        )
+                    } else if (episodeSources.isEmpty() && sourceError != null) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = sourceError!!,
+                                color = AccentCoral,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                            TextButton(onClick = { viewModel.openSourceChooser(ep, forceRefresh = true) }) {
+                                Text("Retry source lookup", color = AccentCyan)
+                            }
+                        }
                     } else {
+                        sourceError?.let { message ->
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = message,
+                                    color = if (episodeSources.isEmpty()) AccentCoral else TextMuted,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(vertical = 8.dp)
+                                )
+                                TextButton(onClick = { viewModel.openSourceChooser(ep, forceRefresh = true) }) {
+                                    Text("Retry source lookup", color = AccentCyan)
+                                }
+                            }
+                        }
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(episodeSources, key = { it.id }) { src ->
+                            items(episodeSources, key = { it.stableIdentity }) { src ->
                                 SourceCandidateCard(
                                     source = src,
                                     onClick = {
@@ -801,6 +858,7 @@ fun EpisodeRow(
     downloadEntry: DownloadEntry? = null,
     onPlayClick: () -> Unit,
     onSourcesClick: () -> Unit,
+    sourceStateLabel: String? = null,
     onDownloadClick: () -> Unit = {}
 ) {
     Card(
@@ -904,7 +962,7 @@ fun EpisodeRow(
                 Spacer(modifier = Modifier.width(4.dp))
 
                 Text(
-                    text = "Sources",
+                    text = sourceStateLabel ?: "Sources",
                     fontSize = 11.sp,
                     color = AccentIndigo,
                     fontWeight = FontWeight.SemiBold,
@@ -939,7 +997,7 @@ fun SourceCandidateCard(
         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = source.id.isNotBlank(), onClick = onClick)
     ) {
         Row(
             modifier = Modifier
@@ -951,7 +1009,7 @@ fun SourceCandidateCard(
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = source.label ?: "Direct Source",
+                        text = source.displayProviderName,
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Bold,
                         color = TextPrimary
@@ -973,10 +1031,12 @@ fun SourceCandidateCard(
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                val codecStr = source.codec ?: ""
-                val langStr = source.language ?: ""
+                val codecStr = source.codec?.takeIf { it.isNotBlank() } ?: ""
+                val langStr = source.language?.takeIf { it.isNotBlank() } ?: "Unknown language"
+                val sizeStr = source.sizeBytes?.let { "${it / 1_000_000} MB" }
                 Text(
-                    text = listOf(codecStr, langStr).filter { it.isNotBlank() }.joinToString(" • "),
+                    text = listOf(codecStr, langStr, sizeStr, source.downloadable?.let { if (it) "Downloadable" else "Stream only" })
+                        .filterNotNull().filter { it.isNotBlank() }.joinToString(" • "),
                     color = TextMuted,
                     fontSize = 11.sp
                 )
@@ -984,8 +1044,8 @@ fun SourceCandidateCard(
 
             Icon(
                 imageVector = Icons.Default.PlayArrow,
-                contentDescription = "Play with this source",
-                tint = PlayableGreen,
+                contentDescription = if (source.id.isNotBlank()) "Play with this source" else "Source cannot be played because it has no ID",
+                tint = if (source.id.isNotBlank()) PlayableGreen else TextMuted,
                 modifier = Modifier.size(24.dp)
             )
         }

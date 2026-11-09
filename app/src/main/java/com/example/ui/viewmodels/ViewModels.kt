@@ -12,6 +12,7 @@ import com.example.data.local.WatchlistEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.EpisodeNumberWindow
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
 import android.content.Context
@@ -30,6 +31,9 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
 
 class AppViewModelFactory(private val application: Application) {
     val database by lazy { AppDatabase.getInstance(application) }
@@ -192,14 +196,22 @@ class DetailViewModel(
     val seasons: StateFlow<List<SeasonEntry>> = repository.observeSeasons(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val allEpisodes: StateFlow<List<EpisodeEntry>> = repository.observeAllEpisodes(animeId)
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val firstEpisode: StateFlow<EpisodeEntry?> = repository.observeFirstEpisode(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     private val _selectedSeason = MutableStateFlow(1)
     val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
 
-    val episodes: StateFlow<List<EpisodeEntry>> = _selectedSeason.flatMapLatest { s ->
-        repository.observeEpisodes(animeId, s)
+    private val _episodeWindowStart = MutableStateFlow(1)
+    val episodeWindowStart: StateFlow<Int> = _episodeWindowStart.asStateFlow()
+    private val _episodeWindowSize = MutableStateFlow(30)
+    val episodeWindowSize: StateFlow<Int> = _episodeWindowSize.asStateFlow()
+
+    val episodes: StateFlow<List<EpisodeEntry>> = combine(_selectedSeason, _episodeWindowStart, _episodeWindowSize) { season, start, size ->
+        Triple(season, start, size)
+    }.flatMapLatest { (season, start, size) ->
+        val window = EpisodeNumberWindow(start, size)
+        repository.observeEpisodeWindow(animeId, season, window.firstEpisode, window.episodeLimitExclusive)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val watchlistEntry: StateFlow<WatchlistEntry?> = repository.observeWatchlistEntry(animeId)
@@ -215,6 +227,7 @@ class DetailViewModel(
     val syncError: StateFlow<String?> = _syncError.asStateFlow()
     private var refreshJob: Job? = null
     private var sourceDiscoveryJob: Job? = null
+    private var sourceRequestGeneration: Long = 0L
 
     // In-memory episode source selection
     private val _episodeSources = MutableStateFlow<List<ProphecySourceDto>>(emptyList())
@@ -229,25 +242,43 @@ class DetailViewModel(
     private val _sourceError = MutableStateFlow<String?>(null)
     val sourceError: StateFlow<String?> = _sourceError.asStateFlow()
 
+    enum class EpisodeSourceState { NOT_CHECKED, LOADING, AVAILABLE, EMPTY, PARTIAL, FAILED, UNKNOWN }
+    private val _episodeSourceStates = MutableStateFlow<Map<String, EpisodeSourceState>>(emptyMap())
+    val episodeSourceStates: StateFlow<Map<String, EpisodeSourceState>> = _episodeSourceStates.asStateFlow()
+    private val automaticSourceSemaphore = Semaphore(2)
+    private val automaticSourceJobs = ConcurrentHashMap<String, Job>()
+
     init {
         viewModelScope.launch {
-            combine(seasons, allEpisodes) { sList, epList -> sList to epList }
-                .collect { (sList, epList) ->
+            combine(seasons, firstEpisode) { sList, firstEp -> sList to firstEp }
+                .collect { (sList, firstEp) ->
                     if (sList.isNotEmpty()) {
-                        val currentHasEpisodes = epList.any { it.seasonNumber == _selectedSeason.value }
-                        if (!currentHasEpisodes && epList.isNotEmpty()) {
-                            // Find the first season that actually has episodes (e.g. One Piece Season 22)
-                            val seasonWithEps = epList.firstOrNull()?.seasonNumber
-                            if (seasonWithEps != null && sList.any { it.seasonNumber == seasonWithEps }) {
-                                _selectedSeason.value = seasonWithEps
-                            } else {
-                                _selectedSeason.value = sList.first().seasonNumber
-                            }
-                        } else if (sList.none { it.seasonNumber == _selectedSeason.value }) {
-                            _selectedSeason.value = sList.first().seasonNumber
+                        val firstSeasonWithEpisode = firstEp?.seasonNumber
+                        if (sList.none { it.seasonNumber == _selectedSeason.value }) {
+                            _selectedSeason.value = firstSeasonWithEpisode?.takeIf { candidate ->
+                                sList.any { it.seasonNumber == candidate }
+                            } ?: sList.first().seasonNumber
+                        } else if (_selectedSeason.value == 1 && firstSeasonWithEpisode != null &&
+                            firstSeasonWithEpisode != 1 && sList.any { it.seasonNumber == firstSeasonWithEpisode }) {
+                            _selectedSeason.value = firstSeasonWithEpisode
                         }
                     }
                 }
+        }
+        viewModelScope.launch {
+            lastPlayed.collect { history ->
+                if (history != null) {
+                    _selectedSeason.value = history.seasonNumber
+                    if (history.episodeNumber > 30) {
+                        val window = EpisodeNumberWindow.aroundSelected(history.episodeNumber)
+                        _episodeWindowStart.value = window.firstEpisode
+                        _episodeWindowSize.value = window.episodeCount
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
+            episodes.collect { window -> queueAutomaticSourceDiscovery(window) }
         }
         refreshDetails()
     }
@@ -271,37 +302,154 @@ class DetailViewModel(
 
     fun selectSeason(seasonNumber: Int) {
         _selectedSeason.value = seasonNumber
+        _episodeWindowStart.value = 1
+        _episodeWindowSize.value = 30
     }
 
-    fun openSourceChooser(episode: EpisodeEntry) {
-        if (_selectedEpisodeForSources.value?.id == episode.id && _episodeSources.value.isNotEmpty()) return
+    fun loadNextEpisodeWindow() {
+        _episodeWindowStart.value += _episodeWindowSize.value
+        _episodeWindowSize.value = 30
+    }
+
+    fun loadPreviousEpisodeWindow() {
+        val size = _episodeWindowSize.value
+        _episodeWindowStart.value = (_episodeWindowStart.value - size).coerceAtLeast(1)
+        _episodeWindowSize.value = 30
+    }
+
+    fun focusEpisodeWindow(episode: EpisodeEntry) {
+        _selectedSeason.value = episode.seasonNumber
+        if (episode.episodeNumber > 30) {
+            val window = EpisodeNumberWindow.aroundSelected(episode.episodeNumber)
+            _episodeWindowStart.value = window.firstEpisode
+            _episodeWindowSize.value = window.episodeCount
+        } else {
+            val window = EpisodeNumberWindow.initial()
+            _episodeWindowStart.value = window.firstEpisode
+            _episodeWindowSize.value = window.episodeCount
+        }
+    }
+
+    private fun queueAutomaticSourceDiscovery(window: List<EpisodeEntry>) {
+        val current = animeEntry.value ?: return
+        val backendId = current.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
+        if (backendId == null || window.isEmpty()) return
+        val priorityEpisodeId = lastPlayed.value?.episodeId
+        val ordered = window.sortedWith(compareBy<EpisodeEntry> { if (it.id == priorityEpisodeId) 0 else 1 }
+            .thenBy { it.episodeNumber })
+        ordered.forEach { episode ->
+            val existingState = _episodeSourceStates.value[episode.id]
+            if (existingState in setOf(EpisodeSourceState.LOADING, EpisodeSourceState.AVAILABLE,
+                    EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL, EpisodeSourceState.FAILED,
+                    EpisodeSourceState.UNKNOWN)) return@forEach
+            if (automaticSourceJobs[episode.id]?.isActive == true) return@forEach
+            _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
+            automaticSourceJobs[episode.id] = viewModelScope.launch {
+                try {
+                    automaticSourceSemaphore.withPermit {
+                        val result = repository.fetchEpisodeSourceSnapshot(backendId, episode.id)
+                        val state = result.getOrNull()?.state?.let {
+                            when (it) {
+                                AnimeRepository.SourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+                                AnimeRepository.SourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+                                AnimeRepository.SourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+                                AnimeRepository.SourceResponseState.FAILED -> EpisodeSourceState.FAILED
+                                AnimeRepository.SourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                            }
+                        } ?: EpisodeSourceState.FAILED
+                        _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    _episodeSourceStates.value = _episodeSourceStates.value - episode.id
+                    throw cancelled
+                } catch (_: Exception) {
+                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
+                } finally {
+                    automaticSourceJobs.remove(episode.id)
+                }
+            }
+        }
+    }
+
+    fun openSourceChooser(episode: EpisodeEntry, forceRefresh: Boolean = false) {
+        if (!forceRefresh && _selectedEpisodeForSources.value?.id == episode.id && _episodeSources.value.isNotEmpty()) return
+        val requestGeneration = ++sourceRequestGeneration
         sourceDiscoveryJob?.cancel()
         _selectedEpisodeForSources.value = episode
+        _episodeSources.value = emptyList()
+        _isLoadingSources.value = false
         _sourceError.value = null
+        _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
+        automaticSourceJobs.toMap().forEach { (episodeId, job) ->
+            if (episodeId != episode.id) {
+                job.cancel()
+                _episodeSourceStates.value = _episodeSourceStates.value - episodeId
+            }
+        }
         val current = animeEntry.value
         val backendId = current?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
         if (backendId == null) {
+            _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
             _sourceError.value = "This title is metadata-only and not currently playable in catalog."
             return
         }
 
         sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
-            val res = repository.fetchEpisodeSources(backendId, episode.id)
-            if (res.isSuccess) {
-                _episodeSources.value = res.getOrNull() ?: emptyList()
-                if (_episodeSources.value.isEmpty()) {
-                    _sourceError.value = "No playable sources returned for Episode ${episode.episodeNumber}."
+            try {
+                val res = automaticSourceSemaphore.withPermit {
+                    repository.fetchEpisodeSourceSnapshot(backendId, episode.id, forceRefresh)
                 }
-            } else {
-                _sourceError.value = "Failed to load sources: ${res.exceptionOrNull()?.message}"
+                if (requestGeneration != sourceRequestGeneration) return@launch
+                val snapshot = res.getOrNull()
+                if (snapshot != null) {
+                    _episodeSources.value = snapshot.sources
+                    val state = when (snapshot.state) {
+                        AnimeRepository.SourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+                        AnimeRepository.SourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+                        AnimeRepository.SourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+                        AnimeRepository.SourceResponseState.FAILED -> EpisodeSourceState.FAILED
+                        AnimeRepository.SourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                    }
+                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
+                    if (!snapshot.errorMessage.isNullOrBlank()) {
+                        _sourceError.value = snapshot.errorMessage
+                    } else if (snapshot.sources.isEmpty()) {
+                        _sourceError.value = when (snapshot.state) {
+                            AnimeRepository.SourceResponseState.EMPTY -> "The backend confirmed that no sources are currently available."
+                            AnimeRepository.SourceResponseState.PARTIAL -> "Source lookup is partial; retry to check again."
+                            AnimeRepository.SourceResponseState.FAILED -> snapshot.errorMessage ?: "Source lookup failed. Retry to check again."
+                            else -> "The backend returned no source candidates, but did not confirm an empty result. Retry to check again."
+                        }
+                    } else if (snapshot.state == AnimeRepository.SourceResponseState.PARTIAL) {
+                        _sourceError.value = "Partial source response; available candidates are shown below."
+                    } else if (snapshot.state == AnimeRepository.SourceResponseState.FAILED) {
+                        _sourceError.value = snapshot.errorMessage ?: "Some source information may be unavailable."
+                    }
+                } else {
+                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
+                    _sourceError.value = "Failed to load sources: ${res.exceptionOrNull()?.message}"
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
+                _sourceError.value = "Failed to load sources: ${error.message}"
+            } finally {
+                if (requestGeneration == sourceRequestGeneration) {
+                    _isLoadingSources.value = false
+                    queueAutomaticSourceDiscovery(episodes.value)
+                }
             }
-            _isLoadingSources.value = false
         }
     }
 
     fun closeSourceChooser() {
+        sourceRequestGeneration += 1L
+        sourceDiscoveryJob?.cancel()
+        sourceDiscoveryJob = null
+        _isLoadingSources.value = false
         _selectedEpisodeForSources.value = null
         _episodeSources.value = emptyList()
         _sourceError.value = null

@@ -49,14 +49,27 @@ class AnimeRepository(
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
 
-    private data class SourceCacheEntry(
+    enum class SourceResponseState { AVAILABLE, EMPTY, PARTIAL, FAILED, UNKNOWN }
+
+    data class EpisodeSourceSnapshot(
         val sources: List<ProphecySourceDto>,
-        val fetchedAtMs: Long
-    )
+        val state: SourceResponseState,
+        val backendStatus: String? = null,
+        val errorMessage: String? = null,
+        val fetchedAtMs: Long,
+        val apiCandidateCount: Int = sources.size,
+        val expiredCandidateCount: Int = 0,
+        val exactDuplicateCount: Int = 0
+    ) {
+        val isStale: Boolean
+            get() = System.currentTimeMillis() - fetchedAtMs > 2 * 60 * 1000L
+    }
+
+    private data class SourceCacheEntry(val snapshot: EpisodeSourceSnapshot)
 
     // Transient in-memory cache for source candidates during the active episode session.
     // Strictly NOT persisted in Room or logs. The cache identity includes both catalog and episode.
-    private val memorySourcesCache = mutableMapOf<String, SourceCacheEntry>()
+    private val memorySourcesCache = LinkedHashMap<String, SourceCacheEntry>(16, 0.75f, true)
     private val sourceCacheMutex = Mutex()
     private val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
     private data class ResolvedCacheEntry(val data: DirectPlayData, val cachedAtMs: Long)
@@ -64,6 +77,7 @@ class AnimeRepository(
     private val resolveMutexes = ConcurrentHashMap<String, Mutex>()
     private val searchMutex = Mutex()
     private val sourceCacheTtlMs = 2 * 60 * 1000L
+    private val maxMemorySourceSnapshots = 120
 
     private val homeRefreshMutex = Mutex()
     private var lastHomeRefreshTimestamp: Long = 0L
@@ -82,7 +96,14 @@ class AnimeRepository(
     fun observeSeasons(animeId: String): Flow<List<SeasonEntry>> = episodeDao.observeSeasons(animeId)
     fun observeEpisodes(animeId: String, seasonNumber: Int): Flow<List<EpisodeEntry>> =
         episodeDao.observeEpisodes(animeId, seasonNumber)
+    fun observeEpisodeWindow(
+        animeId: String,
+        seasonNumber: Int,
+        firstEpisode: Int,
+        episodeLimit: Int
+    ): Flow<List<EpisodeEntry>> = episodeDao.observeEpisodeWindow(animeId, seasonNumber, firstEpisode, episodeLimit)
     fun observeAllEpisodes(animeId: String): Flow<List<EpisodeEntry>> = episodeDao.observeAllEpisodes(animeId)
+    fun observeFirstEpisode(animeId: String): Flow<EpisodeEntry?> = episodeDao.observeFirstEpisode(animeId)
 
     fun observeSearchResults(query: String): Flow<List<AnimeEntry>> {
         val norm = TitleMatcher.normalize(query)
@@ -805,21 +826,31 @@ class AnimeRepository(
     suspend fun fetchEpisodeSources(
         backendAnimeId: String,
         episodeId: String
-    ): Result<List<ProphecySourceDto>> = withContext(Dispatchers.IO) {
+    ): Result<List<ProphecySourceDto>> = fetchEpisodeSourceSnapshot(backendAnimeId, episodeId)
+        .map { it.sources }
+
+    /**
+     * Returns both candidates and the server's response state so an empty, partial, or failed
+     * provider lookup is not accidentally presented as a confirmed empty result.
+     */
+    suspend fun fetchEpisodeSourceSnapshot(
+        backendAnimeId: String,
+        episodeId: String,
+        forceRefresh: Boolean = false
+    ): Result<EpisodeSourceSnapshot> = withContext(Dispatchers.IO) {
         val cacheKey = "$backendAnimeId::$episodeId"
         sourceCacheMutex.withLock {
             val cached = memorySourcesCache[cacheKey]
-            if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs <= sourceCacheTtlMs) {
-                return@withContext Result.success(cached.sources)
+            if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.snapshot.fetchedAtMs <= sourceCacheTtlMs) {
+                return@withContext Result.success(cached.snapshot)
             }
-            if (cached != null) memorySourcesCache.remove(cacheKey)
         }
         sourceFetchMutexes.computeIfAbsent(cacheKey) { Mutex() }.withLock {
             // A second caller may have been waiting while the first request completed.
             sourceCacheMutex.withLock {
                 val cached = memorySourcesCache[cacheKey]
-                if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs <= sourceCacheTtlMs) {
-                    return@withContext Result.success(cached.sources)
+                if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.snapshot.fetchedAtMs <= sourceCacheTtlMs) {
+                    return@withContext Result.success(cached.snapshot)
                 }
             }
             try {
@@ -828,20 +859,53 @@ class AnimeRepository(
                     return@withContext Result.failure(Exception("Failed to get episode sources: ${response.code()}"))
                 }
 
-                val sources = response.body()?.sources.orEmpty()
-                    .filter { source ->
-                        source.id.isNotBlank() &&
-                            (!source.expiresAt.isNullOrBlank() && !isExpired(source.expiresAt) || source.expiresAt.isNullOrBlank())
-                    }
-                    .distinctBy { it.id }
-                if (sources.isNotEmpty()) {
-                    sourceCacheMutex.withLock {
-                        memorySourcesCache[cacheKey] = SourceCacheEntry(sources, System.currentTimeMillis())
+                val body = response.body()!!
+                // Keep candidates with missing IDs in the result for visibility; they are not
+                // eligible for direct playback. Expired entries are excluded from current availability.
+                val apiCandidates = body.sources.orEmpty()
+                val nonExpiredCandidates = apiCandidates
+                    .filterNot { !it.expiresAt.isNullOrBlank() && isExpired(it.expiresAt) }
+                val sources = nonExpiredCandidates.distinct()
+                val rawStatus = body.sourcesStatus?.trim()?.takeIf { it.isNotEmpty() }
+                val status = when {
+                    body.sourcesPartial == true || rawStatus.equals("partial", ignoreCase = true) ||
+                        rawStatus.equals("loading", ignoreCase = true) -> SourceResponseState.PARTIAL
+                    !body.sourceError.isNullOrBlank() || rawStatus.equals("failed", ignoreCase = true) ||
+                        rawStatus.equals("error", ignoreCase = true) || rawStatus.equals("timeout", ignoreCase = true) ->
+                        SourceResponseState.FAILED
+                    sources.isNotEmpty() -> SourceResponseState.AVAILABLE
+                    rawStatus.equals("empty", ignoreCase = true) || rawStatus.equals("no_sources", ignoreCase = true) ->
+                        SourceResponseState.EMPTY
+                    else -> SourceResponseState.UNKNOWN
+                }
+                val snapshot = EpisodeSourceSnapshot(
+                    sources = sources,
+                    state = status,
+                    backendStatus = rawStatus,
+                    errorMessage = body.sourceError,
+                    fetchedAtMs = System.currentTimeMillis(),
+                    apiCandidateCount = apiCandidates.size,
+                    expiredCandidateCount = apiCandidates.size - nonExpiredCandidates.size,
+                    exactDuplicateCount = nonExpiredCandidates.size - sources.size
+                )
+                sourceCacheMutex.withLock {
+                    memorySourcesCache[cacheKey] = SourceCacheEntry(snapshot)
+                    while (memorySourcesCache.size > maxMemorySourceSnapshots) {
+                        val eldestKey = memorySourcesCache.keys.iterator().next()
+                        memorySourcesCache.remove(eldestKey)
                     }
                 }
-                Result.success(sources)
+                Result.success(snapshot)
             } catch (e: Exception) {
-                Result.failure(e)
+                val stale = sourceCacheMutex.withLock { memorySourcesCache[cacheKey]?.snapshot }
+                if (stale != null) {
+                    Result.success(stale.copy(
+                        state = SourceResponseState.UNKNOWN,
+                        errorMessage = "Source refresh failed; cached candidates are stale and not verified current: ${e.message}"
+                    ))
+                } else {
+                    Result.failure(e)
+                }
             }
         }
     }

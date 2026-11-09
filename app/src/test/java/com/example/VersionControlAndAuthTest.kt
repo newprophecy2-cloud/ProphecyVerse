@@ -49,8 +49,8 @@ class VersionControlAndAuthTest {
     fun `firestore permission denied is not classified as network`() {
         val failure = classifyVersionVerificationFailure(
             FirebaseFirestoreException(
-                FirebaseFirestoreException.Code.PERMISSION_DENIED,
                 "denied",
+                FirebaseFirestoreException.Code.PERMISSION_DENIED,
                 null
             )
         )
