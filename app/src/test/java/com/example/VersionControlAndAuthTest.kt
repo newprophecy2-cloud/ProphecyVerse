@@ -7,6 +7,9 @@ import com.example.data.firebase.UserProfile
 import com.example.data.firebase.VersionCheckState
 import com.example.data.firebase.VersionControlConfig
 import com.example.data.firebase.VersionControlManager
+import com.example.data.firebase.VersionVerificationFailureKind
+import com.example.data.firebase.classifyVersionVerificationFailure
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.example.data.firebase.requiresDownloadMetadata
 import com.example.data.notice.parsePublishedNotice
 import com.google.firebase.Timestamp
@@ -19,12 +22,76 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.Date
+import java.net.UnknownHostException
+import java.net.SocketTimeoutException
+import javax.net.ssl.SSLException
+import kotlin.coroutines.cancellation.CancellationException
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class VersionControlAndAuthTest {
 
     @Test
+    fun `version code 6 with minimum 5 is up to date`() {
+        val state = VersionControlManager.evaluateVersionState(
+            currentCode = 6,
+            config = VersionControlConfig(
+                latestVersionCode = 6,
+                latestVersionName = "3.0.1",
+                minSupportedVersionCode = 5,
+                forceUpdate = false
+            )
+        )
+        assertTrue(state is VersionCheckState.UpToDate)
+    }
+
+    @Test
+    fun `firestore permission denied is not classified as network`() {
+        val failure = classifyVersionVerificationFailure(
+            FirebaseFirestoreException(
+                FirebaseFirestoreException.Code.PERMISSION_DENIED,
+                "denied",
+                null
+            )
+        )
+        assertEquals(VersionVerificationFailureKind.PERMISSION, failure.kind)
+        assertFalse(failure.isNetworkError)
+    }
+
+    @Test
+    fun `transient and transport errors are classified accurately`() {
+        assertEquals(
+            VersionVerificationFailureKind.NETWORK,
+            classifyVersionVerificationFailure(UnknownHostException("dns")).kind
+        )
+        assertEquals(
+            VersionVerificationFailureKind.TIMEOUT,
+            classifyVersionVerificationFailure(SocketTimeoutException("timeout")).kind
+        )
+        assertEquals(
+            VersionVerificationFailureKind.NETWORK,
+            classifyVersionVerificationFailure(SSLException("tls")).kind
+        )
+    }
+
+    @Test
+    fun `parsing and unexpected errors are not classified as network`() {
+        assertEquals(
+            VersionVerificationFailureKind.PARSING,
+            classifyVersionVerificationFailure(IllegalArgumentException("invalid document")).kind
+        )
+        assertEquals(
+            VersionVerificationFailureKind.UNEXPECTED,
+            classifyVersionVerificationFailure(IllegalStateException("unexpected failure")).kind
+        )
+    }
+
+    @Test(expected = CancellationException::class)
+    fun `cancellation is propagated`() {
+        classifyVersionVerificationFailure(CancellationException("cancelled"))
+    }
+
+	@Test
     fun `test legacy V2 client code 4 is strictly blocked when min version is 5`() {
         val config = VersionControlConfig(
             latestVersionCode = 5,

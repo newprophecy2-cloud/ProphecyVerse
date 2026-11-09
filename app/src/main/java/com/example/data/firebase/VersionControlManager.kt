@@ -5,9 +5,11 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.example.BuildConfig
+import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.Source
@@ -25,7 +27,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.security.cert.CertificateException
+import javax.net.ssl.SSLException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.cancellation.CancellationException
 
 data class DownloadSource(
     val id: String = "",
@@ -74,6 +82,61 @@ sealed class VersionCheckState {
         val message: String,
         val isNetworkError: Boolean
     ) : VersionCheckState()
+}
+
+internal enum class VersionVerificationFailureKind {
+    PERMISSION, NETWORK, TIMEOUT, AUTHENTICATION, CONFIGURATION,
+    NOT_FOUND, CANCELLED, PARSING, UNEXPECTED
+}
+
+internal data class VersionVerificationFailure(
+    val kind: VersionVerificationFailureKind,
+    val userMessage: String,
+    val isNetworkError: Boolean,
+    val firebaseCode: String?,
+    val exceptionClass: String,
+    val rootCauseClass: String
+)
+
+internal fun classifyVersionVerificationFailure(error: Throwable): VersionVerificationFailure {
+    if (error is CancellationException) throw error
+    val firebaseError = generateSequence(error) { it.cause }
+        .filterIsInstance<FirebaseFirestoreException>()
+        .firstOrNull()
+    val rootCause = generateSequence(error) { it.cause }.last()
+    val kind = when {
+        firebaseError?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED -> VersionVerificationFailureKind.PERMISSION
+        firebaseError?.code == FirebaseFirestoreException.Code.UNAUTHENTICATED -> VersionVerificationFailureKind.AUTHENTICATION
+        firebaseError?.code == FirebaseFirestoreException.Code.NOT_FOUND -> VersionVerificationFailureKind.NOT_FOUND
+        firebaseError?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION -> VersionVerificationFailureKind.CONFIGURATION
+        firebaseError?.code == FirebaseFirestoreException.Code.DEADLINE_EXCEEDED -> VersionVerificationFailureKind.TIMEOUT
+        firebaseError?.code == FirebaseFirestoreException.Code.UNAVAILABLE || firebaseError?.code == FirebaseFirestoreException.Code.ABORTED -> VersionVerificationFailureKind.NETWORK
+        firebaseError?.code == FirebaseFirestoreException.Code.CANCELLED -> VersionVerificationFailureKind.CANCELLED
+        rootCause is SocketTimeoutException -> VersionVerificationFailureKind.TIMEOUT
+        rootCause is UnknownHostException || rootCause is ConnectException -> VersionVerificationFailureKind.NETWORK
+        rootCause is SSLException || rootCause is CertificateException -> VersionVerificationFailureKind.NETWORK
+        error is IllegalArgumentException -> VersionVerificationFailureKind.PARSING
+        error is IllegalStateException && error.message.orEmpty().contains(
+            "firebase|firebaseapp|initialize|options".toRegex(RegexOption.IGNORE_CASE)
+        ) -> VersionVerificationFailureKind.CONFIGURATION
+        else -> VersionVerificationFailureKind.UNEXPECTED
+    }
+    val message = when (kind) {
+        VersionVerificationFailureKind.PERMISSION -> "Access to the version configuration was denied. Contact support or retry later."
+        VersionVerificationFailureKind.NETWORK -> "Unable to reach the version service. Check your connection and retry."
+        VersionVerificationFailureKind.TIMEOUT -> "The version service timed out. Check your connection and retry."
+        VersionVerificationFailureKind.AUTHENTICATION -> "The version service authentication failed. Retry later."
+        VersionVerificationFailureKind.CONFIGURATION -> "The version service is not configured correctly. Retry later."
+        VersionVerificationFailureKind.NOT_FOUND -> "The version configuration was not found. Retry later."
+        VersionVerificationFailureKind.CANCELLED -> "Version verification was cancelled. Retry when ready."
+        VersionVerificationFailureKind.PARSING -> "Version configuration is invalid. Retry later."
+        VersionVerificationFailureKind.UNEXPECTED -> "Version verification failed unexpectedly. Retry later."
+    }
+    return VersionVerificationFailure(
+        kind, message,
+        kind == VersionVerificationFailureKind.NETWORK || kind == VersionVerificationFailureKind.TIMEOUT,
+        firebaseError?.code?.name, error.javaClass.simpleName, rootCause.javaClass.simpleName
+    )
 }
 
 sealed class ApkDownloadState {
@@ -127,6 +190,8 @@ class VersionControlManager private constructor(private val context: Context) {
     fun checkForUpdates() {
         if (activeCheckJob?.isActive == true) return
         activeCheckJob = scope.launch {
+            val startedAt = SystemClock.elapsedRealtime()
+            logVersionCheck("START", startedAt)
             try {
                 _versionState.value = VersionCheckState.Checking
 
@@ -135,21 +200,19 @@ class VersionControlManager private constructor(private val context: Context) {
                         .document("version_control")
                         .get(Source.SERVER)
                         .await()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to reach Firestore for version control: ${e.message}")
-                    val networkError = e !is FirebaseFirestoreException || e.code in setOf(
-                        FirebaseFirestoreException.Code.UNAVAILABLE,
-                        FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
-                        FirebaseFirestoreException.Code.ABORTED
-                    )
+                    val failure = classifyVersionVerificationFailure(e)
+                    logVersionCheck("FAILED", startedAt, failure)
                     _versionState.value = VersionCheckState.VerificationFailed(
-                        if (networkError) "Unable to reach the version service. Check your connection and retry."
-                        else "Access to the version configuration was denied. Contact support or retry later.",
-                        networkError
+                        failure.userMessage,
+                        failure.isNetworkError
                     )
                     return@launch
                 }
                 if (!snapshot.exists()) {
+                    logVersionCheck("FAILED", startedAt, message = "DOCUMENT_NOT_FOUND")
                     _versionState.value = VersionCheckState.VerificationFailed(
                         "Version configuration is unavailable. Retry later.", false
                     )
@@ -169,6 +232,7 @@ class VersionControlManager private constructor(private val context: Context) {
                             packageName = BuildConfig.APPLICATION_ID
                         )
                     )
+                    logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
                     return@launch
                 }
                 val forceUpdate = snapshot.getBoolean("force_update")
@@ -218,6 +282,7 @@ class VersionControlManager private constructor(private val context: Context) {
                             )
                         )
                     )
+                    logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
                     return@launch
                 }
                 // Release notes (map or strings)
@@ -290,15 +355,39 @@ class VersionControlManager private constructor(private val context: Context) {
                 )
 
                 _versionState.value = evaluateVersionState(currentVersionCode, config)
+                logVersionCheck("SUCCESS", startedAt, message = _versionState.value::class.simpleName ?: "UNKNOWN")
 
+            } catch (e: CancellationException) {
+                logVersionCheck("CANCELLED", startedAt, message = "CancellationException")
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to verify version configuration", e)
+                val failure = classifyVersionVerificationFailure(e)
+                logVersionCheck("FAILED", startedAt, failure)
                 _versionState.value = VersionCheckState.VerificationFailed(
-                    e.message?.let { "Version configuration is invalid: $it" }
-                        ?: "Version configuration could not be verified. Retry later.", false
+                    failure.userMessage,
+                    failure.isNetworkError
                 )
             }
         }
+    }
+
+    private fun logVersionCheck(
+        result: String,
+        startedAt: Long,
+        failure: VersionVerificationFailure? = null,
+        message: String? = null
+    ) {
+        val firebaseProject = runCatching { FirebaseApp.getInstance().options.projectId }.getOrNull() ?: "unknown"
+        val duration = SystemClock.elapsedRealtime() - startedAt
+        Log.i(
+            TAG,
+            "[VERSION_CHECK] result=$result project=$firebaseProject package=${BuildConfig.APPLICATION_ID} " +
+                "path=app_config/version_control source=SERVER durationMs=$duration " +
+                "exception=${failure?.exceptionClass ?: "none"} firebaseCode=${failure?.firebaseCode ?: "none"} " +
+                "rootCause=${failure?.rootCauseClass ?: "none"} installedCode=$currentVersionCode " +
+                "finalState=${message ?: failure?.kind?.name ?: "CHECKING"}"
+        )
     }
 
     /**
