@@ -972,9 +972,10 @@ class PlayerViewModel(
 
                 // Fetch last saved position from database unless a source switch supplied it.
                 val lastSavedPos = try {
-                    if (startPositionOverrideMs != null) startPositionOverrideMs else
-                    AppDatabase.getInstance(getApplication()).playbackHistoryDao()
-                        .getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
+                    startPositionOverrideMs
+                        ?: AppDatabase.getInstance(getApplication()).playbackHistoryDao()
+                            .getHistoryForEpisode(animeId, episode.id)?.positionMs
+                        ?: 0L
                 } catch (e: Exception) { startPositionOverrideMs ?: 0L }
                 if (requestGeneration != playbackGeneration) return
                 _isResolving.value = false

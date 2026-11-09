@@ -5,6 +5,7 @@ import com.example.data.local.EpisodeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.SourceExpiryTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,7 +17,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
-import java.time.Instant
 
 /**
  * Bounded sliding pre-resolve queue.
@@ -172,8 +172,7 @@ class PreResolveQueueManager(
                             !directData.playbackUrl.startsWith("file://")) {
                             continue
                         }
-                        if (!directData.expiresAt.isNullOrBlank() &&
-                            runCatching { Instant.parse(directData.expiresAt).isBefore(Instant.now()) }.getOrDefault(false)) {
+                        if (SourceExpiryTime.isExpired(directData.expiresAt)) {
                             continue
                         }
                         if (directData.sourceId != source.id) continue

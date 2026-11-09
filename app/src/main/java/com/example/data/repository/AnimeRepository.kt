@@ -40,7 +40,6 @@ import android.util.Log
 import android.util.LruCache
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
-import java.time.Instant
 
 class AnimeRepository(
     private val database: AppDatabase,
@@ -1190,8 +1189,7 @@ class AnimeRepository(
     }
 
     private fun isExpired(expiresAt: String?): Boolean {
-        if (expiresAt.isNullOrBlank()) return false
-        return runCatching { Instant.parse(expiresAt).isBefore(Instant.now()) }.getOrDefault(false)
+        return SourceExpiryTime.isExpired(expiresAt)
     }
 
     // Watchlist methods

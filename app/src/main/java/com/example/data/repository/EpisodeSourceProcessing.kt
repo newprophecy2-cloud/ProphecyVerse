@@ -3,7 +3,43 @@ package com.example.data.repository
 import com.example.data.local.EpisodeEntry
 import com.example.data.local.SeasonEntry
 import com.example.data.remote.ProphecySourceDto
-import java.time.Instant
+import java.text.ParsePosition
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+
+/** Parses API ISO-8601 expiry values without requiring API-26 java.time on minSdk 24. */
+object SourceExpiryTime {
+    private val fractionalZonePattern = Regex("^(.+T\\d{2}:\\d{2}:\\d{2})\\.(\\d+)(Z|[+-]\\d{2}:?\\d{2})$")
+    private val patterns = listOf(
+        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+        "yyyy-MM-dd'T'HH:mm:ssXXX",
+        "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+        "yyyy-MM-dd'T'HH:mm:ssX"
+    )
+
+    fun parseEpochMillis(value: String?): Long? {
+        val source = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        val normalized = fractionalZonePattern.matchEntire(source)?.let { match ->
+            val millis = match.groupValues[2].padEnd(3, '0').take(3)
+            "${match.groupValues[1]}.$millis${match.groupValues[3]}"
+        } ?: source
+
+        for (pattern in patterns) {
+            val formatter = SimpleDateFormat(pattern, Locale.US).apply {
+                isLenient = false
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            val position = ParsePosition(0)
+            val parsed = formatter.parse(normalized, position)
+            if (parsed != null && position.index == normalized.length) return parsed.time
+        }
+        return null
+    }
+
+    fun isExpired(value: String?, nowMs: Long = System.currentTimeMillis()): Boolean =
+        parseEpochMillis(value)?.let { it <= nowMs } ?: false
+}
 
 /** States supported by the API response and local freshness information. */
 enum class EpisodeSourceResponseState {
@@ -45,8 +81,7 @@ object EpisodeSourceCachePolicy {
     ): List<ProphecySourceDto> {
         val candidates = if (authoritativeComplete) incomingCandidates else existingCandidates + incomingCandidates
         return candidates.filterNot { candidate ->
-            val expiry = candidate.expiresAt?.takeIf(String::isNotBlank)
-                ?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
+            val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
             expiry != null && expiry <= nowMs
         }.distinct()
     }
@@ -57,8 +92,7 @@ object EpisodeSourceCachePolicy {
         nowMs: Long
     ): AnimeRepository.EpisodeSourceSnapshot {
         val unexpired = snapshot.sources.filterNot { candidate ->
-            val expiry = candidate.expiresAt?.takeIf(String::isNotBlank)
-                ?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
+            val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
             expiry != null && expiry <= nowMs
         }
         return snapshot.copy(
@@ -84,8 +118,7 @@ object EpisodeSourceAggregator {
     ): EpisodeSourceAggregationResult {
         val raw = apiCandidates.orEmpty()
         val nonExpired = raw.filterNot { candidate ->
-            val expiry = candidate.expiresAt?.takeIf(String::isNotBlank)
-                ?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
+            val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
             expiry != null && expiry <= nowMs
         }
         val candidates = nonExpired.distinct()

@@ -16,6 +16,7 @@ import com.example.data.repository.EpisodeSourceCachePolicy
 import com.example.data.repository.EpisodeSourceRetryBackoff
 import com.example.data.repository.EpisodeSourceAggregator
 import com.example.data.repository.EpisodeSourceResponseState
+import com.example.data.repository.SourceExpiryTime
 import com.squareup.moshi.JsonDataException
 import com.squareup.moshi.Moshi
 import org.junit.Assert.assertEquals
@@ -118,6 +119,19 @@ class SourceCacheAndQuotaGuardTest {
         assertEquals(listOf("future", "unknown-expiry"), result.sources.map { it.id })
         assertEquals(1, result.expiredCandidateCount)
         assertEquals(EpisodeSourceResponseState.AVAILABLE, result.state)
+    }
+
+    @Test
+    fun expiryParserSupportsFractionalSecondsAndTimezoneOffsetsOnMinSdk24() {
+        assertEquals(
+            now + 123L,
+            SourceExpiryTime.parseEpochMillis("2026-11-09T00:00:00.123456789Z")
+        )
+        assertEquals(
+            now,
+            SourceExpiryTime.parseEpochMillis("2026-11-09T01:00:00+01:00")
+        )
+        assertEquals(null, SourceExpiryTime.parseEpochMillis("not-a-date"))
     }
 
     @Test
