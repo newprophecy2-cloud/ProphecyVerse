@@ -3,9 +3,9 @@
 **Repository:** `https://github.com/newprophecy2-cloud/ProphecyVerse`  
 **Branch:** `apk-v3`  
 **Starting commit:** `dc3a9af394f659f1fbedb1393f03e0280af9111e`  
-**Final commit:** `dc3a9af394f659f1fbedb1393f03e0280af9111e` (changes remain uncommitted)  
+**Built-source commit:** `6da870a230b3ad65c1eabd3d1baf5dea39b804eb`
 **Starting working tree:** clean  
-**Final working tree:** modified, not committed; only the files listed below changed.  
+**Working tree at build:** clean after the implementation commit was pushed.
 **Package/version:** `com.aistudio.prophecyverse.vykqtb`, `3.0.1` / version code `6` (unchanged).
 
 This report distinguishes source-inspection findings from executed checks. No production Firebase data, deployed Firestore rules, backend repository, credentials, or provider services were changed or accessed.
@@ -54,10 +54,18 @@ Media3's playback path already applies resolved headers to its HTTP data source.
 
 **Not tested:**
 
-- Android compilation, all JVM/Robolectric tests (including the new route test), instrumentation tests, APK build/install/signature verification, Firestore Emulator rules tests, migration tests, device backup/restore, real playback/provider fallback, download progress/control/persistence/offline tests, and notifications.
+- All JVM/Robolectric tests (including the new route test), instrumentation tests, APK device installation, local `apksigner` verification, Firestore Emulator rules tests, migration tests, device backup/restore, real playback/provider fallback, download progress/control/persistence/offline tests, and notifications. GitHub Actions did successfully assemble and upload the debug APK, as described below.
+
+## GitHub Actions APK build
+
+- Workflow: `Build Android APK`; run [42623060999](https://github.com/newprophecy2-cloud/ProphecyVerse/actions/runs/42623060999), on branch `apk-v3`, commit `6da870a230b3ad65c1eabd3d1baf5dea39b804eb`.
+- Result: **success**. Set up JDK 21, installed Android SDK platform 36/build tools 36.0.0, `:app:assembleDebug`, and artifact upload all passed.
+- Downloaded artifact: `app-debug.apk`, 38,336,827 bytes. SHA-256: `d2fd6f9a5e2e93942e7611e5eb7fe195426a78f0f42ad7b7f5cf9489bb98d147`.
+- Build type/signing: **debug APK**, using the repository's configured debug signing key; this is not a production release-signed APK and is not guaranteed to update an installed release-signed app.
+- The workflow builds the debug variant only; it did not run JVM tests or install the APK on a device. The successful assembly is verified, but local `apksigner` signature verification and device installation were not available.
 
 ## Changed files
 
 `README.md`; `app/src/main/java/com/example/MainActivity.kt`; `app/src/main/java/com/example/data/download/DownloadManager.kt`; `app/src/main/java/com/example/data/firebase/CloudHistoryRepository.kt`; `app/src/main/java/com/example/ui/navigation/Screen.kt`; `app/src/main/java/com/example/ui/screens/DetailScreen.kt`; `app/src/main/java/com/example/ui/viewmodels/ViewModels.kt`; `app/src/main/res/xml/backup_rules.xml`; `app/src/main/res/xml/data_extraction_rules.xml`; `app/src/test/java/com/example/V3CriticalBugFixesTest.kt`; `firestore.rules`.
 
-No commit was created. The release APK deliverable is blocked by the missing Android SDK/API 36 and release signing materials; no APK artifact or SHA-256 is claimed.
+The implementation was committed and pushed on `apk-v3` to enable this GitHub Actions build. A debug APK and its SHA-256 are available as stated above. A production release APK remains unavailable because no authorized release-signing key/credentials were established; no release APK or release certificate fingerprint is claimed.
