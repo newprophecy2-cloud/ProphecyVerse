@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import com.example.BuildConfig
+import com.example.data.firebase.FirestoreRequestGuard
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import kotlinx.coroutines.CoroutineScope
@@ -87,6 +88,14 @@ class NoticeManager private constructor(private val context: Context) {
 
     private fun startNoticeListener() {
         if (listenerRegistration != null) return
+        val cooldownRemaining = FirestoreRequestGuard.cooldownRemainingMs()
+        if (cooldownRemaining > 0L) {
+            _noticeContent.value = _noticeContent.value.copy(
+                isLoading = false,
+                errorMessage = "Firestore quota cooldown is active; previously loaded notices remain available. Retry later."
+            )
+            return
+        }
         _noticeContent.value = _noticeContent.value.copy(isLoading = true, errorMessage = null)
         try {
             // Admin Firestore rules permit ordinary clients to read published notices.
@@ -96,17 +105,20 @@ class NoticeManager private constructor(private val context: Context) {
                 .whereEqualTo("published", true)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
-                        Log.e(TAG, "Failed to listen for published notices", error)
+                        val category = FirestoreRequestGuard.recordListenerFailure(error)
+                        Log.e(TAG, "Failed to listen for published notices ($category)", error)
+                        listenerRegistration?.remove()
+                        listenerRegistration = null
                         _noticeContent.value = _noticeContent.value.copy(
                             isLoading = false,
-                            errorMessage = "Unable to load published notices. Check your connection or access and retry."
+                            errorMessage = "Unable to load published notices ($category). Previously loaded notices are retained; retry when the service is available."
                         )
                         return@addSnapshotListener
                     }
                     if (snapshot == null) {
                         _noticeContent.value = _noticeContent.value.copy(
                             isLoading = false,
-                            errorMessage = "The notices response was empty. Please retry."
+                            errorMessage = "No notice snapshot was received. Previously loaded notices are retained; retry."
                         )
                         return@addSnapshotListener
                     }
@@ -129,10 +141,11 @@ class NoticeManager private constructor(private val context: Context) {
                     }
                 }
         } catch (e: Exception) {
+            val category = FirestoreRequestGuard.recordListenerFailure(e)
             Log.e(TAG, "Unable to attach notice listener", e)
             _noticeContent.value = _noticeContent.value.copy(
                 isLoading = false,
-                errorMessage = "Unable to connect to published notices. Please retry."
+                errorMessage = "Unable to connect to published notices ($category). Retry when the service is available."
             )
         }
     }

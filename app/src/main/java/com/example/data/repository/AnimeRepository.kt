@@ -7,6 +7,8 @@ import com.example.data.local.AppDatabase
 import com.example.data.local.CatalogMapping
 import com.example.data.local.EpisodeDao
 import com.example.data.local.EpisodeEntry
+import com.example.data.local.EpisodeSourceCandidateRecord
+import com.example.data.local.EpisodeSourceSnapshotRecord
 import com.example.data.local.PlaybackHistory
 import com.example.data.local.PlaybackHistoryDao
 import com.example.data.local.SearchDao
@@ -27,12 +29,14 @@ import com.example.data.remote.ProphecySeasonDto
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.remote.ProphecyVerseApiService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import android.util.Log
 import android.util.LruCache
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
@@ -49,28 +53,31 @@ class AnimeRepository(
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
 
-    enum class SourceResponseState { AVAILABLE, EMPTY, PARTIAL, FAILED, UNKNOWN }
-
     data class EpisodeSourceSnapshot(
         val sources: List<ProphecySourceDto>,
-        val state: SourceResponseState,
+        val state: EpisodeSourceResponseState,
         val backendStatus: String? = null,
         val errorMessage: String? = null,
         val fetchedAtMs: Long,
+        val seasonNumber: Int? = null,
+        val episodeNumber: Int? = null,
         val apiCandidateCount: Int = sources.size,
+        val parsedCandidateCount: Int = apiCandidateCount,
         val expiredCandidateCount: Int = 0,
         val exactDuplicateCount: Int = 0
     ) {
         val isStale: Boolean
-            get() = System.currentTimeMillis() - fetchedAtMs > 2 * 60 * 1000L
+            get() = state == EpisodeSourceResponseState.STALE ||
+                System.currentTimeMillis() - fetchedAtMs > 2 * 60 * 1000L
     }
 
     private data class SourceCacheEntry(val snapshot: EpisodeSourceSnapshot)
 
-    // Transient in-memory cache for source candidates during the active episode session.
-    // Strictly NOT persisted in Room or logs. The cache identity includes both catalog and episode.
+    // Short-lived memory tier; Room is the bounded persistent metadata tier.
     private val memorySourcesCache = LinkedHashMap<String, SourceCacheEntry>(16, 0.75f, true)
     private val sourceCacheMutex = Mutex()
+    private data class SourceRetryState(val failures: Int, val retryAtMs: Long)
+    private val sourceRetryStates = LinkedHashMap<String, SourceRetryState>(16, 0.75f, true)
     private val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
     private data class ResolvedCacheEntry(val data: DirectPlayData, val cachedAtMs: Long)
     private val resolvedPlaybackCache = ConcurrentHashMap<String, ResolvedCacheEntry>()
@@ -655,10 +662,14 @@ class AnimeRepository(
             if (backendId != null) {
                 val (detailResp, epResp) = coroutineScope {
                     val detailDeferred = async {
-                        try { prophecyApi.getAnimeDetails(backendId) } catch (_: Exception) { null }
+                        try { prophecyApi.getAnimeDetails(backendId) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
                     }
                     val episodesDeferred = async {
-                        try { prophecyApi.getAnimeEpisodes(backendId) } catch (_: Exception) { null }
+                        try { prophecyApi.getAnimeEpisodes(backendId) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
                     }
                     detailDeferred.await() to episodesDeferred.await()
                 }
@@ -687,7 +698,9 @@ class AnimeRepository(
                     )
                     animeDao.upsertAnime(updatedEntry)
 
-                    episodeSnapshotComplete = body.seasons?.any { !it.episodes.isNullOrEmpty() } == true
+                    // Current responses can explicitly be partial. Unknown completeness is treated
+                    // conservatively so a partial/older response cannot erase cached Episodes.
+                    episodeSnapshotComplete = body.partial == false && body.seasons != null
                     body.seasons?.forEach { s ->
                         val sNum = if (s.number > 0) s.number else 1
                         val seasonKey = "${animeId}_s$sNum"
@@ -717,7 +730,8 @@ class AnimeRepository(
                 }
 
                 if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
-                    episodeSnapshotComplete = true
+                    // This endpoint has no explicit partial/completeness marker, so merge its
+                    // records but never use it alone as authority to delete cached Episodes.
                     val dtoList = epResp.body()!!
                     val seasonsSet = mutableSetOf<Int>()
                     val defaultSeason = seasonsList.firstOrNull()?.seasonNumber ?: 1
@@ -779,8 +793,24 @@ class AnimeRepository(
                     )
                 }
 
-                if (episodeSnapshotComplete && seasonsList.isNotEmpty() && episodesList.isNotEmpty()) {
-                    episodeDao.replaceEpisodeSnapshot(animeId, seasonsList.distinctBy { it.id }, episodesList.distinctBy { it.id })
+                val incomingSnapshot = EpisodeCatalogSnapshot(
+                    seasons = seasonsList.distinctBy { it.id },
+                    episodes = episodesList.distinctBy { it.id }
+                )
+                if (episodeSnapshotComplete) {
+                    episodeDao.replaceEpisodeSnapshot(animeId, incomingSnapshot.seasons, incomingSnapshot.episodes)
+                } else if (incomingSnapshot.seasons.isNotEmpty() || incomingSnapshot.episodes.isNotEmpty()) {
+                    val existingSnapshot = EpisodeCatalogSnapshot(
+                        seasons = episodeDao.getSeasonsForAnime(animeId),
+                        episodes = episodeDao.getEpisodesForAnime(animeId)
+                    )
+                    val mergedSnapshot = EpisodeCatalogSnapshotMerger.merge(
+                        existing = existingSnapshot,
+                        incoming = incomingSnapshot,
+                        authoritative = false
+                    )
+                    episodeDao.upsertSeasons(mergedSnapshot.seasons)
+                    episodeDao.upsertEpisodes(mergedSnapshot.episodes)
                 }
             }
 
@@ -813,20 +843,36 @@ class AnimeRepository(
             }
 
             Result.success(Unit)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
+    /** Read memory/Room metadata immediately; stale candidates are explicitly marked unverified. */
+    suspend fun getCachedEpisodeSourceSnapshot(
+        backendAnimeId: String,
+        episodeId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null
+    ): EpisodeSourceSnapshot? = withContext(Dispatchers.IO) {
+        val cacheKey = sourceCacheKey(backendAnimeId, seasonNumber, episodeId)
+        readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
+    }
+
     /**
-     * Fetches source candidates for an episode.
-     * Route D: GET /api/v1/anime/{anime_id}/episodes/{episode_id}/full
-     * Kept in-memory only; never written to Room.
+     * Fetches source candidates using the existing Episode-level full endpoint. Only non-sensitive
+     * source metadata is cached; resolved playback URLs and headers are never stored here.
      */
     suspend fun fetchEpisodeSources(
         backendAnimeId: String,
-        episodeId: String
-    ): Result<List<ProphecySourceDto>> = fetchEpisodeSourceSnapshot(backendAnimeId, episodeId)
+        episodeId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null
+    ): Result<List<ProphecySourceDto>> = fetchEpisodeSourceSnapshot(
+        backendAnimeId, episodeId, seasonNumber = seasonNumber, episodeNumber = episodeNumber
+    )
         .map { it.sources }
 
     /**
@@ -836,79 +882,269 @@ class AnimeRepository(
     suspend fun fetchEpisodeSourceSnapshot(
         backendAnimeId: String,
         episodeId: String,
-        forceRefresh: Boolean = false
+        forceRefresh: Boolean = false,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null
     ): Result<EpisodeSourceSnapshot> = withContext(Dispatchers.IO) {
-        val cacheKey = "$backendAnimeId::$episodeId"
-        sourceCacheMutex.withLock {
-            val cached = memorySourcesCache[cacheKey]
-            if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.snapshot.fetchedAtMs <= sourceCacheTtlMs) {
-                return@withContext Result.success(cached.snapshot)
-            }
+        val cacheKey = sourceCacheKey(backendAnimeId, seasonNumber, episodeId)
+        val cachedAtStart = readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
+        if (!forceRefresh && cachedAtStart != null && !cachedAtStart.isStale) {
+            return@withContext Result.success(cachedAtStart)
         }
         sourceFetchMutexes.computeIfAbsent(cacheKey) { Mutex() }.withLock {
-            // A second caller may have been waiting while the first request completed.
-            sourceCacheMutex.withLock {
-                val cached = memorySourcesCache[cacheKey]
-                if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.snapshot.fetchedAtMs <= sourceCacheTtlMs) {
-                    return@withContext Result.success(cached.snapshot)
-                }
+            val cached = readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
+            if (!forceRefresh && cached != null && !cached.isStale) {
+                return@withContext Result.success(cached)
+            }
+            val retryRemainingMs = sourceRetryRemainingMs(cacheKey)
+            if (retryRemainingMs > 0L) {
+                val message = "Source retry is delayed by backoff for ${(retryRemainingMs + 999L) / 1000L} seconds."
+                return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
             }
             try {
                 val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
                 if (!response.isSuccessful || response.body() == null) {
-                    return@withContext Result.failure(Exception("Failed to get episode sources: ${response.code()}"))
+                    val retryable = response.code() == 408 || response.code() == 429 || response.code() >= 500 || response.body() == null
+                    val retryRemaining = if (retryable) recordSourceFailure(cacheKey) else 0L
+                    val message = buildString {
+                        append("Episode source request failed with HTTP ${response.code()}.")
+                        if (retryRemaining > 0L) append(" Retry after ${(retryRemaining + 999L) / 1000L} seconds.")
+                    }
+                    return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
                 }
-
                 val body = response.body()!!
-                // Keep candidates with missing IDs in the result for visibility; they are not
-                // eligible for direct playback. Expired entries are excluded from current availability.
-                val apiCandidates = body.sources.orEmpty()
-                val nonExpiredCandidates = apiCandidates
-                    .filterNot { !it.expiresAt.isNullOrBlank() && isExpired(it.expiresAt) }
-                val sources = nonExpiredCandidates.distinct()
-                val rawStatus = body.sourcesStatus?.trim()?.takeIf { it.isNotEmpty() }
-                val status = when {
-                    body.sourcesPartial == true || rawStatus.equals("partial", ignoreCase = true) ||
-                        rawStatus.equals("loading", ignoreCase = true) -> SourceResponseState.PARTIAL
-                    !body.sourceError.isNullOrBlank() || rawStatus.equals("failed", ignoreCase = true) ||
-                        rawStatus.equals("error", ignoreCase = true) || rawStatus.equals("timeout", ignoreCase = true) ->
-                        SourceResponseState.FAILED
-                    sources.isNotEmpty() -> SourceResponseState.AVAILABLE
-                    rawStatus.equals("empty", ignoreCase = true) || rawStatus.equals("no_sources", ignoreCase = true) ->
-                        SourceResponseState.EMPTY
-                    else -> SourceResponseState.UNKNOWN
+                clearSourceFailure(cacheKey)
+                val aggregated = EpisodeSourceAggregator.aggregate(
+                    apiCandidates = body.sources,
+                    rawStatus = body.sourcesStatus,
+                    partial = body.sourcesPartial,
+                    errorMessage = body.sourceError,
+                    nowMs = System.currentTimeMillis()
+                )
+                if (aggregated.sources.isEmpty() && cached != null && aggregated.state in setOf(
+                        EpisodeSourceResponseState.UNKNOWN,
+                        EpisodeSourceResponseState.PARTIAL,
+                        EpisodeSourceResponseState.FAILED,
+                        EpisodeSourceResponseState.TIMEOUT
+                    )) {
+                    val message = aggregated.errorMessage?.takeIf { it.isNotBlank() }
+                        ?: "The response did not confirm an empty source list."
+                    return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
+                }
+                val authoritativeComplete = body.sourcesPartial == false && body.sourceError.isNullOrBlank()
+                val mergedCandidates = EpisodeSourceCachePolicy.mergeRefreshCandidates(
+                    existingCandidates = cached?.sources.orEmpty(),
+                    incomingCandidates = aggregated.sources,
+                    authoritativeComplete = authoritativeComplete,
+                    nowMs = System.currentTimeMillis()
+                )
+                val retainedCachedCandidates = !authoritativeComplete &&
+                    cached?.sources.orEmpty().any { it !in aggregated.sources }
+                val snapshotState = if (retainedCachedCandidates && aggregated.state == EpisodeSourceResponseState.AVAILABLE) {
+                    EpisodeSourceResponseState.UNKNOWN
+                } else {
+                    aggregated.state
+                }
+                val snapshotErrorMessage = if (retainedCachedCandidates) {
+                    listOfNotNull(
+                        aggregated.errorMessage?.takeIf { it.isNotBlank() },
+                        "Older cached candidates were retained because this response did not confirm a complete source list."
+                    ).joinToString(" ")
+                } else {
+                    aggregated.errorMessage
                 }
                 val snapshot = EpisodeSourceSnapshot(
-                    sources = sources,
-                    state = status,
-                    backendStatus = rawStatus,
-                    errorMessage = body.sourceError,
+                    sources = mergedCandidates,
+                    state = snapshotState,
+                    backendStatus = aggregated.backendStatus,
+                    errorMessage = snapshotErrorMessage,
                     fetchedAtMs = System.currentTimeMillis(),
-                    apiCandidateCount = apiCandidates.size,
-                    expiredCandidateCount = apiCandidates.size - nonExpiredCandidates.size,
-                    exactDuplicateCount = nonExpiredCandidates.size - sources.size
+                    seasonNumber = seasonNumber,
+                    episodeNumber = episodeNumber,
+                    apiCandidateCount = aggregated.apiCandidateCount,
+                    parsedCandidateCount = aggregated.parsedCandidateCount,
+                    expiredCandidateCount = aggregated.expiredCandidateCount,
+                    exactDuplicateCount = aggregated.exactDuplicateCount
                 )
-                sourceCacheMutex.withLock {
-                    memorySourcesCache[cacheKey] = SourceCacheEntry(snapshot)
-                    while (memorySourcesCache.size > maxMemorySourceSnapshots) {
-                        val eldestKey = memorySourcesCache.keys.iterator().next()
-                        memorySourcesCache.remove(eldestKey)
-                    }
-                }
+                storeSourceSnapshot(cacheKey, backendAnimeId, episodeId, snapshot)
                 Result.success(snapshot)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                val stale = sourceCacheMutex.withLock { memorySourcesCache[cacheKey]?.snapshot }
-                if (stale != null) {
-                    Result.success(stale.copy(
-                        state = SourceResponseState.UNKNOWN,
-                        errorMessage = "Source refresh failed; cached candidates are stale and not verified current: ${e.message}"
-                    ))
-                } else {
-                    Result.failure(e)
+                val retryRemaining = recordSourceFailure(cacheKey)
+                val message = buildString {
+                    append(if (isTimeoutFailure(e)) "Source refresh timed out." else "Source refresh failed.")
+                    append(" Retry after ${(retryRemaining + 999L) / 1000L} seconds.")
                 }
+                staleSourceFallback(cached, seasonNumber, episodeNumber, message, IllegalStateException(message, e))
             }
         }
     }
+
+    private fun sourceCacheKey(animeId: String, seasonNumber: Int?, episodeId: String): String =
+        EpisodeSourceCacheIdentity.key(animeId, seasonNumber, episodeId)
+
+    private suspend fun readBestCachedSourceSnapshot(
+        cacheKey: String,
+        seasonNumber: Int?,
+        episodeNumber: Int?
+    ): EpisodeSourceSnapshot? {
+        val memory = sourceCacheMutex.withLock { memorySourcesCache[cacheKey]?.snapshot }
+        if (memory != null) {
+            val normalized = refreshCachedExpiry(memory)
+            sourceCacheMutex.withLock { putMemorySourceSnapshot(cacheKey, normalized) }
+            return normalized
+        }
+        return try {
+            val record = episodeDao.getSourceSnapshot(cacheKey) ?: return null
+            val cachedSources = episodeDao.getSourceCandidates(cacheKey).map { row ->
+                ProphecySourceDto(
+                    id = row.sourceId,
+                    label = row.providerLabel,
+                    quality = row.quality,
+                    codec = row.codec,
+                    language = row.audioLanguage,
+                    sizeBytes = row.sizeBytes,
+                    downloadable = row.downloadable,
+                    expiresAt = row.expiresAt
+                )
+            }
+            val state = runCatching { EpisodeSourceResponseState.valueOf(record.state) }
+                .getOrDefault(EpisodeSourceResponseState.UNKNOWN)
+            val stored = EpisodeSourceSnapshot(
+                sources = cachedSources,
+                state = state,
+                backendStatus = record.backendStatus,
+                fetchedAtMs = record.fetchedAtMs,
+                seasonNumber = record.seasonNumber ?: seasonNumber,
+                episodeNumber = record.episodeNumber ?: episodeNumber,
+                apiCandidateCount = record.apiCandidateCount,
+                parsedCandidateCount = record.apiCandidateCount,
+                expiredCandidateCount = record.expiredCandidateCount,
+                exactDuplicateCount = record.exactDuplicateCount
+            )
+            val normalized = refreshCachedExpiry(stored)
+            sourceCacheMutex.withLock { putMemorySourceSnapshot(cacheKey, normalized) }
+            normalized
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            Log.w("AnimeRepository", "Could not read cached source metadata; continuing with the API", e)
+            null
+        }
+    }
+
+    private fun refreshCachedExpiry(snapshot: EpisodeSourceSnapshot): EpisodeSourceSnapshot {
+        val unexpired = snapshot.sources.filterNot { !it.expiresAt.isNullOrBlank() && isExpired(it.expiresAt) }
+        val newlyExpired = snapshot.sources.size - unexpired.size
+        val stale = System.currentTimeMillis() - snapshot.fetchedAtMs > sourceCacheTtlMs
+        return snapshot.copy(
+            sources = unexpired,
+            state = if (stale) EpisodeSourceResponseState.STALE else snapshot.state,
+            errorMessage = if (stale && snapshot.errorMessage.isNullOrBlank())
+                "Cached source candidates are stale and have not been verified current." else snapshot.errorMessage,
+            expiredCandidateCount = snapshot.expiredCandidateCount + newlyExpired
+        )
+    }
+
+    private suspend fun staleSourceFallback(
+        cached: EpisodeSourceSnapshot?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        message: String,
+        cause: Throwable? = null
+    ): Result<EpisodeSourceSnapshot> {
+        if (cached != null) {
+            val stale = EpisodeSourceCachePolicy.staleAfterRefreshFailure(
+                snapshot = refreshCachedExpiry(cached),
+                message = "Refresh could not verify the cached candidates. $message",
+                nowMs = System.currentTimeMillis()
+            )
+            return Result.success(stale.copy(seasonNumber = seasonNumber, episodeNumber = episodeNumber))
+        }
+        val failure = cause ?: IllegalStateException(message)
+        return Result.failure(failure)
+    }
+
+    private suspend fun storeSourceSnapshot(
+        cacheKey: String,
+        animeId: String,
+        episodeId: String,
+        snapshot: EpisodeSourceSnapshot
+    ) {
+        sourceCacheMutex.withLock { putMemorySourceSnapshot(cacheKey, snapshot) }
+        try {
+            val record = EpisodeSourceSnapshotRecord(
+                cacheKey = cacheKey,
+                animeId = animeId,
+                seasonNumber = snapshot.seasonNumber,
+                episodeId = episodeId,
+                episodeNumber = snapshot.episodeNumber,
+                state = snapshot.state.name,
+                backendStatus = snapshot.backendStatus,
+                fetchedAtMs = snapshot.fetchedAtMs,
+                apiCandidateCount = snapshot.apiCandidateCount,
+                expiredCandidateCount = snapshot.expiredCandidateCount,
+                exactDuplicateCount = snapshot.exactDuplicateCount
+            )
+            val candidates = snapshot.sources.map { source ->
+                EpisodeSourceCandidateRecord(
+                    candidateKey = candidateCacheKey(cacheKey, source),
+                    cacheKey = cacheKey,
+                    sourceId = source.id,
+                    providerLabel = source.label,
+                    quality = source.quality,
+                    codec = source.codec,
+                    audioLanguage = source.language,
+                    sizeBytes = source.sizeBytes,
+                    downloadable = source.downloadable,
+                    expiresAt = source.expiresAt
+                )
+            }
+            episodeDao.replaceSourceSnapshot(record, candidates, maxMemorySourceSnapshots)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            Log.w("AnimeRepository", "Could not persist safe source metadata; current results remain available", e)
+        }
+    }
+
+    private fun putMemorySourceSnapshot(cacheKey: String, snapshot: EpisodeSourceSnapshot) {
+        memorySourcesCache[cacheKey] = SourceCacheEntry(snapshot)
+        while (memorySourcesCache.size > maxMemorySourceSnapshots) {
+            val eldestKey = memorySourcesCache.keys.iterator().next()
+            memorySourcesCache.remove(eldestKey)
+        }
+    }
+
+    private suspend fun sourceRetryRemainingMs(cacheKey: String): Long = sourceCacheMutex.withLock {
+        ((sourceRetryStates[cacheKey]?.retryAtMs ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
+    }
+
+    private suspend fun recordSourceFailure(cacheKey: String): Long = sourceCacheMutex.withLock {
+        val now = System.currentTimeMillis()
+        val failures = (sourceRetryStates[cacheKey]?.failures ?: 0) + 1
+        val jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(0L, 30_001L)
+        val delayMs = EpisodeSourceRetryBackoff.delayMs(failures, jitter)
+        sourceRetryStates[cacheKey] = SourceRetryState(failures, now + delayMs)
+        while (sourceRetryStates.size > maxMemorySourceSnapshots) {
+            sourceRetryStates.remove(sourceRetryStates.keys.iterator().next())
+        }
+        delayMs
+    }
+
+    private suspend fun clearSourceFailure(cacheKey: String) {
+        sourceCacheMutex.withLock { sourceRetryStates.remove(cacheKey) }
+    }
+
+    private fun candidateCacheKey(cacheKey: String, source: ProphecySourceDto): String {
+        val bytes = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("${cacheKey.length}:$cacheKey:${source.stableIdentity}".toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun isTimeoutFailure(error: Throwable): Boolean =
+        generateSequence(error) { it.cause }.any { it is java.net.SocketTimeoutException }
 
     /**
      * Resolves direct playback URL.

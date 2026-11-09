@@ -621,7 +621,7 @@ fun DetailScreen(
                                                 modifier = Modifier.size(32.dp)
                                             )
                                             Text(
-                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else "No Episodes for Season $selectedSeason",
+                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else "Episode list not confirmed",
                                                 color = TextPrimary,
                                                 fontSize = 15.sp,
                                                 fontWeight = FontWeight.Bold,
@@ -631,7 +631,7 @@ fun DetailScreen(
                                                 text = if (item.backendAnimeId == null) {
                                                     "Playable episodes for \"${item.preferredTitle}\" are not currently available in the streaming provider catalog.\n(Live Action was strictly excluded to prevent incorrect playback)."
                                                 } else {
-                                                    "No episodes were found for Season $selectedSeason. Try refreshing or selecting another season."
+                                                    "Episodes for Season $selectedSeason have not been confirmed. The catalog response may be incomplete or unavailable; retry or select another season."
                                                 },
                                                 color = TextMuted,
                                                 fontSize = 12.sp,
@@ -674,13 +674,15 @@ fun DetailScreen(
                                 },
                                 sourceStateLabel = episodeSourceStates[ep.id]?.let { state ->
                                     when (state) {
-                                        DetailViewModel.EpisodeSourceState.NOT_CHECKED -> null
+                                        DetailViewModel.EpisodeSourceState.NOT_LOADED -> null
                                         DetailViewModel.EpisodeSourceState.LOADING -> "Sources · loading"
                                         DetailViewModel.EpisodeSourceState.AVAILABLE -> "Sources · ready"
                                         DetailViewModel.EpisodeSourceState.EMPTY -> "Sources · none"
                                         DetailViewModel.EpisodeSourceState.PARTIAL -> "Sources · partial"
                                         DetailViewModel.EpisodeSourceState.FAILED -> "Sources · retry"
+                                        DetailViewModel.EpisodeSourceState.TIMEOUT -> "Sources · timed out"
                                         DetailViewModel.EpisodeSourceState.UNKNOWN -> "Sources · unchecked"
+                                        DetailViewModel.EpisodeSourceState.STALE -> "Sources · stale"
                                     }
                                 },
                                 onDownloadClick = {
@@ -782,7 +784,7 @@ fun DetailScreen(
                                 color = TextPrimary
                             )
                             Text(
-                                text = "Select a verified provider source candidate",
+                                text = "Select a source candidate returned for this Episode",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextMuted
                             )
@@ -794,7 +796,7 @@ fun DetailScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    if (isLoadingSources) {
+                    if (isLoadingSources && episodeSources.isEmpty()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -816,6 +818,16 @@ fun DetailScreen(
                             }
                         }
                     } else {
+                        if (isLoadingSources) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Text("Refreshing source candidates…", color = TextMuted, fontSize = 12.sp)
+                            }
+                        }
                         sourceError?.let { message ->
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(
@@ -829,16 +841,20 @@ fun DetailScreen(
                                 }
                             }
                         }
-                        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(episodeSources, key = { it.stableIdentity }) { src ->
-                                SourceCandidateCard(
-                                    source = src,
-                                    onClick = {
-                                        viewModel.closeSourceChooser()
-                                        onPlayEpisode(anime!!.id, ep.id, src.id)
-                                    }
-                                )
+                        if (episodeSources.isNotEmpty()) {
+                            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(episodeSources, key = { it.stableIdentity }) { src ->
+                                    SourceCandidateCard(
+                                        source = src,
+                                        onClick = {
+                                            viewModel.closeSourceChooser()
+                                            onPlayEpisode(anime!!.id, ep.id, src.id)
+                                        }
+                                    )
+                                }
                             }
+                        } else if (!isLoadingSources) {
+                            Text("No source candidates were returned; the API did not confirm that the list is empty.", color = TextMuted, fontSize = 12.sp)
                         }
                     }
                 }
@@ -997,7 +1013,7 @@ fun SourceCandidateCard(
         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = source.id.isNotBlank(), onClick = onClick)
+            .clickable(enabled = source.hasUsableSourceId, onClick = onClick)
     ) {
         Row(
             modifier = Modifier
@@ -1032,7 +1048,7 @@ fun SourceCandidateCard(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 val codecStr = source.codec?.takeIf { it.isNotBlank() } ?: ""
-                val langStr = source.language?.takeIf { it.isNotBlank() } ?: "Unknown language"
+                val langStr = source.displayAudioLanguage
                 val sizeStr = source.sizeBytes?.let { "${it / 1_000_000} MB" }
                 Text(
                     text = listOf(codecStr, langStr, sizeStr, source.downloadable?.let { if (it) "Downloadable" else "Stream only" })
@@ -1044,8 +1060,8 @@ fun SourceCandidateCard(
 
             Icon(
                 imageVector = Icons.Default.PlayArrow,
-                contentDescription = if (source.id.isNotBlank()) "Play with this source" else "Source cannot be played because it has no ID",
-                tint = if (source.id.isNotBlank()) PlayableGreen else TextMuted,
+                contentDescription = if (source.hasUsableSourceId) "Play with this source" else "Source cannot be played because it has no ID",
+                tint = if (source.hasUsableSourceId) PlayableGreen else TextMuted,
                 modifier = Modifier.size(24.dp)
             )
         }

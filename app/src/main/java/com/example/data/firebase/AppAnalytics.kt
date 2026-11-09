@@ -4,13 +4,10 @@ import android.content.Context
 import android.os.Bundle
 import android.util.Log
 import com.google.firebase.analytics.FirebaseAnalytics
-import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import java.util.UUID
 
 class AppAnalytics private constructor(private val context: Context) {
@@ -34,19 +31,20 @@ class AppAnalytics private constructor(private val context: Context) {
                 }
                 firebaseAnalytics.logEvent(eventName, bundle)
 
-                val user = AuthManager.getInstance(context).currentUser
+                val user = AuthManager.getInstance(context).currentUser ?: return@launch
                 val installation = InstallationManager.getInstance(context)
                 val eventDoc = hashMapOf<String, Any>(
                     "event_name" to eventName,
                     "installation_id" to installation.installationId,
-                    "user_id" to (user?.uid ?: "guest_${installation.installationId}"),
+                    "user_id" to user.uid,
                     "timestamp" to System.currentTimeMillis(),
                     "params" to params
                 )
-                firestore.collection("analytics_events")
-                    .document(UUID.randomUUID().toString())
-                    .set(eventDoc)
-                    .await()
+                FirestoreRequestGuard.execute("write analytics event") {
+                    firestore.collection("analytics_events")
+                        .document(UUID.randomUUID().toString())
+                        .set(eventDoc)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to log event $eventName: ${e.message}")
             }
@@ -57,17 +55,13 @@ class AppAnalytics private constructor(private val context: Context) {
         if (secondsWatched <= 0L) return
         scope.launch {
             try {
-                val user = AuthManager.getInstance(context).currentUser
-                InstallationManager.getInstance(context).recordWatchTime(secondsWatched)
-                if (user != null && !user.isAnonymous) {
-                    firestore.collection("users")
-                        .document(user.uid)
-                        .set(
-                            mapOf("total_watch_seconds" to FieldValue.increment(secondsWatched)),
-                            SetOptions.merge()
-                        )
-                        .await()
+                val bundle = Bundle().apply {
+                    putLong("watch_seconds", secondsWatched)
+                    putString("anime_id", animeId)
+                    putString("episode_id", episodeId)
                 }
+                firebaseAnalytics.logEvent("watch_time", bundle)
+                InstallationManager.getInstance(context).recordWatchTime(secondsWatched)
             } catch (e: Exception) {
                 Log.w(TAG, "Error recording watch time: ${e.message}")
             }

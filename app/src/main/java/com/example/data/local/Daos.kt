@@ -114,6 +114,52 @@ interface EpisodeDao {
     @Query("SELECT * FROM episode_entries WHERE id = :episodeId LIMIT 1")
     suspend fun getEpisodeById(episodeId: String): EpisodeEntry?
 
+    @Query("SELECT * FROM episode_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC, episodeNumber ASC, id ASC")
+    suspend fun getEpisodesForAnime(animeId: String): List<EpisodeEntry>
+
+    @Query("SELECT * FROM season_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC")
+    suspend fun getSeasonsForAnime(animeId: String): List<SeasonEntry>
+
+    @Query("SELECT * FROM episode_source_snapshots WHERE cacheKey = :cacheKey LIMIT 1")
+    suspend fun getSourceSnapshot(cacheKey: String): EpisodeSourceSnapshotRecord?
+
+    @Query("SELECT * FROM episode_source_candidates WHERE cacheKey = :cacheKey ORDER BY candidateKey ASC")
+    suspend fun getSourceCandidates(cacheKey: String): List<EpisodeSourceCandidateRecord>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSourceSnapshot(snapshot: EpisodeSourceSnapshotRecord)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSourceCandidates(candidates: List<EpisodeSourceCandidateRecord>)
+
+    @Query("DELETE FROM episode_source_candidates WHERE cacheKey = :cacheKey")
+    suspend fun deleteSourceCandidates(cacheKey: String)
+
+    @Query("SELECT cacheKey FROM episode_source_snapshots ORDER BY fetchedAtMs DESC LIMIT -1 OFFSET :keep")
+    suspend fun sourceSnapshotKeysOverLimit(keep: Int): List<String>
+
+    @Query("DELETE FROM episode_source_candidates WHERE cacheKey IN (:cacheKeys)")
+    suspend fun deleteSourceCandidatesForKeys(cacheKeys: List<String>)
+
+    @Query("DELETE FROM episode_source_snapshots WHERE cacheKey IN (:cacheKeys)")
+    suspend fun deleteSourceSnapshots(cacheKeys: List<String>)
+
+    @Transaction
+    suspend fun replaceSourceSnapshot(
+        snapshot: EpisodeSourceSnapshotRecord,
+        candidates: List<EpisodeSourceCandidateRecord>,
+        keep: Int
+    ) {
+        deleteSourceCandidates(snapshot.cacheKey)
+        upsertSourceSnapshot(snapshot)
+        if (candidates.isNotEmpty()) upsertSourceCandidates(candidates)
+        val evictedKeys = sourceSnapshotKeysOverLimit(keep)
+        if (evictedKeys.isNotEmpty()) {
+            deleteSourceCandidatesForKeys(evictedKeys)
+            deleteSourceSnapshots(evictedKeys)
+        }
+    }
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSeasons(seasons: List<SeasonEntry>)
 

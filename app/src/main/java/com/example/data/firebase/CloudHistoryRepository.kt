@@ -9,14 +9,20 @@ import com.example.data.local.WatchlistEntry
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class CloudHistoryRepository private constructor(private val context: Context) {
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val database: AppDatabase by lazy { AppDatabase.getInstance(context) }
     private val scope = CoroutineScope(Dispatchers.IO)
+    private val pullMutex = Mutex()
+    private val syncPreferences by lazy {
+        context.getSharedPreferences("cloud_history_sync", Context.MODE_PRIVATE)
+    }
 
     fun syncPlaybackProgress(
         animeId: String,
@@ -73,16 +79,20 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                     .document(ownerKey)
                     .collection("episodes")
                     .document(history.id)
-                firestore.runTransaction { transaction ->
-                    val remote = transaction.get(historyRef)
-                    val remoteTimestamp = remote.getLong("last_played_at") ?: Long.MIN_VALUE
-                    if (!remote.exists() || history.lastPlayedAt >= remoteTimestamp) {
-                        val merged = docData.toMutableMap()
-                        merged["completed"] = completed || (remote.getBoolean("completed") == true)
-                        transaction.set(historyRef, merged, SetOptions.merge())
+                FirestoreRequestGuard.execute("sync playback history") {
+                    firestore.runTransaction { transaction ->
+                        val remote = transaction.get(historyRef)
+                        val remoteTimestamp = remote.getLong("last_played_at") ?: Long.MIN_VALUE
+                        if (!remote.exists() || history.lastPlayedAt >= remoteTimestamp) {
+                            val merged = docData.toMutableMap()
+                            merged["completed"] = completed || (remote.getBoolean("completed") == true)
+                            transaction.set(historyRef, merged, SetOptions.merge())
+                        }
+                        null
                     }
-                    null
-                }.await()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 Log.w("CloudHistoryRepository", "Failed to sync progress to cloud: ${e.message}")
             }
@@ -110,12 +120,15 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                     "owner_key" to ownerKey
                 )
 
-                firestore.collection("watchlist")
-                    .document(ownerKey)
-                    .collection("items")
-                    .document(animeId)
-                    .set(docData, SetOptions.merge())
-                    .await()
+                FirestoreRequestGuard.execute("sync watchlist") {
+                    firestore.collection("watchlist")
+                        .document(ownerKey)
+                        .collection("items")
+                        .document(animeId)
+                        .set(docData, SetOptions.merge())
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 Log.w("CloudHistoryRepository", "Failed to sync watchlist to cloud: ${e.message}")
             }
@@ -124,15 +137,20 @@ class CloudHistoryRepository private constructor(private val context: Context) {
 
     fun pullCloudHistoryAndWatchlist() {
         scope.launch {
-            try {
-                val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
-                val ownerKey = currentUser.uid
+            pullMutex.withLock {
+                try {
+                    val currentUser = AuthManager.getInstance(context).currentUser ?: return@withLock
+                    val ownerKey = currentUser.uid
+                    val prefKey = "last_successful_pull_$ownerKey"
+                    val now = System.currentTimeMillis()
+                    if (now - syncPreferences.getLong(prefKey, 0L) < MIN_PULL_INTERVAL_MS) return@withLock
                 // Pull cloud history
-                val historyDocs = firestore.collection("watch_history")
-                    .document(ownerKey)
-                    .collection("episodes")
-                    .get()
-                    .await()
+                val historyDocs = FirestoreRequestGuard.execute("pull playback history") {
+                    firestore.collection("watch_history")
+                        .document(ownerKey)
+                        .collection("episodes")
+                        .get()
+                }
 
                 val cloudHistories = historyDocs.documents.mapNotNull { doc ->
                     val id = doc.getString("id") ?: return@mapNotNull null
@@ -176,11 +194,12 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 }
 
                 // Pull cloud watchlist
-                val watchlistDocs = firestore.collection("watchlist")
-                    .document(ownerKey)
-                    .collection("items")
-                    .get()
-                    .await()
+                val watchlistDocs = FirestoreRequestGuard.execute("pull watchlist") {
+                    firestore.collection("watchlist")
+                        .document(ownerKey)
+                        .collection("items")
+                        .get()
+                }
 
                 val cloudWatchlist = watchlistDocs.documents.mapNotNull { doc ->
                     val animeId = doc.getString("anime_id") ?: return@mapNotNull null
@@ -199,13 +218,18 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 if (cloudWatchlist.isNotEmpty()) {
                     database.watchlistDao().upsertWatchlistEntries(cloudWatchlist)
                 }
-            } catch (e: Exception) {
-                Log.w("CloudHistoryRepository", "Pull cloud history error: ${e.message}")
+                    syncPreferences.edit().putLong(prefKey, System.currentTimeMillis()).apply()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    Log.w("CloudHistoryRepository", "Pull cloud history error: ${e.message}")
+                }
             }
         }
     }
 
     companion object {
+        private const val MIN_PULL_INTERVAL_MS = 5 * 60 * 1000L
         @Volatile
         private var instance: CloudHistoryRepository? = null
 

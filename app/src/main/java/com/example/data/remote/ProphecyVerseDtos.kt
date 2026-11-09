@@ -13,23 +13,36 @@ data class ProphecySearchResponse(
 @JsonClass(generateAdapter = true)
 data class ProphecySearchResultItem(
     @Json(name = "id") val id: String,
+    @Json(name = "canonical_id") val canonicalId: String? = null,
     @Json(name = "title") val title: String,
     @Json(name = "media_type") val mediaType: String? = null,
     @Json(name = "year") val year: String? = null,
     @Json(name = "poster_url") val posterUrl: String? = null,
-    @Json(name = "season_count") val seasonCount: Int? = null
+    @Json(name = "season_count") val seasonCount: Int? = null,
+    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null
+)
+
+/** Anime/Episode catalog mapping only; this is not an Episode source-resolution result. */
+@JsonClass(generateAdapter = true)
+data class ProphecyProviderMappingDto(
+    @Json(name = "id") val id: String? = null,
+    @Json(name = "provider") val provider: String? = null,
+    @Json(name = "value") val value: String? = null
 )
 
 @JsonClass(generateAdapter = true)
 data class ProphecyAnimeDetailsResponse(
     @Json(name = "id") val id: String,
+    @Json(name = "canonical_id") val canonicalId: String? = null,
     @Json(name = "title") val title: String,
     @Json(name = "media_type") val mediaType: String? = null,
     @Json(name = "year") val year: String? = null,
     @Json(name = "description") val description: String? = null,
     @Json(name = "poster_url") val posterUrl: String? = null,
     @Json(name = "genres") val genres: List<String>? = null,
-    @Json(name = "seasons") val seasons: List<ProphecySeasonDto>? = null
+    @Json(name = "seasons") val seasons: List<ProphecySeasonDto>? = null,
+    @Json(name = "partial") val partial: Boolean? = null,
+    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -41,6 +54,8 @@ data class ProphecySeasonDto(
 @JsonClass(generateAdapter = true)
 data class ProphecyEpisodeDto(
     @Json(name = "id") val id: String,
+    @Json(name = "canonical_id") val canonicalId: String? = null,
+    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null,
     @Json(name = "season") val season: Int,
     @Json(name = "number") val number: Int,
     @Json(name = "title") val title: String? = null,
@@ -70,14 +85,23 @@ data class ProphecySourceDto(
     @Json(name = "downloadable") val downloadable: Boolean? = null,
     @Json(name = "expires_at") val expiresAt: String? = null
 ) {
+    val hasUsableSourceId: Boolean
+        get() = id.isNotBlank()
+
     /** Stable key for Compose rows that distinguishes same-ID candidates with different metadata. */
     val stableIdentity: String
         get() = listOf(id, label, quality, codec, language, sizeBytes, downloadable, expiresAt)
-            .joinToString("\u001f") { it?.toString().orEmpty() }
+            .joinToString("") { value ->
+                val part = value?.toString().orEmpty()
+                "${part.length}:$part"
+            }
 
     /** The backend's existing label is the only provider-like display field in this contract. */
     val displayProviderName: String
         get() = label?.takeIf { it.isNotBlank() } ?: "Unknown provider"
+
+    val displayAudioLanguage: String
+        get() = language?.takeIf { it.isNotBlank() } ?: "Unknown"
 }
 
 @JsonClass(generateAdapter = true)

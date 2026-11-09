@@ -12,6 +12,7 @@ import com.example.data.local.WatchlistEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.EpisodeSourceResponseState
 import com.example.data.repository.EpisodeNumberWindow
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
@@ -242,7 +243,7 @@ class DetailViewModel(
     private val _sourceError = MutableStateFlow<String?>(null)
     val sourceError: StateFlow<String?> = _sourceError.asStateFlow()
 
-    enum class EpisodeSourceState { NOT_CHECKED, LOADING, AVAILABLE, EMPTY, PARTIAL, FAILED, UNKNOWN }
+    enum class EpisodeSourceState { NOT_LOADED, LOADING, AVAILABLE, PARTIAL, EMPTY, FAILED, TIMEOUT, UNKNOWN, STALE }
     private val _episodeSourceStates = MutableStateFlow<Map<String, EpisodeSourceState>>(emptyMap())
     val episodeSourceStates: StateFlow<Map<String, EpisodeSourceState>> = _episodeSourceStates.asStateFlow()
     private val automaticSourceSemaphore = Semaphore(2)
@@ -278,7 +279,8 @@ class DetailViewModel(
             }
         }
         viewModelScope.launch {
-            episodes.collect { window -> queueAutomaticSourceDiscovery(window) }
+            combine(animeEntry, episodes, lastPlayed) { anime, window, history -> Triple(anime, window, history) }
+                .collect { (anime, window, history) -> queueAutomaticSourceDiscovery(window, anime, history) }
         }
         refreshDetails()
     }
@@ -330,33 +332,66 @@ class DetailViewModel(
         }
     }
 
-    private fun queueAutomaticSourceDiscovery(window: List<EpisodeEntry>) {
-        val current = animeEntry.value ?: return
+    private fun queueAutomaticSourceDiscovery(
+        window: List<EpisodeEntry>,
+        current: AnimeEntry?,
+        history: PlaybackHistory?
+    ) {
+        current ?: return
         val backendId = current.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
-        if (backendId == null || window.isEmpty()) return
-        val priorityEpisodeId = lastPlayed.value?.episodeId
+        if (backendId == null) {
+            automaticSourceJobs.values.forEach { it.cancel() }
+            automaticSourceJobs.clear()
+            _episodeSourceStates.value = emptyMap()
+            return
+        }
+        val visibleIds = window.map { it.id }.toSet()
+        val selectedId = _selectedEpisodeForSources.value?.id
+        automaticSourceJobs.toMap().forEach { (episodeId, job) ->
+            if (episodeId !in visibleIds && episodeId != selectedId) {
+                job.cancel()
+                _episodeSourceStates.value = _episodeSourceStates.value - episodeId
+            }
+        }
+        _episodeSourceStates.value = _episodeSourceStates.value.filterKeys { it in visibleIds || it == selectedId }
+        if (window.isEmpty()) return
+        val priorityEpisodeId = history?.episodeId
         val ordered = window.sortedWith(compareBy<EpisodeEntry> { if (it.id == priorityEpisodeId) 0 else 1 }
             .thenBy { it.episodeNumber })
         ordered.forEach { episode ->
             val existingState = _episodeSourceStates.value[episode.id]
             if (existingState in setOf(EpisodeSourceState.LOADING, EpisodeSourceState.AVAILABLE,
                     EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL, EpisodeSourceState.FAILED,
-                    EpisodeSourceState.UNKNOWN)) return@forEach
+                    EpisodeSourceState.TIMEOUT, EpisodeSourceState.UNKNOWN, EpisodeSourceState.STALE)) return@forEach
             if (automaticSourceJobs[episode.id]?.isActive == true) return@forEach
             _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
             automaticSourceJobs[episode.id] = viewModelScope.launch {
                 try {
                     automaticSourceSemaphore.withPermit {
-                        val result = repository.fetchEpisodeSourceSnapshot(backendId, episode.id)
+                        val result = repository.fetchEpisodeSourceSnapshot(
+                            backendId,
+                            episode.id,
+                            seasonNumber = episode.seasonNumber,
+                            episodeNumber = episode.episodeNumber
+                        )
                         val state = result.getOrNull()?.state?.let {
                             when (it) {
-                                AnimeRepository.SourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
-                                AnimeRepository.SourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
-                                AnimeRepository.SourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
-                                AnimeRepository.SourceResponseState.FAILED -> EpisodeSourceState.FAILED
-                                AnimeRepository.SourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                                EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+                                EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+                                EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+                                EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
+                                EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
+                                EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                                EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
                             }
-                        } ?: EpisodeSourceState.FAILED
+                        } ?: run {
+                            val error = result.exceptionOrNull()
+                            if (generateSequence(error) { it.cause }.any { it is java.net.SocketTimeoutException }) {
+                                EpisodeSourceState.TIMEOUT
+                            } else {
+                                EpisodeSourceState.FAILED
+                            }
+                        }
                         _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -373,10 +408,12 @@ class DetailViewModel(
 
     fun openSourceChooser(episode: EpisodeEntry, forceRefresh: Boolean = false) {
         if (!forceRefresh && _selectedEpisodeForSources.value?.id == episode.id && _episodeSources.value.isNotEmpty()) return
+        val sameEpisode = _selectedEpisodeForSources.value?.id == episode.id
         val requestGeneration = ++sourceRequestGeneration
         sourceDiscoveryJob?.cancel()
         _selectedEpisodeForSources.value = episode
-        _episodeSources.value = emptyList()
+        // Clear only when changing Episode; retry retains this Episode's candidates during refresh.
+        if (!sameEpisode) _episodeSources.value = emptyList()
         _isLoadingSources.value = false
         _sourceError.value = null
         _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
@@ -398,48 +435,88 @@ class DetailViewModel(
         sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
             try {
+                val cached = repository.getCachedEpisodeSourceSnapshot(
+                    backendId,
+                    episode.id,
+                    seasonNumber = episode.seasonNumber,
+                    episodeNumber = episode.episodeNumber
+                )
+                if (requestGeneration != sourceRequestGeneration) return@launch
+                if (cached != null) {
+                    _episodeSources.value = cached.sources
+                    val cachedState = when (cached.state) {
+                        EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+                        EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+                        EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+                        EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
+                        EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
+                        EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                        EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
+                    }
+                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to cachedState)
+                    if (cached.isStale) _sourceError.value = "Showing cached source candidates; they are stale and not verified current. Refreshing…"
+                }
                 val res = automaticSourceSemaphore.withPermit {
-                    repository.fetchEpisodeSourceSnapshot(backendId, episode.id, forceRefresh)
+                    repository.fetchEpisodeSourceSnapshot(
+                        backendId,
+                        episode.id,
+                        forceRefresh = forceRefresh,
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber
+                    )
                 }
                 if (requestGeneration != sourceRequestGeneration) return@launch
                 val snapshot = res.getOrNull()
                 if (snapshot != null) {
                     _episodeSources.value = snapshot.sources
                     val state = when (snapshot.state) {
-                        AnimeRepository.SourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
-                        AnimeRepository.SourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
-                        AnimeRepository.SourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
-                        AnimeRepository.SourceResponseState.FAILED -> EpisodeSourceState.FAILED
-                        AnimeRepository.SourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                        EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+                        EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+                        EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+                        EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
+                        EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
+                        EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+                        EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
                     }
                     _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
                     if (!snapshot.errorMessage.isNullOrBlank()) {
                         _sourceError.value = snapshot.errorMessage
                     } else if (snapshot.sources.isEmpty()) {
                         _sourceError.value = when (snapshot.state) {
-                            AnimeRepository.SourceResponseState.EMPTY -> "The backend confirmed that no sources are currently available."
-                            AnimeRepository.SourceResponseState.PARTIAL -> "Source lookup is partial; retry to check again."
-                            AnimeRepository.SourceResponseState.FAILED -> snapshot.errorMessage ?: "Source lookup failed. Retry to check again."
+                            EpisodeSourceResponseState.EMPTY -> "The backend confirmed that no sources are currently available."
+                            EpisodeSourceResponseState.PARTIAL -> "Source lookup is partial; retry to check again."
+                            EpisodeSourceResponseState.FAILED -> snapshot.errorMessage ?: "Source lookup failed. Retry to check again."
+                            EpisodeSourceResponseState.TIMEOUT -> snapshot.errorMessage ?: "Source lookup timed out. Retry to check again."
+                            EpisodeSourceResponseState.STALE -> snapshot.errorMessage ?: "Showing stale, unverified source candidates."
                             else -> "The backend returned no source candidates, but did not confirm an empty result. Retry to check again."
                         }
-                    } else if (snapshot.state == AnimeRepository.SourceResponseState.PARTIAL) {
+                    } else if (snapshot.state == EpisodeSourceResponseState.PARTIAL) {
                         _sourceError.value = "Partial source response; available candidates are shown below."
-                    } else if (snapshot.state == AnimeRepository.SourceResponseState.FAILED) {
+                    } else if (snapshot.state == EpisodeSourceResponseState.FAILED ||
+                        snapshot.state == EpisodeSourceResponseState.TIMEOUT ||
+                        snapshot.state == EpisodeSourceResponseState.STALE) {
                         _sourceError.value = snapshot.errorMessage ?: "Some source information may be unavailable."
                     }
                 } else {
-                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
+                    val error = res.exceptionOrNull()
+                    val timedOut = generateSequence(error) { it.cause }.any { it is java.net.SocketTimeoutException }
+                    _episodeSourceStates.value = _episodeSourceStates.value + (
+                        episode.id to if (timedOut) EpisodeSourceState.TIMEOUT else EpisodeSourceState.FAILED
+                    )
                     _sourceError.value = "Failed to load sources: ${res.exceptionOrNull()?.message}"
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
+                val timedOut = generateSequence<Throwable>(error) { it.cause }.any { it is java.net.SocketTimeoutException }
+                _episodeSourceStates.value = _episodeSourceStates.value + (
+                    episode.id to if (timedOut) EpisodeSourceState.TIMEOUT else EpisodeSourceState.FAILED
+                )
                 _sourceError.value = "Failed to load sources: ${error.message}"
             } finally {
                 if (requestGeneration == sourceRequestGeneration) {
                     _isLoadingSources.value = false
-                    queueAutomaticSourceDiscovery(episodes.value)
+                    queueAutomaticSourceDiscovery(episodes.value, animeEntry.value, lastPlayed.value)
                 }
             }
         }
@@ -620,14 +697,18 @@ class PlayerViewModel(
 
         var lastWatchTimeTrackMs = System.currentTimeMillis()
         var lastCloudSyncMs = 0L
+        var lastCloudSyncEpisodeId: String? = null
+        val completedCloudSyncEpisodeIds = mutableSetOf<String>()
 
-        // Auto-save playback position periodically and sync with Firebase Cloud
+        // Save playback locally at the player cadence, but bound cloud writes to one/minute.
         playerManager.onPositionUpdate = { posMs, durMs ->
             val ep = _currentEpisode.value
             if (ep != null && durMs > 0) {
                 val now = System.currentTimeMillis()
                 val deltaSec = (now - lastWatchTimeTrackMs) / 1000
-                if (deltaSec >= 10 && playerManager.isPlaying.value) {
+                if (!playerManager.isPlaying.value) {
+                    lastWatchTimeTrackMs = now
+                } else if (deltaSec >= 60) {
                     com.example.data.firebase.AppAnalytics.getInstance(application).recordWatchTime(
                         deltaSec, animeId, ep.id
                     )
@@ -651,8 +732,11 @@ class PlayerViewModel(
                     )
 
                     // Non-blocking cloud history synchronization
-                    if (now - lastCloudSyncMs > 10000L || isCompleted) {
+                    val firstSyncForEpisode = lastCloudSyncEpisodeId != ep.id
+                    val completionNeedsSync = isCompleted && completedCloudSyncEpisodeIds.add(ep.id)
+                    if (firstSyncForEpisode || now - lastCloudSyncMs >= 60_000L || completionNeedsSync) {
                         lastCloudSyncMs = now
+                        lastCloudSyncEpisodeId = ep.id
                         com.example.data.firebase.CloudHistoryRepository.getInstance(application)
                             .syncPlaybackProgress(
                                 animeId = animeId,
@@ -764,7 +848,9 @@ class PlayerViewModel(
                         onPlaybackFailed = {
                             if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
-                                val freshSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                val freshSources = repository.fetchEpisodeSources(
+                                    backendId, episode.id, episode.seasonNumber, episode.episodeNumber
+                                ).getOrNull() ?: emptyList()
                                 if (requestGeneration == playbackGeneration) {
                                     resolveWithFallback(backendId, episode, freshSources, 0, requestGeneration = requestGeneration)
                                 }
@@ -772,7 +858,9 @@ class PlayerViewModel(
                         },
                         onRetryNeeded = {
                             if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
-                                val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                                val refreshedSources = repository.fetchEpisodeSources(
+                                    backendId, episode.id, episode.seasonNumber, episode.episodeNumber
+                                ).getOrNull() ?: emptyList()
                                 if (requestGeneration == playbackGeneration) {
                                     resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
                                 }
@@ -787,7 +875,9 @@ class PlayerViewModel(
             }
 
             // Route D: Get sources for the selected episode
-            val sourcesRes = repository.fetchEpisodeSources(backendId, episode.id)
+            val sourcesRes = repository.fetchEpisodeSources(
+                backendId, episode.id, episode.seasonNumber, episode.episodeNumber
+            )
             if (requestGeneration != playbackGeneration) return@launch
             if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
                 _resolutionError.value = "No playable sources found for this episode."
@@ -862,6 +952,10 @@ class PlayerViewModel(
         for (i in startIndex until orderedCandidates.size) {
             if (requestGeneration != playbackGeneration) return
             val source = orderedCandidates[i]
+            if (!source.hasUsableSourceId) {
+                lastError = "Source candidate has no usable source ID."
+                continue
+            }
             activeSourceId = source.id
             _activeSource.value = source
 
@@ -910,7 +1004,9 @@ class PlayerViewModel(
                             playbackResolutionJob = viewModelScope.launch {
                             // Link expired (e.g. Google UserContent signed URL expiration):
                             // Request fresh sources and resolve afresh
-                            val refreshedSources = repository.fetchEpisodeSources(backendId, episode.id).getOrNull() ?: emptyList()
+                            val refreshedSources = repository.fetchEpisodeSources(
+                                backendId, episode.id, episode.seasonNumber, episode.episodeNumber
+                            ).getOrNull() ?: emptyList()
                             if (requestGeneration != playbackGeneration) return@launch
                             val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
                             resolveWithFallback(

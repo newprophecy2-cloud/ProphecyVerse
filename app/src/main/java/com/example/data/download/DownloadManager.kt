@@ -188,19 +188,25 @@ class DownloadManager private constructor(private val context: Context) {
                         return@launch
                     }
 
-                    val sourcesRes = repository.fetchEpisodeSources(backendId, episodeId)
+                    val sourcesRes = repository.fetchEpisodeSources(
+                        backendId,
+                        episodeId,
+                        seasonNumber = seasonNumber,
+                        episodeNumber = episodeNumber
+                    )
                     val sources = sourcesRes.getOrNull()
+                    val playableSources = sources.orEmpty().filter { it.hasUsableSourceId }
                     val source = if (!preferredSourceId.isNullOrBlank()) {
-                        sources?.firstOrNull { it.id == preferredSourceId }
+                        playableSources.firstOrNull { it.id == preferredSourceId }
                     } else if (!preferredQuality.isNullOrBlank() || !preferredLanguage.isNullOrBlank()) {
-                        sources?.firstOrNull { s ->
+                        playableSources.firstOrNull { s ->
                             (preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true) &&
                             (preferredLanguage.isNullOrBlank() || s.language?.contains(preferredLanguage, ignoreCase = true) == true)
-                        } ?: sources?.firstOrNull { s ->
+                        } ?: playableSources.firstOrNull { s ->
                             preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true
-                        } ?: sources?.firstOrNull { it.downloadable == true } ?: sources?.firstOrNull()
+                        } ?: playableSources.firstOrNull { it.downloadable == true } ?: playableSources.firstOrNull()
                     } else {
-                        sources?.firstOrNull { it.downloadable == true } ?: sources?.firstOrNull()
+                        playableSources.firstOrNull { it.downloadable == true } ?: playableSources.firstOrNull()
                     }
 
                     if (source == null) {

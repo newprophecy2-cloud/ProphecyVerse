@@ -110,10 +110,19 @@ class AuthManager private constructor(private val context: Context) {
     }
 
     private fun listenToUserProfile(user: FirebaseUser) {
+        val cooldown = FirestoreRequestGuard.cooldownRemainingMs()
+        if (cooldown > 0L) {
+            _authState.value = AuthState.Error("Account profile verification is paused briefly after a Firestore quota limit. Retry after the cooldown.")
+            return
+        }
         val docRef = firestore.collection("users").document(user.uid)
         userDocListener = docRef.addSnapshotListener { snapshot, error ->
             if (error != null) {
-                Log.w(TAG, "Error listening to user profile: ${error.message}")
+                val category = FirestoreRequestGuard.recordListenerFailure(error)
+                Log.w(TAG, "User profile listener failed ($category): ${error.message}")
+                userDocListener?.remove()
+                userDocListener = null
+                _authState.value = AuthState.Error("Unable to verify account profile ($category). Retry when the service is available.")
                 return@addSnapshotListener
             }
 
@@ -148,6 +157,10 @@ class AuthManager private constructor(private val context: Context) {
     }
 
     fun checkDownloadEligibility(): DownloadEligibility {
+        val user = auth.currentUser
+        if (user != null && !user.isAnonymous && _authState.value is AuthState.Error) {
+            return DownloadEligibility.Suspended("Account status could not be verified. Retry after the profile service is available.")
+        }
         return evaluateDownloadEligibility(auth.currentUser, _userProfile.value)
     }
 
@@ -256,14 +269,18 @@ class AuthManager private constructor(private val context: Context) {
                 user.email?.let { data["email"] = it }
 
                 val userDocument = firestore.collection("users").document(user.uid)
-                val existingProfile = userDocument.get().await()
+                val existingProfile = FirestoreRequestGuard.execute("read user profile before sync") {
+                    userDocument.get()
+                }
                 if (!existingProfile.exists()) {
                     // The deployed user rules require safe initial values on create. Do not include
                     // these fields for existing profiles, where owner updates cannot change them.
                     data["status"] = "active"
                     data["download_blocked"] = false
                 }
-                userDocument.set(data, SetOptions.merge()).await()
+                FirestoreRequestGuard.execute("sync user profile") {
+                    userDocument.set(data, SetOptions.merge())
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to sync user profile to Firestore: ${e.message}")
             }

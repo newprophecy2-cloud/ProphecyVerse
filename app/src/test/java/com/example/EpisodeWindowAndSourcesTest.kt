@@ -43,6 +43,10 @@ class EpisodeWindowAndSourcesTest {
         val unique = listOf(sourceA, sourceB, sourceA).distinct()
         assertEquals(2, unique.size)
         assertEquals(2, unique.map { it.stableIdentity }.distinct().size)
+        assertFalse(
+            ProphecySourceDto(id = "s", label = "A\u001fB", quality = "C").stableIdentity ==
+                ProphecySourceDto(id = "s", label = "A", quality = "B\u001fC").stableIdentity
+        )
     }
 
     @Test
@@ -50,7 +54,7 @@ class EpisodeWindowAndSourcesTest {
         val source = ProphecySourceDto(label = "New provider", language = null)
         assertEquals("", source.id)
         assertEquals("New provider", source.displayProviderName)
-        assertFalse(source.id.isNotBlank())
+        assertFalse(source.hasUsableSourceId)
     }
 
     @Test

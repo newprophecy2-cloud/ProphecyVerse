@@ -85,7 +85,7 @@ sealed class VersionCheckState {
 }
 
 internal enum class VersionVerificationFailureKind {
-    PERMISSION, NETWORK, TIMEOUT, AUTHENTICATION, CONFIGURATION,
+    RESOURCE_EXHAUSTED, PERMISSION, UNAVAILABLE, NETWORK, TIMEOUT, AUTHENTICATION, CONFIGURATION,
     NOT_FOUND, CANCELLED, PARSING, UNEXPECTED
 }
 
@@ -103,14 +103,22 @@ internal fun classifyVersionVerificationFailure(error: Throwable): VersionVerifi
     val firebaseError = generateSequence(error) { it.cause }
         .filterIsInstance<FirebaseFirestoreException>()
         .firstOrNull()
+    val guardedFailure = generateSequence(error) { it.cause }
+        .filterIsInstance<FirestoreOperationException>()
+        .firstOrNull()
     val rootCause = generateSequence(error) { it.cause }.last()
     val kind = when {
+        guardedFailure?.category == FirestoreFailureCategory.RESOURCE_EXHAUSTED ||
+            firebaseError?.code == FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED -> VersionVerificationFailureKind.RESOURCE_EXHAUSTED
         firebaseError?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED -> VersionVerificationFailureKind.PERMISSION
         firebaseError?.code == FirebaseFirestoreException.Code.UNAUTHENTICATED -> VersionVerificationFailureKind.AUTHENTICATION
         firebaseError?.code == FirebaseFirestoreException.Code.NOT_FOUND -> VersionVerificationFailureKind.NOT_FOUND
         firebaseError?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION -> VersionVerificationFailureKind.CONFIGURATION
         firebaseError?.code == FirebaseFirestoreException.Code.DEADLINE_EXCEEDED -> VersionVerificationFailureKind.TIMEOUT
-        firebaseError?.code == FirebaseFirestoreException.Code.UNAVAILABLE || firebaseError?.code == FirebaseFirestoreException.Code.ABORTED -> VersionVerificationFailureKind.NETWORK
+        guardedFailure?.category == FirestoreFailureCategory.UNAVAILABLE ||
+            firebaseError?.code == FirebaseFirestoreException.Code.UNAVAILABLE ||
+            firebaseError?.code == FirebaseFirestoreException.Code.ABORTED -> VersionVerificationFailureKind.UNAVAILABLE
+        guardedFailure?.category == FirestoreFailureCategory.NETWORK_ERROR -> VersionVerificationFailureKind.NETWORK
         firebaseError?.code == FirebaseFirestoreException.Code.CANCELLED -> VersionVerificationFailureKind.CANCELLED
         rootCause is SocketTimeoutException -> VersionVerificationFailureKind.TIMEOUT
         rootCause is UnknownHostException || rootCause is ConnectException -> VersionVerificationFailureKind.NETWORK
@@ -122,7 +130,9 @@ internal fun classifyVersionVerificationFailure(error: Throwable): VersionVerifi
         else -> VersionVerificationFailureKind.UNEXPECTED
     }
     val message = when (kind) {
+        VersionVerificationFailureKind.RESOURCE_EXHAUSTED -> "Firestore quota is temporarily exhausted. Local features remain available; retry after the cooldown."
         VersionVerificationFailureKind.PERMISSION -> "Access to the version configuration was denied. Contact support or retry later."
+        VersionVerificationFailureKind.UNAVAILABLE -> "The version service is currently unavailable. Check your connection and retry later."
         VersionVerificationFailureKind.NETWORK -> "Unable to reach the version service. Check your connection and retry."
         VersionVerificationFailureKind.TIMEOUT -> "The version service timed out. Check your connection and retry."
         VersionVerificationFailureKind.AUTHENTICATION -> "The version service authentication failed. Retry later."
@@ -134,7 +144,7 @@ internal fun classifyVersionVerificationFailure(error: Throwable): VersionVerifi
     }
     return VersionVerificationFailure(
         kind, message,
-        kind == VersionVerificationFailureKind.NETWORK || kind == VersionVerificationFailureKind.TIMEOUT,
+        kind == VersionVerificationFailureKind.UNAVAILABLE || kind == VersionVerificationFailureKind.NETWORK || kind == VersionVerificationFailureKind.TIMEOUT,
         firebaseError?.code?.name, error.javaClass.simpleName, rootCause.javaClass.simpleName
     )
 }
@@ -196,10 +206,11 @@ class VersionControlManager private constructor(private val context: Context) {
                 _versionState.value = VersionCheckState.Checking
 
                 val snapshot = try {
-                    firestore.collection("app_config")
-                        .document("version_control")
-                        .get(Source.SERVER)
-                        .await()
+                    FirestoreRequestGuard.execute("read app version configuration") {
+                        firestore.collection("app_config")
+                            .document("version_control")
+                            .get(Source.SERVER)
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {

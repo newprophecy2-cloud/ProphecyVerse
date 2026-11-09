@@ -20,9 +20,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PlaybackHistory::class,
         UserPreference::class,
         DownloadEntry::class,
-        LocalProfile::class
+        LocalProfile::class,
+        EpisodeSourceSnapshotRecord::class,
+        EpisodeSourceCandidateRecord::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -158,6 +160,45 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `episode_source_snapshots` (
+                        `cacheKey` TEXT NOT NULL,
+                        `animeId` TEXT NOT NULL,
+                        `seasonNumber` INTEGER,
+                        `episodeId` TEXT NOT NULL,
+                        `episodeNumber` INTEGER,
+                        `state` TEXT NOT NULL,
+                        `backendStatus` TEXT,
+                        `fetchedAtMs` INTEGER NOT NULL,
+                        `apiCandidateCount` INTEGER NOT NULL,
+                        `expiredCandidateCount` INTEGER NOT NULL,
+                        `exactDuplicateCount` INTEGER NOT NULL,
+                        PRIMARY KEY(`cacheKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_episode_source_snapshots_animeId` ON `episode_source_snapshots` (`animeId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_episode_source_snapshots_fetchedAtMs` ON `episode_source_snapshots` (`fetchedAtMs`)")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `episode_source_candidates` (
+                        `candidateKey` TEXT NOT NULL,
+                        `cacheKey` TEXT NOT NULL,
+                        `sourceId` TEXT NOT NULL,
+                        `providerLabel` TEXT,
+                        `quality` TEXT,
+                        `codec` TEXT,
+                        `audioLanguage` TEXT,
+                        `sizeBytes` INTEGER,
+                        `downloadable` INTEGER,
+                        `expiresAt` TEXT,
+                        PRIMARY KEY(`candidateKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_episode_source_candidates_cacheKey` ON `episode_source_candidates` (`cacheKey`)")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -165,7 +206,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "prophecyverse.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                     .build()
                 INSTANCE = instance
                 instance

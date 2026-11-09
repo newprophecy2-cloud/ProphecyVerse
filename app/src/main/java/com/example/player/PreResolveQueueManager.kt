@@ -130,7 +130,7 @@ class PreResolveQueueManager(
 
                 updateStatusFor(ep.id, ResolutionStatus.RESOLVING)
 
-                val success = preResolveEpisode(backendAnimeId, ep.id)
+                val success = preResolveEpisode(backendAnimeId, ep.id, ep.seasonNumber, ep.episodeNumber)
                 if (success) {
                     updateStatusFor(ep.id, ResolutionStatus.READY)
                 } else {
@@ -140,11 +140,21 @@ class PreResolveQueueManager(
         }
     }
 
-    private suspend fun preResolveEpisode(backendAnimeId: String, episodeId: String): Boolean {
+    private suspend fun preResolveEpisode(
+        backendAnimeId: String,
+        episodeId: String,
+        seasonNumber: Int,
+        episodeNumber: Int
+    ): Boolean {
         return try {
             kotlinx.coroutines.withTimeout(12000L) {
                 // 1. Fetch sources
-                val sourcesRes = repository.fetchEpisodeSources(backendAnimeId, episodeId)
+                val sourcesRes = repository.fetchEpisodeSources(
+                    backendAnimeId,
+                    episodeId,
+                    seasonNumber = seasonNumber,
+                    episodeNumber = episodeNumber
+                )
                 val sources = sourcesRes.getOrNull()
                 if (sources.isNullOrEmpty()) {
                     Log.d(TAG, "No sources found during pre-resolve for ep $episodeId")
@@ -153,6 +163,7 @@ class PreResolveQueueManager(
 
                 // 2. Resolve direct playback for top candidate
                 for (source in sources) {
+                    if (!source.hasUsableSourceId) continue
                     val directRes = repository.resolveDirectPlayback(source.id)
                     val directData = directRes.getOrNull()
                     if (directData != null && !directData.playbackUrl.isNullOrBlank()) {
@@ -179,6 +190,8 @@ class PreResolveQueueManager(
                 }
                 false
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.w(TAG, "Error during pre-resolution for episode $episodeId: ${e.message}")
             false

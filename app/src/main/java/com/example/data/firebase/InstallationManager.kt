@@ -47,7 +47,7 @@ class InstallationManager private constructor(private val context: Context) {
             syncMutex.withLock {
                 prefs.edit().putBoolean(KEY_PENDING_SYNC, true).apply()
                 try {
-                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
+                val ownerUid = auth.currentUser?.uid ?: return@withLock
                 val refreshedToken = try {
                     FirebaseMessaging.getInstance().token.await()
                 } catch (e: Exception) {
@@ -95,11 +95,12 @@ class InstallationManager private constructor(private val context: Context) {
                     docData["fcm_token"] = tokenValue
                 }
 
-                firestore.collection("installations")
-                    .document(registrationDocumentId(ownerUid))
-                    .set(docData, SetOptions.merge())
-                    .await()
-                    prefs.edit().putBoolean(KEY_PENDING_SYNC, false).apply()
+                FirestoreRequestGuard.execute("sync installation") {
+                    firestore.collection("installations")
+                        .document(registrationDocumentId(ownerUid))
+                        .set(docData, SetOptions.merge())
+                }
+                prefs.edit().putBoolean(KEY_PENDING_SYNC, false).apply()
                 } catch (e: Exception) {
                     // Keep the pending marker so the next launch/heartbeat retries the same
                     // stable installation record without creating a second identity.
@@ -118,15 +119,16 @@ class InstallationManager private constructor(private val context: Context) {
     fun recordHeartbeat() {
         scope.launch {
             try {
-                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
+                val ownerUid = auth.currentUser?.uid ?: return@launch
                 val now = System.currentTimeMillis()
                 val cachedCountry = NoticeManager.getInstance(context).detectedCountry.value
                     ?: Locale.getDefault().country.ifBlank { "BD" }
 
-                firestore.collection("installations")
-                    .document(registrationDocumentId(ownerUid))
-                    .set(
-                        mapOf(
+                FirestoreRequestGuard.execute("installation heartbeat") {
+                    firestore.collection("installations")
+                        .document(registrationDocumentId(ownerUid))
+                        .set(
+                            mapOf(
                             "owner_uid" to ownerUid,
                             "installation_id" to installationId,
                             "last_active_at" to now,
@@ -135,9 +137,10 @@ class InstallationManager private constructor(private val context: Context) {
                             "app_version_name" to BuildConfig.VERSION_NAME,
                             "app_version_code" to BuildConfig.VERSION_CODE,
                             "country_code" to cachedCountry.uppercase(),
-                                ),
-                        SetOptions.merge()
-                    ).await()
+                            ),
+                            SetOptions.merge()
+                        )
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Installation heartbeat failed: ${e.message}")
             }
@@ -148,29 +151,21 @@ class InstallationManager private constructor(private val context: Context) {
         if (secondsWatched <= 0L) return
         scope.launch {
             try {
-                val ownerUid = auth.currentUser?.uid ?: "guest_$installationId"
-                firestore.collection("installations")
-                    .document(registrationDocumentId(ownerUid))
-                    .set(
-                        mapOf(
+                val ownerUid = auth.currentUser?.uid ?: return@launch
+                FirestoreRequestGuard.execute("record installation watch time") {
+                    firestore.collection("installations")
+                        .document(registrationDocumentId(ownerUid))
+                        .set(
+                            mapOf(
                             "owner_uid" to ownerUid,
                             "installation_id" to installationId,
                             "total_watch_seconds" to FieldValue.increment(secondsWatched),
                             "last_active_at" to System.currentTimeMillis(),
                             "last_heartbeat_at" to FieldValue.serverTimestamp(),
                             "activity_status" to "active"
-                        ),
-                        SetOptions.merge()
-                    ).await()
-
-                // Also update user's profile watch time
-                if (ownerUid.isNotBlank() && !ownerUid.startsWith("guest_")) {
-                    firestore.collection("users")
-                        .document(ownerUid)
-                        .set(
-                            mapOf("total_watch_seconds" to FieldValue.increment(secondsWatched)),
+                            ),
                             SetOptions.merge()
-                        ).await()
+                        )
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Installation watch-time update failed: ${e.message}")
@@ -181,10 +176,11 @@ class InstallationManager private constructor(private val context: Context) {
     suspend fun deleteCurrentRegistration() {
         val ownerUid = auth.currentUser?.uid ?: return
         try {
-            firestore.collection("installations")
-                .document(registrationDocumentId(ownerUid))
-                .delete()
-                .await()
+            FirestoreRequestGuard.execute("delete installation registration") {
+                firestore.collection("installations")
+                    .document(registrationDocumentId(ownerUid))
+                    .delete()
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Could not remove prior installation registration: ${e.message}")
         }
