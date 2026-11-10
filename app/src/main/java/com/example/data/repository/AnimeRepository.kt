@@ -776,6 +776,7 @@ class AnimeRepository(
                 val seasonsList = mutableListOf<SeasonEntry>()
                 val episodesList = mutableListOf<EpisodeEntry>()
                 var episodeSnapshotComplete = false
+                val sharedRecords = mutableListOf<SharedCatalogMetadata>()
 
                 if (detailResp?.isSuccessful == true && detailResp.body() != null) {
                     val body = detailResp.body()!!
