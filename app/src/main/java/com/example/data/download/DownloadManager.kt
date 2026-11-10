@@ -171,8 +171,10 @@ class DownloadManager private constructor(private val context: Context) {
                     return@launch
                 }
 
-                // Resolve URL if missing or expired
-                var directUrl = existing.downloadUrl
+                // Always resolve a fresh URL for an active download. Signed playback URLs and
+                // their authorization headers are short-lived and must not be reused from a
+                // previous attempt or persisted database row.
+                var directUrl: String? = null
                 var headers: List<List<String>> = emptyList()
 
                 if (directUrl.isNullOrBlank()) {
@@ -234,7 +236,7 @@ class DownloadManager private constructor(private val context: Context) {
                     directUrl = playData.playbackUrl
                     headers = playData.headers
                     existing = existing.copy(
-                        downloadUrl = directUrl,
+                        downloadUrl = null,
                         quality = existing.quality ?: source.quality,
                         audioLanguage = existing.audioLanguage ?: source.language
                     )
@@ -431,11 +433,12 @@ class DownloadManager private constructor(private val context: Context) {
             output.close()
             inputStream.close()
 
-            // Completion: rename temp file to final file
-            if (tempFile.exists()) {
+            // Completion: only publish a non-empty file. A successful HTTP response alone is
+            // not sufficient evidence that a playable media file was downloaded.
+            if (tempFile.exists() && tempFile.length() > 0L) {
                 if (finalFile.exists()) finalFile.delete()
                 val renamed = tempFile.renameTo(finalFile)
-                if (renamed) {
+                if (renamed && finalFile.exists() && finalFile.length() > 0L) {
                     downloadDao.upsertDownload(
                         entry.copy(
                             downloadStatus = "COMPLETED",
@@ -453,6 +456,13 @@ class DownloadManager private constructor(private val context: Context) {
                         )
                     )
                 }
+            } else {
+                downloadDao.upsertDownload(
+                    entry.copy(
+                        downloadStatus = "FAILED",
+                        errorMessage = "Downloaded file is empty or unavailable"
+                    )
+                )
             }
         } finally {
             try { output.close() } catch (_: Exception) {}
