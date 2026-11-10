@@ -66,15 +66,8 @@ jobs:
             ./gradlew --no-daemon --stacktrace :app:assembleRelease
             signing_status="signed with configured release keystore"
           elif [[ "$signing_count" -eq 0 ]]; then
-            # Preserve the checked-in release config; clear signing only for this unsigned CI build.
-            cat > "$RUNNER_TEMP/unsigned-release.gradle" <<'GROOVY'
-          gradle.projectsEvaluated {
-              def app = gradle.rootProject.findProject(':app')
-              def android = app.extensions.findByName('android')
-              android.buildTypes.getByName('release').signingConfig = null
-          }
-          GROOVY
-            ./gradlew --no-daemon --stacktrace --init-script "$RUNNER_TEMP/unsigned-release.gradle" :app:assembleRelease
+            echo "CI_UNSIGNED_RELEASE=true" >> "$GITHUB_ENV"
+            ./gradlew --no-daemon --stacktrace :app:assembleRelease
             signing_status="unsigned release APK (no release signing secrets configured)"
           else
             echo "Release signing secrets are only partially configured; refusing to build with incomplete signing material." >&2
