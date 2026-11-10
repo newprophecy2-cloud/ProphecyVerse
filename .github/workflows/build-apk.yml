@@ -66,7 +66,7 @@ jobs:
             ./gradlew --no-daemon --stacktrace :app:assembleRelease
             signing_status="signed with configured release keystore"
           elif [[ "$signing_count" -eq 0 ]]; then
-            echo "CI_UNSIGNED_RELEASE=true" >> "$GITHUB_ENV"
+            export CI_UNSIGNED_RELEASE=true
             ./gradlew --no-daemon --stacktrace :app:assembleRelease
             signing_status="unsigned release APK (no release signing secrets configured)"
           else
