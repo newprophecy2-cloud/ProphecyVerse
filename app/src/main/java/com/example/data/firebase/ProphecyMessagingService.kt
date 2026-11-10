@@ -82,6 +82,14 @@ class ProphecyMessagingService : FirebaseMessagingService() {
             .setContentIntent(pendingIntent)
             .build()
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "POST_NOTIFICATIONS permission not granted; suppressing notification display")
+            return
+        }
+
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify((System.currentTimeMillis() % 100000).toInt(), notification)
     }

@@ -36,7 +36,7 @@ The app strictly follows **database-first rendering**:
 - **Title & Season Metadata (Route B):** `GET /api/v1/anime/{anime_id}`
 - **Episodes Listing (Route C):** `GET /api/v1/anime/{anime_id}/episodes` (called when not bundled in title details)
 - **Episode Sources (Route D):** `GET /api/v1/anime/{anime_id}/episodes/{episode_id}/full`
-  - Loaded in-memory only upon episode selection; never stored in Room.
+  - Candidate metadata is retained in a bounded Room cache for short-lived offline/UI continuity; signed playback URLs and authorization headers are never persisted.
 - **The One and Only Playback Route (Route E):**
   - `POST /api/v1/play/direct`
   - **Body:** `{"source_id": "<selected_source_id>"}`

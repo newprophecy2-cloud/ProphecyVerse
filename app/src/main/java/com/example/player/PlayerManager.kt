@@ -280,18 +280,6 @@ class PlayerManager(
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .build()
-            .apply {
-                playWhenReady = true
-                volume = 1.0f
-                val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
-                trackSelectionParameters = trackSelectionParameters
-                    .buildUpon()
-                    .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
-                    .build()
-                setMediaItem(mediaItem, startPositionMs)
-                prepare()
-                play()
-            }
 
         _exoPlayerInstance.value = player
         exoPlayer = player
@@ -432,6 +420,18 @@ class PlayerManager(
                 }
             }
         })
+
+        // Configure playback parameters and media item after listeners are registered
+        player.playWhenReady = true
+        player.volume = 1.0f
+        val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
+        player.trackSelectionParameters = player.trackSelectionParameters
+            .buildUpon()
+            .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
+            .build()
+        player.setMediaItem(mediaItem, startPositionMs)
+        player.prepare()
+        player.play()
 
         startPositionTicker()
         return player

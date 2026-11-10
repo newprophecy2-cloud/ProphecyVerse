@@ -236,7 +236,6 @@ class AuthManager private constructor(private val context: Context) {
             try {
                 userDocListener?.remove()
                 userDocListener = null
-                InstallationManager.getInstance(context).deleteCurrentRegistration()
                 auth.signOut()
                 val guest = try {
                     auth.signInAnonymously().await().user

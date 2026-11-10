@@ -38,11 +38,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 class AppViewModelFactory(private val application: Application) {
     val database by lazy { AppDatabase.getInstance(application) }
-    val repository by lazy { AnimeRepository(database) }
+    val repository by lazy { AnimeRepository(database, applicationContext = application) }
 }
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
 
     val trending: StateFlow<List<AnimeEntry>> = repository.observeTrending()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -79,6 +79,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         override fun onAvailable(network: Network) {
             viewModelScope.launch {
                 // When internet connectivity returns, automatically refresh feeds in background
+                repository.processPendingSharedCatalogWrites()
                 repository.refreshHomeDiscovery(force = false)
             }
         }
@@ -88,6 +89,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         try {
             connectivityManager?.registerDefaultNetworkCallback(networkCallback)
         } catch (_: Exception) {}
+        // Resume only the durable pending queue after process restart; no catalog scan is performed.
+        viewModelScope.launch { repository.processPendingSharedCatalogWrites() }
         refreshHome()
     }
 
@@ -123,7 +126,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 }
 
 class SearchViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
@@ -173,6 +176,7 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
                 _error.value = "Network search failed. Showing local results."
             }
             _isSearching.value = false
+            if (res.isSuccess) viewModelScope.launch { repository.syncSearchResults(newQuery) }
         }
     }
 
@@ -189,7 +193,7 @@ class DetailViewModel(
     application: Application,
     val animeId: String
 ) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
 
     val animeEntry: StateFlow<AnimeEntry?> = repository.observeAnimeById(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
@@ -288,17 +292,29 @@ class DetailViewModel(
     fun refreshDetails() {
         if (refreshJob?.isActive == true) return
         refreshJob = viewModelScope.launch {
-            _isLoading.value = true
             _syncError.value = null
-            com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
-                "anime_view",
-                mapOf("anime_id" to animeId)
-            )
-            val result = repository.refreshAnimeDetails(animeId)
-            if (result.isFailure) {
-                _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+            com.example.data.repository.withLoadingFlag({ _isLoading.value = it }) {
+                try {
+                    try {
+                        com.example.data.firebase.AppAnalytics.getInstance(getApplication()).logEvent(
+                            "anime_view",
+                            mapOf("anime_id" to animeId)
+                        )
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Analytics is optional; it must not prevent catalog refresh.
+                    }
+                    val result = repository.refreshAnimeDetails(animeId)
+                    if (result.isFailure) {
+                        _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                }
             }
-            _isLoading.value = false
         }
     }
 
@@ -306,6 +322,7 @@ class DetailViewModel(
         _selectedSeason.value = seasonNumber
         _episodeWindowStart.value = 1
         _episodeWindowSize.value = 30
+        viewModelScope.launch { repository.syncOpenedSeason(animeId, seasonNumber) }
     }
 
     fun loadNextEpisodeWindow() {
@@ -432,6 +449,8 @@ class DetailViewModel(
             return
         }
 
+        // Separate cancellable catalog sync; never make playback source resolution wait on Firestore.
+        viewModelScope.launch { repository.syncOpenedEpisode(animeId, episode) }
         sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
             try {
@@ -565,7 +584,7 @@ class PlayerViewModel(
     val initialEpisodeId: String,
     private val initialPreferredSourceId: String? = null
 ) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
     val playerManager = PlayerManager(application, viewModelScope)
     val preResolveManager = PreResolveQueueManager(repository, viewModelScope)
 
@@ -846,23 +865,39 @@ class PlayerViewModel(
                         directData = prepared.directData,
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = {
-                            if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
+                            if (requestGeneration == playbackGeneration) {
+                                preResolveManager.discardPreparedSource(backendId, episode.id)
+                                repository.invalidateDirectPlayback(prepared.source.id)
+                                playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
                                 val freshSources = repository.fetchEpisodeSources(
-                                    backendId, episode.id, episode.seasonNumber, episode.episodeNumber
+                                    backendId,
+                                    episode.id,
+                                    episode.seasonNumber,
+                                    episode.episodeNumber,
+                                    forceRefresh = true
                                 ).getOrNull() ?: emptyList()
                                 if (requestGeneration == playbackGeneration) {
                                     resolveWithFallback(backendId, episode, freshSources, 0, requestGeneration = requestGeneration)
                                 }
                             }
+                            }
                         },
                         onRetryNeeded = {
-                            if (requestGeneration == playbackGeneration) playbackResolutionJob = viewModelScope.launch {
-                                val refreshedSources = repository.fetchEpisodeSources(
-                                    backendId, episode.id, episode.seasonNumber, episode.episodeNumber
-                                ).getOrNull() ?: emptyList()
-                                if (requestGeneration == playbackGeneration) {
-                                    resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
+                            if (requestGeneration == playbackGeneration) {
+                                preResolveManager.discardPreparedSource(backendId, episode.id)
+                                repository.invalidateDirectPlayback(prepared.source.id)
+                                playbackResolutionJob = viewModelScope.launch {
+                                    val refreshedSources = repository.fetchEpisodeSources(
+                                        backendId,
+                                        episode.id,
+                                        episode.seasonNumber,
+                                        episode.episodeNumber,
+                                        forceRefresh = true
+                                    ).getOrNull() ?: emptyList()
+                                    if (requestGeneration == playbackGeneration) {
+                                        resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
+                                    }
                                 }
                             }
                         }
@@ -985,36 +1020,46 @@ class PlayerViewModel(
                     directData = directData,
                     startPositionMs = lastSavedPos,
                     onPlaybackFailed = {
-                        // Automatically try next source candidate if playback fails
-                        if (requestGeneration == playbackGeneration && i + 1 < orderedCandidates.size) {
-                            _isResolving.value = true
-                            playbackResolutionJob?.cancel()
-                            playbackResolutionJob = viewModelScope.launch {
+                        // Try the next candidate, but always terminate in a user-visible error
+                        // when the final candidate also fails.
+                        if (requestGeneration == playbackGeneration) {
+                            if (i + 1 < orderedCandidates.size) {
                                 _isResolving.value = true
-                                resolveWithFallback(
-                                    backendId, episode, orderedCandidates, i + 1,
-                                    startPositionOverrideMs = lastSavedPos,
-                                    requestGeneration = requestGeneration
-                                )
+                                playbackResolutionJob?.cancel()
+                                playbackResolutionJob = viewModelScope.launch {
+                                    _isResolving.value = true
+                                    resolveWithFallback(
+                                        backendId, episode, orderedCandidates, i + 1,
+                                        startPositionOverrideMs = lastSavedPos,
+                                        requestGeneration = requestGeneration
+                                    )
+                                }
+                            } else {
+                                _resolutionError.value = "All available sources failed to start playback. Select Retry to try source discovery again."
+                                _isResolving.value = false
                             }
                         }
                     },
                     onRetryNeeded = {
                         if (requestGeneration == playbackGeneration) {
+                            repository.invalidateDirectPlayback(source.id)
                             playbackResolutionJob?.cancel()
                             playbackResolutionJob = viewModelScope.launch {
-                            // Link expired (e.g. Google UserContent signed URL expiration):
-                            // Request fresh sources and resolve afresh
-                            val refreshedSources = repository.fetchEpisodeSources(
-                                backendId, episode.id, episode.seasonNumber, episode.episodeNumber
-                            ).getOrNull() ?: emptyList()
-                            if (requestGeneration != playbackGeneration) return@launch
-                            val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
-                            resolveWithFallback(
-                                backendId, episode, newCandidates, 0,
-                                startPositionOverrideMs = lastSavedPos,
-                                requestGeneration = requestGeneration
-                            )
+                                // Refresh both source candidates and the source's resolved URL.
+                                val refreshedSources = repository.fetchEpisodeSources(
+                                    backendId,
+                                    episode.id,
+                                    episode.seasonNumber,
+                                    episode.episodeNumber,
+                                    forceRefresh = true
+                                ).getOrNull() ?: emptyList()
+                                if (requestGeneration != playbackGeneration) return@launch
+                                val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
+                                resolveWithFallback(
+                                    backendId, episode, newCandidates, 0,
+                                    startPositionOverrideMs = lastSavedPos,
+                                    requestGeneration = requestGeneration
+                                )
                             }
                         }
                     }
@@ -1191,7 +1236,7 @@ class PlayerViewModel(
 }
 
 class LibraryViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
 
     val watchlist: StateFlow<List<WatchlistEntry>> = repository.observeWatchlist()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -1247,7 +1292,7 @@ class DownloadsViewModel(application: Application) : AndroidViewModel(applicatio
 }
 
 class ProfileViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = AnimeRepository(AppDatabase.getInstance(application))
+    private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
     private val downloadManager = com.example.data.download.DownloadManager.getInstance(application)
 
     val profile = repository.observeProfile()

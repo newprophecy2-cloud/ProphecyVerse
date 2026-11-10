@@ -303,20 +303,20 @@ fun DownloadManagementBottomSheet(
     var activeBatchSeason by remember(selectedSeason) { mutableIntStateOf(selectedSeason) }
 
     val defaultQualities = remember(availableQualities) {
-        if (availableQualities.isNotEmpty()) availableQualities else listOf("1080p", "720p", "480p", "360p")
+        availableQualities.distinct().filter { it.isNotBlank() }
     }
     var singleQuality by remember(defaultQualities) {
-        mutableStateOf(defaultQualities.firstOrNull() ?: "1080p")
+        mutableStateOf(defaultQualities.firstOrNull())
     }
     var singleLanguage by remember(availableLanguages) {
-        mutableStateOf(availableLanguages.firstOrNull() ?: "Original")
+        mutableStateOf(availableLanguages.firstOrNull())
     }
 
     var batchQuality by remember(defaultQualities) {
-        mutableStateOf(defaultQualities.firstOrNull() ?: "1080p")
+        mutableStateOf(defaultQualities.firstOrNull())
     }
     var batchLanguage by remember(availableLanguages) {
-        mutableStateOf(availableLanguages.firstOrNull() ?: "Original")
+        mutableStateOf(availableLanguages.firstOrNull())
     }
 
     val seasonEps = remember(allEpisodes, activeBatchSeason) {
@@ -554,10 +554,10 @@ private fun CurrentEpisodeDownloadContent(
     download: DownloadEntry?,
     availableQualities: List<String>,
     availableLanguages: List<String>,
-    selectedQuality: String,
-    selectedLanguage: String,
-    onQualityChange: (String) -> Unit,
-    onLanguageChange: (String) -> Unit,
+    selectedQuality: String?,
+    selectedLanguage: String?,
+    onQualityChange: (String?) -> Unit,
+    onLanguageChange: (String?) -> Unit,
     onStartDownload: () -> Unit,
     onPauseDownload: () -> Unit,
     onResumeDownload: () -> Unit,
@@ -864,10 +864,10 @@ private fun BatchDownloadContent(
     onDeselectAll: () -> Unit,
     availableQualities: List<String>,
     availableLanguages: List<String>,
-    selectedQuality: String,
-    selectedLanguage: String,
-    onQualityChange: (String) -> Unit,
-    onLanguageChange: (String) -> Unit,
+    selectedQuality: String?,
+    selectedLanguage: String?,
+    onQualityChange: (String?) -> Unit,
+    onLanguageChange: (String?) -> Unit,
     onStartBatchDownload: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {

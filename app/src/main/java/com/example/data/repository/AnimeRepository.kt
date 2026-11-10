@@ -22,6 +22,8 @@ import com.example.data.remote.AniListGraphQLService
 import com.example.data.remote.AniListMedia
 import com.example.data.remote.AniListQueries
 import com.example.data.remote.DirectPlayData
+import com.example.data.firebase.SharedCatalogMetadata
+import com.example.data.firebase.SharedCatalogRepository
 import com.example.data.remote.DirectPlayRequest
 import com.example.data.remote.NetworkModule
 import com.example.data.remote.ProphecyEpisodeDto
@@ -38,19 +40,58 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import android.util.Log
 import android.util.LruCache
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
+
+/** Map only explicit backend media types; unknown values remain unclassified. */
+internal fun backendMediaCategory(mediaType: String?): String? = when (mediaType?.trim()?.lowercase()) {
+    "anime" -> "ANIME"
+    "movie" -> "MOVIE"
+    "kdrama", "k-drama", "korean_drama" -> "KDRAMA"
+    "series", "web_series", "tv_series" -> "SERIES"
+    else -> null
+}
+
+internal fun preserveMovieMediaCategory(
+    existingCategory: String?,
+    existingFormat: String?,
+    detailMediaType: String?
+): String? {
+    if (existingCategory.equals("MOVIE", ignoreCase = true) || existingFormat.equals("MOVIE", ignoreCase = true)) {
+        return "MOVIE"
+    }
+    return backendMediaCategory(detailMediaType) ?: existingCategory
+}
+
+internal fun isAuthoritativeEpisodeSnapshot(
+    partial: Boolean?,
+    seasons: List<ProphecySeasonDto>?
+): Boolean = partial == false && seasons != null && seasons.all { season ->
+    season.number > 0 && season.episodes.orEmpty().all { episode ->
+        episode.id.isNotBlank() && episode.number > 0
+    }
+}
 
 class AnimeRepository(
     private val database: AppDatabase,
     private val prophecyApi: ProphecyVerseApiService = NetworkModule.prophecyVerseApi,
-    private val aniListApi: AniListGraphQLService = NetworkModule.aniListApi
+    private val aniListApi: AniListGraphQLService = NetworkModule.aniListApi,
+    private val applicationContext: Context? = null
 ) {
     private val animeDao: AnimeDao = database.animeDao()
     private val episodeDao: EpisodeDao = database.episodeDao()
     private val searchDao: SearchDao = database.searchDao()
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
+    private val sharedCatalog = SharedCatalogRepository(database.sharedCatalogDao(), networkAvailable = {
+        val manager = applicationContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val network = manager?.activeNetwork
+        val capabilities = if (manager != null && network != null) manager.getNetworkCapabilities(network) else null
+        capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    })
 
     data class EpisodeSourceSnapshot(
         val sources: List<ProphecySourceDto>,
@@ -90,6 +131,7 @@ class AnimeRepository(
 
     // In-memory query cache to avoid repeating identical searches within 5 minutes
     private val searchCache = LruCache<String, Long>(30)
+    private val searchCatalogResults = ConcurrentHashMap<String, List<com.example.data.remote.ProphecySearchResultItem>>()
 
     // Database observation flows (Database-First)
     fun observeTrending(): Flow<List<AnimeEntry>> = animeDao.observeTrending()
@@ -110,6 +152,51 @@ class AnimeRepository(
     ): Flow<List<EpisodeEntry>> = episodeDao.observeEpisodeWindow(animeId, seasonNumber, firstEpisode, episodeLimit)
     fun observeAllEpisodes(animeId: String): Flow<List<EpisodeEntry>> = episodeDao.observeAllEpisodes(animeId)
     fun observeFirstEpisode(animeId: String): Flow<EpisodeEntry?> = episodeDao.observeFirstEpisode(animeId)
+
+    /** Pending-only recovery hook; it never scans or republishes the catalog. */
+    suspend fun processPendingSharedCatalogWrites(): Int = sharedCatalog.processPendingQueue()
+
+    /** Called from SearchViewModel after local results are visible; capped to 20 DTOs per event. */
+    suspend fun syncSearchResults(query: String) = withContext(Dispatchers.IO) {
+        val key = TitleMatcher.normalize(query)
+        searchCatalogResults[key].orEmpty().asSequence().take(20)
+            .mapNotNull { SharedCatalogMetadata.fromSearch(it) }
+            .forEach { sharedCatalog.acceptBackendMetadata(it) }
+        sharedCatalog.processPendingQueue()
+    }
+
+    /** Called only for an explicit season selection; uses real persisted backend season/episode IDs. */
+    suspend fun syncOpenedSeason(animeId: String, seasonNumber: Int) = withContext(Dispatchers.IO) {
+        if (animeId.isBlank() || seasonNumber <= 0) return@withContext
+        val parent = animeDao.getAnimeById(animeId) ?: return@withContext
+        val backendId = parent.backendAnimeId?.takeIf { it.isNotBlank() } ?:
+            animeId.takeUnless { it.startsWith("anilist_") } ?: return@withContext
+        val season = episodeDao.getSeasonsForAnime(animeId).firstOrNull { it.seasonNumber == seasonNumber }
+            ?: return@withContext
+        SharedCatalogMetadata.fromSeason(
+            backendId, null, ProphecySeasonDto(canonicalId = season.backendSeasonId, number = season.seasonNumber)
+        )?.let { sharedCatalog.acceptBackendMetadata(it) }
+        episodeDao.getEpisodesForAnime(animeId).asSequence()
+            .filter { it.seasonNumber == seasonNumber }.take(19)
+            .map { ep -> ProphecyEpisodeDto(id = ep.id, season = ep.seasonNumber, number = ep.episodeNumber,
+                title = ep.title, overview = ep.overview) }
+            .mapNotNull { SharedCatalogMetadata.fromEpisode(backendId, null, seasonNumber, it) }
+            .forEach { sharedCatalog.acceptBackendMetadata(it) }
+        sharedCatalog.processPendingQueue()
+    }
+
+    /** Called from the explicit episode-open UI event, separately from playback source resolution. */
+    suspend fun syncOpenedEpisode(animeId: String, episode: EpisodeEntry) = withContext(Dispatchers.IO) {
+        if (animeId.isBlank() || episode.id.isBlank() || episode.seasonNumber <= 0 || episode.episodeNumber <= 0) return@withContext
+        val parent = animeDao.getAnimeById(animeId) ?: return@withContext
+        val backendId = parent.backendAnimeId?.takeIf { it.isNotBlank() } ?: animeId.takeUnless { it.startsWith("anilist_") }
+            ?: return@withContext
+        val episodeDto = ProphecyEpisodeDto(id = episode.id, season = episode.seasonNumber,
+            number = episode.episodeNumber, title = episode.title, overview = episode.overview)
+        SharedCatalogMetadata.fromEpisode(backendId, null, episode.seasonNumber, episodeDto)
+            ?.let { sharedCatalog.acceptBackendMetadata(it) }
+        sharedCatalog.processPendingQueue()
+    }
 
     fun observeSearchResults(query: String): Flow<List<AnimeEntry>> {
         val norm = TitleMatcher.normalize(query)
@@ -320,19 +407,21 @@ class AnimeRepository(
                         aliasesToInsert.add(AnimeAlias(animeId = item.id, alias = TitleMatcher.normalize(item.title), originalAlias = item.title))
                     }
 
-                    // Add Movies
-                    movieItems.forEach { item ->
+                    // Add only items explicitly classified as movies by the authoritative backend.
+                    // The search query is free text and must not be treated as a media-type filter.
+                    movieItems.filter { backendMediaCategory(it.mediaType) == "MOVIE" }.forEach { item ->
+                        val existing = animeDao.getAnimeById(item.id)
                         val entry = AnimeEntry(
                             id = item.id,
                             backendAnimeId = item.id,
                             preferredTitle = item.title,
                             titleEnglish = item.title,
-                            format = "MOVIE",
+                            format = item.mediaType ?: "MOVIE",
                             year = item.year,
-                            posterUrl = item.posterUrl,
+                            posterUrl = item.posterUrl ?: existing?.posterUrl,
                             isPlayable = true,
                             mediaCategory = "MOVIE",
-                            genres = "Movie, Action, Animation",
+                            genres = existing?.genres ?: "",
                             updatedAt = System.currentTimeMillis()
                         )
                         entriesToUpsert.add(entry)
@@ -446,6 +535,8 @@ class AnimeRepository(
 
                 // Tier 1: Wait for ProphecyVerse results and display progressively if fast
                 val prophecyItems = prophecyDeferred.await()
+                searchCatalogResults[normQuery] = prophecyItems.take(20)
+                if (searchCatalogResults.size > 20) searchCatalogResults.keys.filter { it != normQuery }.take(5).forEach { searchCatalogResults.remove(it) }
                 if (prophecyItems.isNotEmpty()) {
                     val tier1Entries = mutableListOf<AnimeEntry>()
                     val tier1Aliases = mutableListOf<AnimeAlias>()
@@ -463,6 +554,8 @@ class AnimeRepository(
                             format = pItem.mediaType,
                             year = pItem.year,
                             posterUrl = pItem.posterUrl ?: existing?.posterUrl,
+                            mediaCategory = backendMediaCategory(pItem.mediaType) ?: existing?.mediaCategory ?: "ANIME",
+                            genres = existing?.genres ?: "",
                             isPlayable = true,
                             updatedAt = System.currentTimeMillis()
                         )
@@ -539,6 +632,7 @@ class AnimeRepository(
                         posterUrl = media.coverImage?.large ?: matchedProphecy?.posterUrl ?: existing?.posterUrl,
                         bannerUrl = media.bannerImage ?: existing?.bannerUrl,
                         isPlayable = isPlayable || (existing?.isPlayable == true),
+                        mediaCategory = backendMediaCategory(matchedProphecy?.mediaType) ?: existing?.mediaCategory ?: "ANIME",
                         updatedAt = System.currentTimeMillis()
                     )
                     entriesToUpsert.add(entry)
@@ -566,6 +660,8 @@ class AnimeRepository(
                         format = pItem.mediaType,
                         year = pItem.year,
                         posterUrl = pItem.posterUrl ?: existing?.posterUrl,
+                        mediaCategory = backendMediaCategory(pItem.mediaType) ?: existing?.mediaCategory ?: "ANIME",
+                        genres = existing?.genres ?: "",
                         isPlayable = true,
                         updatedAt = System.currentTimeMillis()
                     )
@@ -625,7 +721,11 @@ class AnimeRepository(
                 for (query in searchQueries) {
                     val searchRes = try {
                         prophecyApi.searchAnime(query = query, limit = 20)
-                    } catch (e: Exception) { null }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
 
                     if (searchRes?.isSuccessful == true) {
                         val pItems = searchRes.body()?.results ?: emptyList()
@@ -692,35 +792,63 @@ class AnimeRepository(
                         year = body.year ?: currentEntry?.year,
                         format = body.mediaType ?: currentEntry?.format,
                         genres = body.genres?.joinToString(", ") ?: currentEntry?.genres ?: "",
+                        mediaCategory = preserveMovieMediaCategory(
+                            existingCategory = currentEntry?.mediaCategory,
+                            existingFormat = currentEntry?.format,
+                            detailMediaType = body.mediaType
+                        ) ?: "ANIME",
                         isPlayable = true,
                         updatedAt = System.currentTimeMillis()
                     )
                     animeDao.upsertAnime(updatedEntry)
-
+                    // Cache/queue only actual backend fields. Movies never produce season/episode rows.
+                    SharedCatalogMetadata.fromDetail(body)?.let(sharedRecords::add)
+                    if (body.mediaType.equals("anime", ignoreCase = true)) {
+                        var catalogCount = 1
+                        for (season in body.seasons.orEmpty()) {
+                            if (catalogCount >= 20) break
+                            SharedCatalogMetadata.fromSeason(backendId, body.canonicalId, season)?.let {
+                                sharedRecords.add(it); catalogCount++
+                            }
+                            for (ep in season.episodes.orEmpty()) {
+                                if (catalogCount >= 20) break
+                                val realSeason = ep.season?.takeIf { it > 0 } ?: season.number
+                                SharedCatalogMetadata.fromEpisode(backendId, body.canonicalId, realSeason, ep)?.let {
+                                    sharedRecords.add(it); catalogCount++
+                                }
+                            }
+                        }
+                        body.genres.orEmpty().asSequence().take((20 - catalogCount).coerceAtLeast(0))
+                            .mapNotNull { SharedCatalogMetadata.fromGenre(it) }
+                            .forEach { sharedRecords.add(it) }
+                    }
                     // Current responses can explicitly be partial. Unknown completeness is treated
                     // conservatively so a partial/older response cannot erase cached Episodes.
-                    episodeSnapshotComplete = body.partial == false && body.seasons != null
+                    episodeSnapshotComplete = isAuthoritativeEpisodeSnapshot(body.partial, body.seasons)
                     body.seasons?.forEach { s ->
-                        val sNum = if (s.number > 0) s.number else 1
+                        if (s.number <= 0) return@forEach
+                        val sNum = s.number
                         val seasonKey = "${animeId}_s$sNum"
                         seasonsList.add(
                             SeasonEntry(
                                 id = seasonKey,
                                 animeId = animeId,
                                 seasonNumber = sNum,
-                                title = "Season $sNum"
+                                backendSeasonId = s.canonicalId,
+                                title = null
                             )
                         )
-                        s.episodes?.forEach { ep ->
-                            // Fallback: If ep.season is 0 or negative, associate with current season sNum
-                            val epSeason = if (ep.season > 0) ep.season else sNum
+                        s.episodes?.forEach episodeLoop@{ ep ->
+                            if (ep.id.isBlank() || ep.number <= 0) return@episodeLoop
+                            // The containing backend season is authoritative when an episode omits its season.
+                            val epSeason = ep.season?.takeIf { it > 0 } ?: sNum
                             episodesList.add(
                                 EpisodeEntry(
                                     id = ep.id,
                                     animeId = animeId,
                                     seasonNumber = epSeason,
                                     episodeNumber = ep.number,
-                                    title = ep.title ?: "Episode ${ep.number}",
+                                    title = ep.title,
                                     overview = ep.overview
                                 )
                             )
@@ -733,16 +861,16 @@ class AnimeRepository(
                     // records but never use it alone as authority to delete cached Episodes.
                     val dtoList = epResp.body()!!
                     val seasonsSet = mutableSetOf<Int>()
-                    val defaultSeason = seasonsList.firstOrNull()?.seasonNumber ?: 1
-                    dtoList.forEach { ep ->
-                        val sNum = if (ep.season > 0) ep.season else defaultSeason
+                    dtoList.forEach episodeLoop@{ ep ->
+                        if (ep.id.isBlank() || ep.season == null || ep.season <= 0 || ep.number <= 0) return@episodeLoop
+                        val sNum = ep.season
                         seasonsSet.add(sNum)
                         val newEp = EpisodeEntry(
                             id = ep.id,
                             animeId = animeId,
                             seasonNumber = sNum,
                             episodeNumber = ep.number,
-                            title = ep.title ?: "Episode ${ep.number}",
+                            title = ep.title,
                             overview = ep.overview
                         )
                         val existingIndex = episodesList.indexOfFirst { it.id == ep.id }
@@ -759,7 +887,7 @@ class AnimeRepository(
                                     id = "${animeId}_s$sNum",
                                     animeId = animeId,
                                     seasonNumber = sNum,
-                                    title = "Season $sNum"
+                                    title = null
                                 )
                             )
                         }
@@ -774,43 +902,22 @@ class AnimeRepository(
                                 id = "${animeId}_s$sNum",
                                 animeId = animeId,
                                 seasonNumber = sNum,
-                                title = "Season $sNum"
+                                title = null
                             )
                         )
                     }
                 }
 
-                // If seasons still empty but episodes exist, add default Season 1
-                if (seasonsList.isEmpty() && episodesList.isNotEmpty()) {
-                    seasonsList.add(
-                        SeasonEntry(
-                            id = "${animeId}_s1",
-                            animeId = animeId,
-                            seasonNumber = 1,
-                            title = "Season 1"
-                        )
-                    )
-                }
-
-                val incomingSnapshot = EpisodeCatalogSnapshot(
-                    seasons = seasonsList.distinctBy { it.id },
-                    episodes = episodesList.distinctBy { it.id }
-                )
+                val incomingSeasons = seasonsList.distinctBy { it.id }
+                val incomingEpisodes = episodesList.distinctBy { it.id }
                 if (episodeSnapshotComplete) {
-                    episodeDao.replaceEpisodeSnapshot(animeId, incomingSnapshot.seasons, incomingSnapshot.episodes)
-                } else if (incomingSnapshot.seasons.isNotEmpty() || incomingSnapshot.episodes.isNotEmpty()) {
-                    val existingSnapshot = EpisodeCatalogSnapshot(
-                        seasons = episodeDao.getSeasonsForAnime(animeId),
-                        episodes = episodeDao.getEpisodesForAnime(animeId)
-                    )
-                    val mergedSnapshot = EpisodeCatalogSnapshotMerger.merge(
-                        existing = existingSnapshot,
-                        incoming = incomingSnapshot,
-                        authoritative = false
-                    )
-                    episodeDao.upsertSeasons(mergedSnapshot.seasons)
-                    episodeDao.upsertEpisodes(mergedSnapshot.episodes)
+                    episodeDao.replaceEpisodeSnapshot(animeId, incomingSeasons, incomingEpisodes)
+                } else if (incomingSeasons.isNotEmpty() || incomingEpisodes.isNotEmpty()) {
+                    episodeDao.mergeEpisodeSnapshot(animeId, incomingSeasons, incomingEpisodes)
                 }
+                // All backend-driven Room writes are committed before optional Firestore traffic.
+                sharedRecords.forEach { sharedCatalog.acceptBackendMetadata(it) }
+                sharedCatalog.processPendingQueue()
             }
 
             // Also enrich metadata via AniList if available
@@ -822,7 +929,11 @@ class AnimeRepository(
                             variables = mapOf("id" to currentEntry.aniListId)
                         )
                     )
-                } catch (e: Exception) { null }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
 
                 if (alResp?.isSuccessful == true && alResp.body()?.data?.media != null) {
                     val m = alResp.body()!!.data!!.media!!
@@ -868,9 +979,14 @@ class AnimeRepository(
         backendAnimeId: String,
         episodeId: String,
         seasonNumber: Int? = null,
-        episodeNumber: Int? = null
+        episodeNumber: Int? = null,
+        forceRefresh: Boolean = false
     ): Result<List<ProphecySourceDto>> = fetchEpisodeSourceSnapshot(
-        backendAnimeId, episodeId, seasonNumber = seasonNumber, episodeNumber = episodeNumber
+        backendAnimeId,
+        episodeId,
+        forceRefresh = forceRefresh,
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber
     )
         .map { it.sources }
 
@@ -1177,10 +1293,17 @@ class AnimeRepository(
             }
             resolvedPlaybackCache[sourceId] = ResolvedCacheEntry(data, System.currentTimeMillis())
             Result.success(data)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Result.failure(e)
         }
         }
+    }
+
+    /** Drop only the in-memory direct response for a source after a playback error. */
+    fun invalidateDirectPlayback(sourceId: String) {
+        if (sourceId.isNotBlank()) resolvedPlaybackCache.remove(sourceId)
     }
 
     private fun isPlayableUrl(url: String): Boolean {

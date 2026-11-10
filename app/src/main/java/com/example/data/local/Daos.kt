@@ -67,7 +67,7 @@ interface AnimeDao {
     suspend fun clearPopularFlags()
 
     @Query("""
-        DELETE FROM anime_entries 
+        DELETE FROM anime_entries
         WHERE id NOT IN (SELECT animeId FROM watchlist_entries)
           AND id NOT IN (SELECT animeId FROM playback_history)
           AND isTrending = 0 AND isSeasonal = 0 AND isPopular = 0
@@ -182,6 +182,34 @@ interface EpisodeDao {
         deleteSeasonsForAnime(animeId)
         upsertSeasons(seasons)
         upsertEpisodes(episodes)
+    }
+
+    /** Merge a partial response and persist season/episode rows in one Room transaction. */
+    @Transaction
+    suspend fun mergeEpisodeSnapshot(
+        animeId: String,
+        incomingSeasons: List<SeasonEntry>,
+        incomingEpisodes: List<EpisodeEntry>
+    ) {
+        val existingSeasons = getSeasonsForAnime(animeId)
+        val existingSeasonsById = existingSeasons.associateBy { it.id }
+        val mergedSeasons = (existingSeasons + incomingSeasons)
+            .associateBy { it.id }
+            .values
+            .map { season ->
+                if (season.backendSeasonId == null) {
+                    season.copy(backendSeasonId = existingSeasonsById[season.id]?.backendSeasonId)
+                } else {
+                    season
+                }
+            }
+            .sortedBy { it.seasonNumber }
+        val mergedEpisodes = (getEpisodesForAnime(animeId) + incomingEpisodes)
+            .associateBy { it.id }
+            .values
+            .sortedWith(compareBy<EpisodeEntry> { it.seasonNumber }.thenBy { it.episodeNumber }.thenBy { it.id })
+        if (mergedSeasons.isNotEmpty()) upsertSeasons(mergedSeasons)
+        if (mergedEpisodes.isNotEmpty()) upsertEpisodes(mergedEpisodes)
     }
 }
 

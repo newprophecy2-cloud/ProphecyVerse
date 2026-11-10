@@ -353,7 +353,7 @@ fun PlayableBadge(isPlayable: Boolean, modifier: Modifier = Modifier) {
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Playable in app",
+                    text = "Available in catalog",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = PlayableGreen

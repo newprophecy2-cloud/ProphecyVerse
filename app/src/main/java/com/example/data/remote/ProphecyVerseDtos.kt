@@ -47,6 +47,7 @@ data class ProphecyAnimeDetailsResponse(
 
 @JsonClass(generateAdapter = true)
 data class ProphecySeasonDto(
+    @Json(name = "canonical_id") val canonicalId: String? = null,
     @Json(name = "number") val number: Int,
     @Json(name = "episodes") val episodes: List<ProphecyEpisodeDto>? = null
 )
@@ -56,7 +57,8 @@ data class ProphecyEpisodeDto(
     @Json(name = "id") val id: String,
     @Json(name = "canonical_id") val canonicalId: String? = null,
     @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null,
-    @Json(name = "season") val season: Int,
+    // Some nested detail responses omit season; the containing season is authoritative there.
+    @Json(name = "season") val season: Int? = null,
     @Json(name = "number") val number: Int,
     @Json(name = "title") val title: String? = null,
     @Json(name = "overview") val overview: String? = null

@@ -8,6 +8,8 @@ import com.example.data.local.SeasonEntry
 import com.example.data.local.EpisodeSourceCandidateRecord
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySourceDto
+import com.example.data.remote.DirectPlayResponse
+import com.example.player.PreResolveQueueManager
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeCatalogSnapshot
 import com.example.data.repository.EpisodeCatalogSnapshotMerger
@@ -208,6 +210,50 @@ class SourceCacheAndQuotaGuardTest {
     }
 
     @Test
+    fun preparedPlaybackExpiresAtBackendExpiryEvenBeforeTheCacheTtl() {
+        val prepared = PreResolveQueueManager.PreparedEpisode(
+            backendAnimeId = "backend-title",
+            episodeId = "episode-1",
+            source = ProphecySourceDto(id = "source-1", label = "Provider"),
+            directData = com.example.data.remote.DirectPlayData(
+                sourceId = "source-1",
+                playbackUrl = "https://example.invalid/stream.m3u8",
+                expiresAt = "2026-11-08T23:59:59Z"
+            ),
+            resolvedAtMs = now - 1_000L
+        )
+        assertTrue(prepared.isExpired(now))
+    }
+
+    @Test
+    fun preparedPlaybackRemainsValidBeforeBothBackendAndLocalExpiry() {
+        val prepared = PreResolveQueueManager.PreparedEpisode(
+            backendAnimeId = "backend-title",
+            episodeId = "episode-1",
+            source = ProphecySourceDto(id = "source-1", label = "Provider"),
+            directData = com.example.data.remote.DirectPlayData(
+                sourceId = "source-1",
+                playbackUrl = "https://example.invalid/stream.m3u8",
+                expiresAt = "2026-11-09T00:01:00Z"
+            ),
+            resolvedAtMs = now - 1_000L
+        )
+        assertFalse(prepared.isExpired(now))
+        assertTrue(prepared.copy(resolvedAtMs = now - PreResolveQueueManager.CACHE_TTL_MS - 1L).isExpired(now))
+    }
+
+    @Test
+    fun directPlayResponseParsingRetainsResolvedSourceAndRequiredHeaders() {
+        val response = Moshi.Builder().build().adapter(DirectPlayResponse::class.java).fromJson(
+            """{"success":true,"data":{"source_id":"source-7","playback_url":"https://example.invalid/v.m3u8","url_type":"direct","requires_headers":true,"headers":[["Referer","https://provider.invalid/"]]},"meta":{"request_id":"req-1"}}"""
+        )!!
+        assertTrue(response.success)
+        assertEquals("source-7", response.data?.sourceId)
+        assertEquals("https://example.invalid/v.m3u8", response.data?.playbackUrl)
+        assertEquals(listOf(listOf("Referer", "https://provider.invalid/")), response.data?.headers)
+    }
+
+    @Test
     fun partialCatalogMergePreservesOmittedRowsAndReplacesMatchingMetadata() {
         val oldSeason = SeasonEntry(id = "anime_s1", animeId = "anime", seasonNumber = 1, title = "Old")
         val oldEpisode = EpisodeEntry(id = "ep-1", animeId = "anime", seasonNumber = 1, episodeNumber = 1, title = "Old title")
@@ -231,6 +277,39 @@ class SourceCacheAndQuotaGuardTest {
         )
         assertEquals(1, complete.episodes.size)
         assertFalse(complete.episodes.any { it.id == "ep-2" })
+    }
+
+    @Test
+    fun emptyPartialMovieSnapshotRetainsRealSeasonOneEpisodeOneIdentity() {
+        val movieId = "backend-movie-id"
+        val episode = EpisodeEntry(
+            id = "backend-episode-id",
+            animeId = movieId,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            title = "Complete Movie"
+        )
+        val existing = EpisodeCatalogSnapshot(
+            seasons = listOf(SeasonEntry(id = "${movieId}_s1", animeId = movieId, seasonNumber = 1)),
+            episodes = listOf(episode)
+        )
+        val partialEmpty = EpisodeCatalogSnapshotMerger.merge(
+            existing = existing,
+            incoming = EpisodeCatalogSnapshot(emptyList(), emptyList()),
+            authoritative = false
+        )
+        assertEquals(listOf("${movieId}_s1"), partialEmpty.seasons.map { it.id })
+        assertEquals(listOf("backend-episode-id"), partialEmpty.episodes.map { it.id })
+        assertEquals(1, partialEmpty.episodes.single().seasonNumber)
+        assertEquals(1, partialEmpty.episodes.single().episodeNumber)
+
+        val authoritativeEmpty = EpisodeCatalogSnapshotMerger.merge(
+            existing = existing,
+            incoming = EpisodeCatalogSnapshot(emptyList(), emptyList()),
+            authoritative = true
+        )
+        assertTrue(authoritativeEmpty.seasons.isEmpty())
+        assertTrue(authoritativeEmpty.episodes.isEmpty())
     }
 
     @Test

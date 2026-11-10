@@ -7,7 +7,7 @@
 - Audited remote baseline: `9265cdd3880068c1524d6bdfe70d891f38bf0308` (working tree clean before edits)
 - Package: `com.aistudio.prophecyverse.vykqtb`
 - Version: `3.0.1` / version code `6` (unchanged)
-- Final commit SHA: reported in the completion message after commit/push.
+- Supplied source archive: non-Git working copy; no commit or push performed.
 
 The forensic baseline findings are in [BASELINE_AUDIT_REPORT.md](BASELINE_AUDIT_REPORT.md). This report is deliberately not a claim that the entire requested shared-cloud architecture has been delivered: several requirements are blocked by absent authorized infrastructure or unavailable API contract information.
 
@@ -41,7 +41,7 @@ This endpoint returns an episode-level candidate response, not a separately call
 - Full JVM unit run: **40 tests completed, 39 passed, 1 failed**. The failure was `Eac3PlaybackAudioTest` during Robolectric setup: it rejected the fetched `org.robolectric:android-all-instrumented:16-robolectric-13921718-i7` POM because its SHA-512 did not match Robolectric's expected digest. This is an artifact-integrity/fetch failure, not an assertion against the changed code. The other 39 completed tests passed.
 - The pre-existing `VersionControlAndAuthTest` used the Firebase exception constructor arguments in the wrong order for the installed SDK; its test-only arguments were corrected so the suite compiles. No production Firebase behavior was changed by that correction.
 - Latest Kotlin main and unit-test sources compiled successfully in the focused Gradle test run.
-- `:app:assembleDebug` **succeeded**. `aapt` verified the APK package/version as `com.aistudio.prophecyverse.vykqtb`, `3.0.1`, code `6`; `apksigner verify` succeeded (debug APK, v2 signature). The artifact was built locally and was not published or distributed.
+- `:app:assembleDebug` and the focused unit tests were **not executable in this sandbox** because no Android SDK is installed/configured. No APK artifact or test pass is claimed for this repair pass.
 - No emulator/device install, live playback, Firebase-permission integration test, or UI/performance benchmark was performed.
 
 ## Not implemented or blocked by existing infrastructure
@@ -52,7 +52,7 @@ The audit found no existing authorized shared catalog collection or trusted meta
 
 ### Persistent cache and background work
 
-Anime/Season/Episode metadata continues to use the existing Room architecture. Source snapshots are only short-lived in-memory cache entries; no Room schema or migration was added for provider/source metadata. No WorkManager synchronization or shared metadata hydration worker was added because there is no authorized shared writer/schema. Existing API refresh behavior still fetches the response shape supported by the backend client; first-page API metadata loading and all-season lazy loading were not established without a documented backend page/index contract.
+Anime/Season/Episode metadata continues to use the existing Room architecture. Source snapshots and candidate metadata use a bounded persistent Room cache added by the v6 migration; signed playback URLs and authorization headers remain in memory only. No WorkManager synchronization or shared metadata hydration worker was added because there is no authorized shared writer/schema. Existing API refresh behavior still fetches the response shape supported by the backend client; first-page API metadata loading and all-season lazy loading were not established without a documented backend page/index contract.
 
 ### Live source contract and complete provider coverage
 
@@ -70,5 +70,7 @@ The behavior is suitable for APK-side candidate discovery using the current clie
 - `app/src/main/java/com/example/ui/screens/DetailScreen.kt` — window navigation, source states/retry, stable list keys, and truthful metadata display.
 - `app/src/test/java/com/example/EpisodeWindowAndSourcesTest.kt` — six new regression tests.
 - `app/src/test/java/com/example/VersionControlAndAuthTest.kt` — correct existing Firebase exception test constructor argument order.
+- `app/src/test/java/com/example/BackendMediaCategoryTest.kt` — omitted nested episode-season parsing regression.
+- `ORIGINAL_ZIP_SHA256.txt` — SHA-256 of the untouched uploaded archive.
 - `BASELINE_AUDIT_REPORT.md` — pre-change forensic audit.
 - `IMPLEMENTATION_REPORT.md` — this execution/verification report.

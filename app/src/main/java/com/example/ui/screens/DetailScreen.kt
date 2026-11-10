@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
@@ -99,6 +100,9 @@ fun DetailScreen(
     onPlayEpisode: (String, String, String?) -> Unit // animeId, episodeId, preferredSourceId
 ) {
     val anime by viewModel.animeEntry.collectAsStateWithLifecycle()
+    val isMovie = anime?.mediaCategory?.equals("MOVIE", ignoreCase = true) == true ||
+            anime?.format?.equals("MOVIE", ignoreCase = true) == true ||
+            anime?.format?.equals("FILM", ignoreCase = true) == true
     val seasons by viewModel.seasons.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val episodes by viewModel.episodes.collectAsStateWithLifecycle()
@@ -302,7 +306,11 @@ fun DetailScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = if (lastPlayed != null) "Resume Ep ${lastPlayed?.episodeNumber}" else "Play Ep 1",
+                                    text = if (isMovie) {
+                                        if (lastPlayed != null) "Resume Movie" else "Play Movie"
+                                    } else {
+                                        if (lastPlayed != null) "Resume Ep ${lastPlayed?.episodeNumber}" else "Play Ep 1"
+                                    },
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White
                                 )
@@ -435,14 +443,18 @@ fun DetailScreen(
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            text = "Continue Watching",
+                                            text = if (isMovie) "Continue Movie" else "Continue Watching",
                                             color = AccentCyan,
                                             fontSize = 12.sp,
                                             fontWeight = FontWeight.Bold
                                         )
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
-                                            text = "Season ${lastPlayed!!.seasonNumber} • Episode ${lastPlayed!!.episodeNumber}${if (!lastPlayed!!.episodeTitle.isNullOrBlank()) ": ${lastPlayed!!.episodeTitle}" else ""}",
+                                            text = if (isMovie) {
+                                                lastPlayed!!.episodeTitle?.takeIf { it.isNotBlank() } ?: item.preferredTitle
+                                            } else {
+                                                "Season ${lastPlayed!!.seasonNumber} • Episode ${lastPlayed!!.episodeNumber}${if (!lastPlayed!!.episodeTitle.isNullOrBlank()) ": ${lastPlayed!!.episodeTitle}" else ""}"
+                                            },
                                             color = TextPrimary,
                                             fontSize = 14.sp,
                                             fontWeight = FontWeight.Bold,
@@ -491,7 +503,7 @@ fun DetailScreen(
 
                     item {
                         Text(
-                            text = "Episodes",
+                            text = if (isMovie) "Movie Playback" else "Episodes",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary,
@@ -499,8 +511,8 @@ fun DetailScreen(
                         )
                     }
 
-                    // Season Chips (always visible when seasons exist, e.g. Season 22 for One Piece)
-                    if (seasons.isNotEmpty()) {
+                    // Season Chips (only visible for series when seasons exist)
+                    if (!isMovie && seasons.isNotEmpty()) {
                         item {
                             LazyRow(
                                 contentPadding = PaddingValues(horizontal = 16.dp),
@@ -525,21 +537,23 @@ fun DetailScreen(
                         }
                     }
 
-                    item {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (episodeWindowStart > 1) {
-                                TextButton(onClick = { viewModel.loadPreviousEpisodeWindow() }) {
-                                    Text("Previous episodes", color = AccentCyan)
+                    if (!isMovie) {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (episodeWindowStart > 1) {
+                                    TextButton(onClick = { viewModel.loadPreviousEpisodeWindow() }) {
+                                        Text("Previous episodes", color = AccentCyan)
+                                    }
+                                } else {
+                                    Spacer(modifier = Modifier.width(1.dp))
                                 }
-                            } else {
-                                Spacer(modifier = Modifier.width(1.dp))
-                            }
-                            TextButton(onClick = { viewModel.loadNextEpisodeWindow() }) {
-                                Text("Next episodes", color = AccentCyan)
+                                TextButton(onClick = { viewModel.loadNextEpisodeWindow() }) {
+                                    Text("Next episodes", color = AccentCyan)
+                                }
                             }
                         }
                     }
@@ -662,6 +676,7 @@ fun DetailScreen(
                             val downloadEntry = downloadsByEpisode[ep.id]
                             EpisodeRow(
                                 episode = ep,
+                                isMovie = isMovie,
                                 isPlayed = lastPlayed?.episodeId == ep.id,
                                 downloadEntry = downloadEntry,
                                 onPlayClick = {
@@ -676,7 +691,7 @@ fun DetailScreen(
                                     when (state) {
                                         DetailViewModel.EpisodeSourceState.NOT_LOADED -> null
                                         DetailViewModel.EpisodeSourceState.LOADING -> "Sources · loading"
-                                        DetailViewModel.EpisodeSourceState.AVAILABLE -> "Sources · ready"
+                                        DetailViewModel.EpisodeSourceState.AVAILABLE -> "Sources · available"
                                         DetailViewModel.EpisodeSourceState.EMPTY -> "Sources · none"
                                         DetailViewModel.EpisodeSourceState.PARTIAL -> "Sources · partial"
                                         DetailViewModel.EpisodeSourceState.FAILED -> "Sources · retry"
@@ -778,13 +793,13 @@ fun DetailScreen(
                     ) {
                         Column {
                             Text(
-                                text = "Episode ${ep.episodeNumber} Sources",
+                                text = if (isMovie) "Movie Sources" else "Episode ${ep.episodeNumber} Sources",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = TextPrimary
                             )
                             Text(
-                                text = "Select a source candidate returned for this Episode",
+                                text = if (isMovie) "Select a source candidate returned for this Movie" else "Select a source candidate returned for this Episode",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextMuted
                             )
@@ -870,6 +885,7 @@ fun DetailScreen(
 @Composable
 fun EpisodeRow(
     episode: EpisodeEntry,
+    isMovie: Boolean = false,
     isPlayed: Boolean,
     downloadEntry: DownloadEntry? = null,
     onPlayClick: () -> Unit,
@@ -886,7 +902,7 @@ fun EpisodeRow(
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 4.dp)
             .clickable(onClick = onPlayClick)
-            .testTag("episode_row_${episode.episodeNumber}")
+            .testTag(if (isMovie) "movie_row" else "episode_row_${episode.episodeNumber}")
     ) {
         Row(
             modifier = Modifier
@@ -905,12 +921,21 @@ fun EpisodeRow(
                     modifier = Modifier.size(40.dp)
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Text(
-                            text = "${episode.episodeNumber}",
-                            fontWeight = FontWeight.Bold,
-                            color = if (isPlayed) AccentCyan else TextPrimary,
-                            fontSize = 14.sp
-                        )
+                        if (isMovie) {
+                            Icon(
+                                imageVector = Icons.Default.Movie,
+                                contentDescription = "Movie",
+                                tint = if (isPlayed) AccentCyan else TextPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        } else {
+                            Text(
+                                text = "${episode.episodeNumber}",
+                                fontWeight = FontWeight.Bold,
+                                color = if (isPlayed) AccentCyan else TextPrimary,
+                                fontSize = 14.sp
+                            )
+                        }
                     }
                 }
 
@@ -918,7 +943,7 @@ fun EpisodeRow(
 
                 Column {
                     Text(
-                        text = episode.title ?: "Episode ${episode.episodeNumber}",
+                        text = if (isMovie) (episode.title?.takeIf { it.isNotBlank() } ?: "Full Movie") else (episode.title ?: "Episode ${episode.episodeNumber}"),
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = TextPrimary,

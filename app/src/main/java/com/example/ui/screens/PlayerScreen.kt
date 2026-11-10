@@ -148,6 +148,9 @@ fun PlayerScreen(
     val context = LocalContext.current
     val anime by viewModel.animeEntry.collectAsStateWithLifecycle()
     val currentEpisode by viewModel.currentEpisode.collectAsStateWithLifecycle()
+    val isMovie = anime?.mediaCategory?.equals("MOVIE", ignoreCase = true) == true ||
+            anime?.format?.equals("MOVIE", ignoreCase = true) == true ||
+            anime?.format?.equals("FILM", ignoreCase = true) == true
     val isResolving by viewModel.isResolving.collectAsStateWithLifecycle()
     val resolutionError by viewModel.resolutionError.collectAsStateWithLifecycle()
 
@@ -421,7 +424,8 @@ fun PlayerScreen(
             // Manual Next Episode Overlay when playback completes (NO auto play)
             if (isPlaybackEnded && !isInPipMode) {
                 PlaybackEndedOverlay(
-                    nextEpisode = nextEpisode,
+                    isMovie = isMovie,
+                    nextEpisode = if (isMovie) null else nextEpisode,
                     onPlayNext = { viewModel.playNextEpisode() },
                     onReplay = {
                         viewModel.playerManager.seekTo(0L)
@@ -465,6 +469,7 @@ fun PlayerScreen(
                 isFullscreen = true,
                 animeTitle = anime?.preferredTitle ?: "ProphecyVerse",
                 currentEpisode = currentEpisode,
+                isMovie = isMovie,
                 isPlaying = isPlaying,
                 isResolving = isResolving,
                 isBuffering = isBuffering,
@@ -588,7 +593,8 @@ fun PlayerScreen(
                 // Manual Next Episode Overlay when playback completes (NO auto play)
                 if (isPlaybackEnded && !isInPipMode) {
                     PlaybackEndedOverlay(
-                        nextEpisode = nextEpisode,
+                        isMovie = isMovie,
+                        nextEpisode = if (isMovie) null else nextEpisode,
                         onPlayNext = { viewModel.playNextEpisode() },
                         onReplay = {
                             viewModel.playerManager.seekTo(0L)
@@ -632,6 +638,7 @@ fun PlayerScreen(
                     isFullscreen = false,
                     animeTitle = anime?.preferredTitle ?: "ProphecyVerse",
                     currentEpisode = currentEpisode,
+                    isMovie = isMovie,
                     isPlaying = isPlaying,
                     isResolving = isResolving,
                     isBuffering = isBuffering,
@@ -701,7 +708,7 @@ fun PlayerScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         currentEpisode?.let { ep ->
                             Text(
-                                text = "Season ${ep.seasonNumber} • Episode ${ep.episodeNumber}${if (!ep.title.isNullOrBlank()) ": ${ep.title}" else ""}",
+                                text = if (isMovie) (ep.title?.takeIf { it.isNotBlank() } ?: "Full Movie") else "Season ${ep.seasonNumber} • Episode ${ep.episodeNumber}${if (!ep.title.isNullOrBlank()) ": ${ep.title}" else ""}",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = AccentCyan,
                                 fontWeight = FontWeight.SemiBold
@@ -1285,6 +1292,7 @@ private fun ErrorOverlay(
 
 @Composable
 private fun PlaybackEndedOverlay(
+    isMovie: Boolean = false,
     nextEpisode: EpisodeEntry?,
     onPlayNext: () -> Unit,
     onReplay: () -> Unit
@@ -1308,14 +1316,16 @@ private fun PlaybackEndedOverlay(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "Episode Finished",
+                    text = if (isMovie) "Movie Finished" else "Episode Finished",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = Color.White
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = if (nextEpisode != null) {
+                    text = if (isMovie) {
+                        "Thank you for watching."
+                    } else if (nextEpisode != null) {
                         "Next: Episode ${nextEpisode.episodeNumber}${if (!nextEpisode.title.isNullOrBlank()) " - ${nextEpisode.title}" else ""}"
                     } else {
                         "You've reached the end of this season."
@@ -1361,6 +1371,7 @@ private fun PlayerControlsOverlay(
     isFullscreen: Boolean,
     animeTitle: String,
     currentEpisode: EpisodeEntry?,
+    isMovie: Boolean = false,
     isPlaying: Boolean,
     isResolving: Boolean,
     isBuffering: Boolean,
@@ -1456,7 +1467,7 @@ private fun PlayerControlsOverlay(
                         )
                         currentEpisode?.let { ep ->
                             Text(
-                                text = "S${ep.seasonNumber} : E${ep.episodeNumber} • ${ep.title ?: ""}",
+                                text = if (isMovie) (ep.title?.takeIf { it.isNotBlank() } ?: "Full Movie") else "S${ep.seasonNumber} : E${ep.episodeNumber} • ${ep.title ?: ""}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = AccentCyan,
                                 maxLines = 1,

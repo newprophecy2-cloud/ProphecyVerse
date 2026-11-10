@@ -47,7 +47,12 @@ class InstallationManager private constructor(private val context: Context) {
             syncMutex.withLock {
                 prefs.edit().putBoolean(KEY_PENDING_SYNC, true).apply()
                 try {
-                val ownerUid = auth.currentUser?.uid ?: return@withLock
+                val ownerUid = auth.currentUser?.uid ?: try {
+                    auth.signInAnonymously().await().user?.uid
+                } catch (e: Exception) {
+                    Log.w(TAG, "Guest sign-in not yet complete for installation sync: ${e.message}")
+                    null
+                } ?: return@withLock
                 val refreshedToken = try {
                     FirebaseMessaging.getInstance().token.await()
                 } catch (e: Exception) {
@@ -66,7 +71,7 @@ class InstallationManager private constructor(private val context: Context) {
                 }
 
                 val cachedCountry = NoticeManager.getInstance(context).detectedCountry.value
-                    ?: Locale.getDefault().country.ifBlank { "BD" }
+                    ?: Locale.getDefault().country.takeIf { it.isNotBlank() } ?: "US"
 
                 val tokenValue = prefs.getString("fcm_token", null)
                 val tokenStatus = if (!tokenValue.isNullOrBlank()) "registered" else "pending"
@@ -122,7 +127,7 @@ class InstallationManager private constructor(private val context: Context) {
                 val ownerUid = auth.currentUser?.uid ?: return@launch
                 val now = System.currentTimeMillis()
                 val cachedCountry = NoticeManager.getInstance(context).detectedCountry.value
-                    ?: Locale.getDefault().country.ifBlank { "BD" }
+                    ?: Locale.getDefault().country.takeIf { it.isNotBlank() } ?: "US"
 
                 FirestoreRequestGuard.execute("installation heartbeat") {
                     firestore.collection("installations")

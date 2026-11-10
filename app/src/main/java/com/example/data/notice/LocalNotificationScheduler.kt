@@ -4,12 +4,15 @@ import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import com.example.R
 import org.json.JSONArray
 import org.json.JSONObject
@@ -75,9 +78,10 @@ object LocalNotificationScheduler {
     private fun cancelExisting(context: Context) {
         val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return
         repeat(SLOT_COUNT) { slot ->
+            val requestCode = 1000 + slot
             val intent = Intent(context, LocalNoticeReceiver::class.java).apply { action = ACTION_FIRE }
             val pending = PendingIntent.getBroadcast(
-                context, slot, intent, PendingIntent.FLAG_NO_CREATE or immutableFlag()
+                context, requestCode, intent, PendingIntent.FLAG_NO_CREATE or immutableFlag()
             )
             if (pending != null) {
                 alarmManager.cancel(pending)
@@ -122,6 +126,12 @@ class LocalNoticeReceiver : BroadcastReceiver() {
         val title = intent.getStringExtra("title") ?: "Prophecy Verse"
         val message = intent.getStringExtra("message") ?: return
         ensureChannelForReceiver(app)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
         val notificationId = intent.getIntExtra("notification_id", 1)
         val notification = NotificationCompat.Builder(app, "prophecy_local_notices")
             .setSmallIcon(R.mipmap.ic_launcher)

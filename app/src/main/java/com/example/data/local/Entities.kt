@@ -82,6 +82,7 @@ data class SeasonEntry(
     @PrimaryKey val id: String, // "${animeId}_s${seasonNumber}"
     val animeId: String,
     val seasonNumber: Int,
+    val backendSeasonId: String? = null,
     val title: String? = null
 )
 

@@ -1,0 +1,1638 @@
+PROPHECYVERSE ANDROID APK — GITHUB-BASED A–Z MASTER AUDIT, REPAIR, VERIFICATION & OPTIMIZATION
+
+ROLE
+
+Act as a senior Android engineer, Kotlin/Java engineer, Firebase architect, Media3 playback engineer, security engineer, QA engineer, and Android release-build engineer.
+
+Your responsibility is to continue the existing ProphecyVerse Android APK repair project directly from GitHub.
+
+This is an existing production application. Do not create a new application, replace the architecture unnecessarily, remove existing features, or produce a superficial demonstration.
+
+You are authorized to inspect, repair, test, document, commit, and push APK-only source changes to the designated repair branch.
+
+Do not stop after writing an audit report. Perform actual repairs wherever safely possible.
+
+---
+
+PART 1 — GITHUB REPOSITORY AND CURRENT PROJECT STATE
+
+Repository:
+
+https://github.com/newprophecy2-cloud/ProphecyVerse
+
+Default branch: "main"
+
+Original repair base branch: "apk-v3"
+
+Original base commit:
+"4341a22ef099ea85e43c98e800e548174e2fa66a"
+
+Existing working/repair branch:
+
+"ai-studio/apk-v3-repair"
+
+Existing latest repair commit:
+
+"743a3924237d81429fa07186fab415be19243877"
+
+Existing Pull Request creation link:
+
+https://github.com/newprophecy2-cloud/ProphecyVerse/pull/new/ai-studio/apk-v3-repair
+
+Mandatory first action
+
+Before modifying anything:
+
+1. Verify GitHub repository access.
+2. Inspect the current remote branch list.
+3. Fetch the latest remote references.
+4. Verify that "ai-studio/apk-v3-repair" exists.
+5. Verify its current HEAD commit.
+6. Verify that the existing commit "743a3924237d81429fa07186fab415be19243877" is present in its history.
+7. Inspect the actual changes in that commit.
+8. Verify the repair branch's relationship to "apk-v3".
+9. Inspect whether additional commits have been pushed after the stated commit.
+10. Record the exact starting commit and repository status.
+
+Do not assume that the repository has remained unchanged since the information in this prompt was written.
+
+Use the latest verified remote state.
+
+Branch safety
+
+All new APK repairs must be made on:
+
+"ai-studio/apk-v3-repair"
+
+Do not modify or push directly to:
+
+- "main"
+- "master"
+- "apk-v3"
+
+Do not reset, force-push, overwrite, or delete existing branches.
+
+Do not overwrite another contributor's changes.
+
+If the repair branch has diverged or contains unexpected commits, inspect and reconcile safely before proceeding.
+
+Never merge the Pull Request automatically.
+
+Never publish or deploy the application.
+
+Existing completed repair — DO NOT DUPLICATE
+
+The following change was already pushed in commit:
+
+"743a3924237d81429fa07186fab415be19243877"
+
+File:
+
+"app/src/main/java/com/example/data/notice/LocalNotificationScheduler.kt"
+
+Two defects were repaired:
+
+1. Scheduled alarms used request codes "1000..1028", but cancellation searched for "0..28", potentially leaving old alarms active.
+2. Notification delivery called "notify()" without checking "POST_NOTIFICATIONS" permission on Android 13+.
+
+Before changing this file again:
+
+- Inspect the actual current implementation.
+- Verify whether both fixes remain present.
+- Check for related defects.
+- Do not repeat or revert the existing fixes.
+- Only make further changes if a new, confirmed defect is discovered.
+
+The earlier environment could not complete an APK build because Java 21 was available without "javac"; Android SDK tools, "adb", and "apksigner" were also unavailable.
+
+This is historical information, not proof of the current environment's limitations. Recheck the current build environment independently.
+
+---
+
+PART 2 — FIXED PROJECT IDENTITY
+
+Project: ProphecyVerse Android APK
+
+Repository:
+
+"newprophecy2-cloud/ProphecyVerse"
+
+Expected application ID:
+
+"com.aistudio.prophecyverse.vykqtb"
+
+Expected release:
+
+- Version Name: "3.0.1"
+- Android Version Code: "6"
+
+Preserve these values unless a genuine technical blocker makes this impossible. Report before changing them.
+
+Backend:
+
+"https://api.prophecyverse.tech"
+
+Existing APK backend routes:
+
+- "GET /api/v1/anime/search"
+- "GET /api/v1/anime/{id}"
+- "GET /api/v1/anime/{id}/episodes/{episode_id}/full"
+- "POST /api/v1/play/direct"
+
+Do not invent new backend endpoints, request parameters, response fields, or source identifiers.
+
+Firebase identity
+
+Expected Firebase project:
+
+- Project ID: "prophecy-verse-483df"
+- Project Number: "357805299753"
+- Storage Bucket: "prophecy-verse-483df.firebasestorage.app"
+
+The actual Firebase configuration supplied by the owner contains the Android package entry:
+
+"com.prophecy.verse"
+
+The APK application ID is:
+
+"com.aistudio.prophecyverse.vykqtb"
+
+Investigate this difference carefully.
+
+Do not assume that the supplied Firebase configuration is wrong merely because the project has another registered Android client.
+
+Determine whether the actual APK application ID has its own Firebase Android app registration.
+
+If missing, document the exact Firebase Console registration and genuine "google-services.json" download requirement.
+
+Never invent a Firebase app registration, "mobilesdk_app_id", OAuth client, or API key.
+
+Do not change the Firebase project identity or application ID merely to suppress an error.
+
+---
+
+PART 3 — PROJECT PRESERVATION AND WORKFLOW
+
+The source project is already stored in GitHub.
+
+Do not require an uploaded ZIP as the primary input.
+
+Use the GitHub repair branch as the source of truth.
+
+Step 1 — Preserve and inspect
+
+- Fetch the current repository state.
+- Inspect the entire Android project.
+- Record file and directory counts.
+- Identify modules and source roots.
+- Inspect hidden project configuration files where accessible.
+- Inspect Gradle wrapper and build configuration.
+- Inspect AndroidManifest.xml.
+- Inspect Firebase configuration.
+- Inspect Room entities, DAOs and migrations.
+- Inspect all relevant Kotlin/Java files.
+- Inspect Compose screens, ViewModels and navigation.
+- Inspect network clients and API models.
+- Inspect Media3 playback.
+- Inspect downloads and background workers.
+- Inspect FCM and notification scheduling.
+- Inspect tests and existing documentation.
+
+Do not silently skip important directories or files.
+
+If repository access is incomplete, report exactly what could not be inspected.
+
+Step 2 — Create a safe working copy
+
+Create a separate working directory or worktree based on the verified repair branch.
+
+Preserve the original remote branch and its history.
+
+Before editing, verify that the working copy matches the selected starting commit.
+
+Do not edit "main" or "apk-v3".
+
+Step 3 — Full source audit
+
+Create an issue register with:
+
+- Issue ID
+- Severity
+- File and line
+- Confirmed root cause
+- User-visible symptom
+- Required repair
+- Dependencies
+- Verification method
+- Status
+
+Do not treat older audit findings as automatically confirmed. Verify them against the current source.
+
+Step 4 — Repair
+
+Fix confirmed APK-side defects.
+
+Step 5 — Re-audit
+
+Inspect every changed file and its related implementation.
+
+Run available static checks, tests, and build validation.
+
+Repair new failures introduced by your changes.
+
+Repeat until stable or a genuine external blocker is reached.
+
+---
+
+PART 4 — STRICT CHANGE BOUNDARIES
+
+Authorized changes
+
+You may modify the Android APK repository's:
+
+- Kotlin/Java source
+- Jetpack Compose UI
+- AndroidManifest.xml
+- Gradle dependencies and configuration
+- Room/SQLite implementation
+- Firebase client integration
+- FCM integration
+- Media3 playback
+- Download manager
+- Local caching
+- Error handling
+- Tests
+- APK documentation
+
+Forbidden changes
+
+Do not:
+
+- Modify the separate backend repository.
+- Change the production backend.
+- Change existing backend API contracts.
+- Deploy backend services.
+- Change live Firebase security rules.
+- Delete or recreate Firebase collections.
+- Change Firebase project identity.
+- Add fake Firebase credentials.
+- Add Firebase Admin credentials to the APK.
+- Publish to Google Play.
+- Deploy anything.
+- Change the application ID without approval.
+- Remove working application features.
+- Replace the existing architecture without justification.
+- Introduce fake catalog data or fake playback sources.
+- Claim an external integration works without verifying it.
+- Merge the Pull Request automatically.
+
+If an external backend, Firebase Console, Cloud Function, or security-rule change is required, implement the safe APK-side portion and document the external requirement.
+
+Never pretend that an APK-only change completes a server-side requirement.
+
+---
+
+PART 5 — FIREBASE AND DATA ARCHITECTURE
+
+5.1 Firebase project verification
+
+Verify:
+
+- Firebase initialization
+- "google-services.json"
+- Application ID matching
+- Firebase Auth
+- Firestore
+- Firebase Messaging
+- Analytics
+- App Check, if already configured
+
+Preserve the correct Firebase project.
+
+Do not add fake configuration.
+
+5.2 Shared catalog and private user data
+
+Separate shared catalog information from private user information.
+
+Intended shared catalog
+
+- Home content
+- Anime catalog
+- Movies
+- Web Series
+- Seasons
+- Episodes
+- Genres
+- Categories
+- Curated collections
+- Shared suggestions
+- Featured content
+- Catalog metadata
+- Catalog update/version metadata
+
+All users should receive consistent shared catalog data.
+
+Private user data
+
+- User profile
+- Watch history
+- Watchlist
+- User preferences
+- User-specific recommendations
+- Installation information
+- Notification preferences
+
+Backend responsibilities
+
+The existing backend remains authoritative for:
+
+- Anime metadata returned by its API
+- Season and episode data
+- Source discovery
+- Source IDs
+- Fresh playback URLs
+- Playback resolution
+
+Never store video files or temporary signed playback URLs in Firestore.
+
+Room responsibilities
+
+Room should provide:
+
+- Fast startup
+- Local catalog cache
+- Home cache
+- Anime and movie cache
+- Season/episode cache
+- Appropriate source metadata cache
+- Watch history cache
+- Watchlist cache
+- Download records
+- Offline playback records
+- Local preferences
+
+Do not confuse Firestore/backend data with local Room data.
+
+5.3 Shared catalog blocker
+
+Verify whether the current project or accessible infrastructure contains:
+
+- A trusted catalog writer
+- Existing Cloud Functions integration
+- Backend-to-Firestore synchronization
+- Catalog versioning
+- Appropriate read/write rules
+
+Do not invent a client-side global-write architecture.
+
+Do not allow every APK installation to write arbitrary shared catalog records.
+
+If a trusted writer is missing, implement compatible read/cache handling where possible and document the exact server-side work required.
+
+---
+
+PART 6 — LOGIN-INDEPENDENT INSTALLATION TRACKING
+
+Installation tracking must work without user registration or login.
+
+Do not force login merely to:
+
+- Register an installation
+- Save an FCM token
+- Track app activity
+- Track app version
+- Record country
+- Count sessions
+- Record basic device/app information
+
+Installation identity
+
+Implement or repair a stable installation identifier.
+
+Requirements:
+
+1. Generate a unique random installation ID on first launch.
+2. Persist it locally.
+3. Reuse it across normal app restarts.
+4. Never generate a new ID on every launch.
+5. Avoid duplicate installation records.
+6. Preserve identity across app upgrades.
+7. FCM token refresh must not create a new installation.
+8. Login/logout must not destroy installation identity.
+9. Do not use IMEI, serial number, MAC address, or restricted hardware identifiers.
+10. Document reinstall and app-data-clear behavior.
+
+Use a secure random UUID or suitable Firebase installation identity.
+
+Do not claim permanent physical-device identification.
+
+Installation data
+
+Where permitted by the actual schema and security rules, track:
+
+- Installation ID
+- First seen
+- Last seen
+- App version name
+- App version code
+- Android version
+- Device manufacturer
+- Device model
+- App language
+- Notification permission state
+- FCM token state
+- Session count
+- Last active time
+- Country and country code from IP
+- Consent/privacy state where relevant
+
+Avoid unnecessary personal data.
+
+Do not collect contact lists, SMS, call logs, photos, microphone recordings, or unrelated device information.
+
+Duplicate prevention
+
+Prevent repeated installation counting caused by:
+
+- App launches
+- Activity recreation
+- Token refresh
+- Network retry
+- Login/logout
+- Process restart
+- Repeated Firestore writes
+
+Use idempotent installation identity and safe updates.
+
+---
+
+PART 7 — IP-BASED COUNTRY TRACKING (NO LOCATION PERMISSION)
+
+The owner does not want GPS tracking or precise location collection.
+
+The requirement is approximate country detection from the public IP address used by the app's network request.
+
+Examples:
+
+- Bangladesh → BD
+- India → IN
+- United States → US
+- United Kingdom → GB
+
+Permissions
+
+Do not request:
+
+- "ACCESS_FINE_LOCATION"
+- "ACCESS_COARSE_LOCATION"
+- "ACCESS_BACKGROUND_LOCATION"
+
+Do not use GPS or Android Location Services.
+
+Normal "INTERNET" permission is sufficient for network communication.
+
+Preferred architecture
+
+Use the existing backend request path wherever possible.
+
+The trusted server should:
+
+1. Receive an app request.
+2. Determine the actual public client IP using verified trusted proxy configuration.
+3. Ignore spoofable client-supplied country headers.
+4. Resolve the IP through a reliable IP geolocation database/service.
+5. Return or securely record country information where the existing contract supports it.
+6. Save necessary country-level information through an authorized trusted writer.
+
+Do not trust arbitrary "X-Forwarded-For" or "X-Real-IP" values without verified proxy configuration.
+
+Do not let the APK claim that its own country is verified.
+
+Do not invent a backend endpoint.
+
+If the existing backend does not support trusted IP-country lookup and Firestore persistence, document the missing server-side requirement.
+
+Stored data
+
+Prefer:
+
+- Country name
+- ISO country code
+- Detection timestamp
+- Detection method
+- Confidence/accuracy status where available
+- Region only if sufficiently reliable and necessary
+
+Do not permanently store raw IP addresses without a documented and necessary reason.
+
+IP geolocation is approximate, not GPS. VPNs, proxies, carrier NAT and mobile networks can cause inaccurate results.
+
+Update policy
+
+- Detect country during installation registration or reasonable periodic refresh.
+- Avoid excessive lookup requests.
+- Refresh only when appropriate.
+- Avoid repeated writes when country is unchanged.
+- Do not block startup.
+- Preserve the last valid country when a new lookup fails.
+- Mark stale/unavailable results appropriately.
+
+---
+
+PART 8 — LOGIN-INDEPENDENT FCM TOKEN MANAGEMENT
+
+FCM must work without mandatory user login.
+
+Implement or repair:
+
+1. Retrieve the FCM registration token.
+2. Save it against installation identity using the existing authorized structure.
+3. Update the record on token refresh.
+4. Avoid duplicate installation records.
+5. Track notification permission state.
+6. Handle token retrieval failures.
+7. Retry safely when network returns.
+8. Remove or invalidate obsolete token records where appropriate.
+9. Support multiple installations independently.
+10. Do not require email/password registration to receive notifications.
+
+Use proper Firebase Messaging lifecycle callbacks.
+
+Token refresh must not reset installation identity.
+
+Security
+
+Inspect existing Anonymous Authentication behavior.
+
+Anonymous authentication may be appropriate if the existing project supports it.
+
+However:
+
+- Do not repeatedly create anonymous users.
+- Do not create duplicate anonymous identities on every launch.
+- Preserve account linking behavior.
+- Do not weaken Firestore rules.
+- Do not put privileged credentials in the APK.
+- Do not treat a client-generated installation ID as sufficient authorization.
+
+If existing rules do not authorize secure installation writes, document the missing trusted writer or authentication requirement.
+
+Do not change live rules.
+
+---
+
+PART 9 — ADVANCED ANALYTICS
+
+Implement a privacy-conscious installation-level analytics system where supported.
+
+Possible events:
+
+- First app launch
+- App open
+- Session start/end
+- Session duration
+- Last active timestamp
+- App version and update
+- Search action
+- Anime detail open
+- Movie detail open
+- Episode selection
+- Playback start/success/failure
+- Download start/completion/failure
+- Notification received/opened
+- Crash/error event
+
+Do not store:
+
+- Passwords
+- Access tokens
+- Full private request headers
+- Private messages
+- Raw authentication credentials
+
+Performance and quota
+
+- Batch suitable events.
+- Use bounded local queues.
+- Avoid excessive Firestore writes.
+- Prevent duplicate events.
+- Retry transient errors with bounded exponential backoff.
+- Do not retry permanent permission/validation failures forever.
+- Respect offline mode.
+- Never block the UI for analytics writes.
+
+Use Firebase Analytics for general analytics where appropriate.
+
+Use Firestore only for operational data that genuinely needs to be queried by the Admin system.
+
+---
+
+PART 10 — FIRESTORE SECURITY
+
+Inspect existing Firestore rules and collection paths.
+
+Previously observed collections include:
+
+- "notices/{noticeId}"
+- "app_config/version_control"
+- "users/{uid}"
+- "watch_history/{uid}/episodes/{historyId}"
+- "watchlist/{uid}/items/{animeId}"
+- "installations/{uid}_{installationId}"
+- "analytics_events/{uuid}"
+
+Other observed admin collections may include:
+
+- "admin_users"
+- "notifications"
+- "security_logs"
+- "update_history"
+- "analytics_daily"
+- "admin_settings"
+
+Treat these as previously observed paths, not permission to redesign them.
+
+Requirements:
+
+- Preserve existing schema.
+- Preserve ownership restrictions.
+- No unrestricted public writes.
+- No cross-user profile modification.
+- No normal APK user admin writes.
+- Validate fields and types.
+- Prevent arbitrary document path injection.
+- Keep server-only operations server-side.
+- Avoid exposing private tokens or credentials in logs.
+- Never put service-account JSON or Admin SDK credentials in the APK.
+
+Do not modify deployed Firestore rules.
+
+If a new rule is required, provide a separate proposed rules change and explain why. Do not deploy it.
+
+---
+
+PART 11 — SOURCE DISCOVERY AND PLAYBACK REPAIR
+
+Reported user-facing problem
+
+The application sometimes displays:
+
+- Sources · ready
+- Source Available
+- Available Sources
+
+But pressing Play results in:
+
+- No Playback Source
+- No playable source
+- Playback error
+- Direct-play resolution failed
+
+Correct state model
+
+A discovered source candidate is not automatically playable.
+
+Separate:
+
+1. Source discovery loading
+2. Source candidates discovered
+3. Source resolution in progress
+4. Source resolved successfully
+5. Media playback initialized
+6. Playback actually started
+7. Playback failed
+
+Never label a source playback-ready merely because a candidate exists.
+
+Existing backend contract
+
+Use:
+
+"POST /api/v1/play/direct"
+
+Request:
+
+- "source_id"
+
+Expected existing response:
+
+- "success"
+- "data.playback_url"
+
+Inspect actual request/response handling before changing parsing.
+
+Do not invent response fields.
+
+Source identity
+
+Preserve exact:
+
+- Source ID
+- Provider
+- Anime/movie ID
+- Season
+- Episode ID
+- Episode number
+- Language
+- Quality
+- Relevant headers
+- Source metadata
+
+Never resolve a source using another episode or provider's source ID.
+
+Do not use array indexes as episode identifiers.
+
+If source IDs are not globally unique, use a safe composite cache identity based on actual source and episode metadata.
+
+Provider discovery
+
+Do not stop provider discovery merely because one provider has results.
+
+A FourKHDHub result must not hide actual AniZone or Dramachi results.
+
+Use providers returned by the backend.
+
+Do not invent providers, source URLs, or provider endpoints.
+
+MovieBox is disabled in the current backend behavior. Do not re-enable or assume it is available.
+
+Direct-play validation
+
+Validate:
+
+- HTTP status
+- Response body
+- JSON parsing
+- "success"
+- Playback URL presence
+- URL scheme
+- Source identity
+- Expiry if supplied
+- Required headers
+- Redirect behavior
+
+Preserve useful backend error information.
+
+Keep structured error categories and request IDs where available.
+
+Do not convert every failure into "No Playback Source".
+
+Media3
+
+Audit:
+
+- Player initialization
+- Listener registration order
+- Media item creation
+- Prepare/play order
+- HTTP data source
+- Redirect behavior
+- Required headers
+- Timeout policy
+- MIME/container handling
+- Decoder errors
+- Audio renderer errors
+- Player lifecycle
+- Activity/Compose lifecycle
+- Cancellation
+- Retry behavior
+- Player cleanup
+
+Register listeners early enough to capture initial failures.
+
+Ensure stale resolution errors cannot mask new playback errors.
+
+Distinguish:
+
+- Source not found
+- Direct-play resolution failed
+- Network failure
+- HTTP error
+- Expired URL
+- Unsupported video codec
+- Unsupported audio codec
+- Container issue
+- Decoder failure
+- Player initialization failure
+
+Show clear user-friendly messages while preserving safe diagnostics.
+
+Codec compatibility
+
+Prefer compatible direct-play sources.
+
+Do not pretend Media3 supports every codec.
+
+Detect unsupported HEVC/H.265 and other unsupported formats appropriately.
+
+If all returned sources are unsupported, show a compatibility error.
+
+Do not silently change source identity.
+
+Do not introduce unrequested server-side transcoding.
+
+---
+
+PART 12 — MOVIE PLAYBACK
+
+The backend represents a Movie as Season 1 / Episode 1.
+
+The APK must not incorrectly treat every Movie as a normal Anime episode list.
+
+Requirements:
+
+1. Detect Movie type using actual metadata.
+2. Load the actual backend detail response.
+3. Recognize the actual S1/Episode 1 representation.
+4. Load actual Movie source candidates.
+5. Preserve exact backend episode/source identifiers.
+6. Resolve through the existing direct-play route.
+7. Do not invent a Movie endpoint.
+8. Do not fabricate S1/Episode 1 when absent.
+9. Do not show "No Episode Found" when a valid Movie representation exists.
+10. Keep the Movie UI focused on its title and source.
+
+Anime playback must remain unchanged.
+
+Add regression tests for:
+
+- Valid Movie S1/Episode 1
+- Movie with no sources
+- Movie with multiple sources
+- Successful Movie playback
+- Failed Movie resolution
+- Anime playback unaffected
+
+---
+
+PART 13 — EPISODE AND SEASON LOADING
+
+Support large catalogs:
+
+- 1000+ episodes
+- 100+ seasons
+- Specials
+- Anime-related movies
+- Episode numbering gaps
+- Non-sequential IDs
+- Long-running series
+
+Pagination
+
+Use actual backend response behavior.
+
+Desired page size where supported:
+
+- 1–30
+- 31–60
+- 61–90
+- Continue as required
+
+When selecting a later episode, fetch the relevant page rather than loading the entire catalog unnecessarily.
+
+Preserve:
+
+- Actual episode IDs
+- Actual episode numbers
+- Total episode count
+- Source availability separately from episode availability
+
+Do not hide episodes with no sources.
+
+Distinguish:
+
+- Loading
+- Partial data
+- Fully loaded
+- Empty
+- Failed
+- Retry available
+
+Prevent duplicate page requests and stale responses.
+
+Do not invent pagination parameters.
+
+If backend pagination is unavailable, report the limitation and implement safe APK-side loading without breaking the existing API.
+
+---
+
+PART 14 — DOWNLOAD MANAGER
+
+Downloads require login if that is the existing application policy.
+
+After a valid DRM-free file is completely downloaded and stored locally, it must remain playable offline after logout, provided the application installation and local file remain intact.
+
+Implement or repair:
+
+- Download queue
+- Persistent state
+- Progress
+- Speed
+- ETA
+- Pause
+- Resume
+- Cancel
+- Retry
+- Failure reason
+- Completed state
+- File validation
+- Local metadata
+- Offline playback
+
+Download integrity
+
+Do not mark downloads complete merely because an HTTP request returned success.
+
+Validate:
+
+- File exists
+- File is not empty
+- Size is plausible
+- Container is readable
+- Playability where validation is available
+- Expected length where known
+- Partial files are never treated as complete
+
+Use temporary files and move to the final library only after validation.
+
+Expired URLs and headers
+
+Do not reuse expired signed URLs indefinitely.
+
+Refresh through the existing source-resolution process where appropriate.
+
+Preserve actual required headers.
+
+Do not invent headers.
+
+File extensions
+
+Do not save everything as ".mp4".
+
+Use verified media container:
+
+- MP4 → ".mp4"
+- MKV → ".mkv"
+- WebM → ".webm"
+- TS → ".ts"
+
+Do not rely solely on URL extension.
+
+Multiple resolutions
+
+Show only real available source qualities.
+
+Do not fabricate 720p/480p options if the source only offers 1080p.
+
+A normal Media3 Player does not transcode.
+
+Only offer lower-resolution conversion if a real supported Media3 Transformer/MediaCodec workflow exists and output validation succeeds.
+
+Never mark failed transcoding as success.
+
+Background work
+
+Inspect WorkManager or an appropriate foreground service.
+
+Do not use an in-memory coroutine as the only durable download mechanism.
+
+Respect Android background execution and notification requirements.
+
+---
+
+PART 15 — OFFLINE MODE
+
+The app should remain useful without network connectivity.
+
+Requirements:
+
+- Completed downloads play offline.
+- Local watch history remains available.
+- Local watchlist remains available.
+- Cached anime/movie details remain accessible.
+- Cached Home content appears where available.
+- Cached episode information appears where available.
+- No endless loading indicators.
+- No unnecessary retry loops.
+- No mandatory login for local downloaded playback.
+- No fake online status.
+
+Use Room as the local cache source.
+
+On reconnection:
+
+- Sync eligible pending user data.
+- Refresh stale catalog data.
+- Retry queued analytics safely.
+- Refresh expired playback information only when online playback requires it.
+
+Never delete valid local data merely because synchronization failed.
+
+Clearly distinguish cached data from fresh server data.
+
+Test a cold offline start.
+
+---
+
+PART 16 — HOME SCREEN AND PERFORMANCE
+
+Requirements:
+
+- Cache-first loading where appropriate.
+- Background refresh of shared content.
+- Avoid duplicate simultaneous requests.
+- Avoid main-thread blocking.
+- Avoid excessive Firestore reads/writes.
+- Use pagination where supported.
+- Stable Compose keys.
+- Avoid unnecessary recomposition.
+- Cancel obsolete requests.
+- Avoid memory leaks.
+- Handle empty/failed sections independently.
+
+Shared Home content should be consistent across users.
+
+Personalized or curated suggestions should use the intended Firestore source if a trusted source already exists.
+
+Do not fabricate recommendations.
+
+Investigate the previously observed five-minute Home refresh throttle and verify whether it is intentional.
+
+---
+
+PART 17 — VERSION VERIFICATION
+
+Expected:
+
+- Version Name: "3.0.1"
+- Version Code: "6"
+
+Requirements:
+
+1. Verify version metadata using the existing source.
+2. Confirm whether checking is connected to actual cold-start flow.
+3. Avoid checks on every recomposition or screen opening.
+4. Persist the last checked installed version and result appropriately.
+5. Check after a new version is installed.
+6. Preserve mandatory update behavior.
+7. Support offline startup.
+8. Handle malformed metadata safely.
+9. Do not block offline downloads.
+10. Avoid update loops.
+
+Do not change the existing version-control document structure without evidence and approval.
+
+Do not claim an update exists without a valid response.
+
+---
+
+PART 18 — NOTICES AND ANALYTICS RELIABILITY
+
+Inspect the existing notice implementation.
+
+Requirements:
+
+- Display published notices from the existing source.
+- Avoid repeated listener registration.
+- Handle network failure.
+- Add compatible local persistence where appropriate.
+- Avoid duplicate notices.
+- Do not allow ordinary APK users to publish notices.
+
+Inspect analytics delivery:
+
+- Identify events lost offline.
+- Add a bounded durable queue where justified.
+- Retry safely.
+- Prevent duplicate events.
+- Respect consent and data minimization.
+- Avoid unnecessary Firestore writes.
+
+Also re-verify the already repaired "LocalNotificationScheduler.kt" implementation from commit "743a392".
+
+---
+
+PART 19 — STARTUP AND FIREBASE OPTIMIZATION
+
+Audit:
+
+- Firebase initialization
+- Anonymous authentication, if used
+- Installation registration
+- FCM token retrieval
+- FCM token refresh
+- Notices listener
+- Version check
+- Watch history sync
+- Watchlist sync
+- Analytics
+- Home loading
+
+Requirements:
+
+- Do not block UI on nonessential tasks.
+- Avoid repeated listener creation.
+- Avoid repeated token writes.
+- Avoid repeated installation creation.
+- Avoid unnecessary Firestore writes.
+- Use bounded retries.
+- Handle offline startup.
+- Avoid initialization races.
+- Avoid excessive quota consumption.
+
+Do not remove necessary features just to reduce reads.
+
+---
+
+PART 20 — UI AND ERROR HANDLING
+
+Review all important user-facing flows.
+
+Requirements:
+
+- Clear user-friendly errors.
+- No technical stack traces in ordinary UI.
+- Retry actions where meaningful.
+- Safe diagnostic logs.
+- No exposed FCM tokens.
+- No exposed authentication tokens.
+- No full private URLs.
+- No raw sensitive headers.
+- No internal credentials.
+
+Ensure:
+
+- Accurate loading states.
+- Accurate empty states.
+- Distinct failure states.
+- Clear offline states.
+- Playback status reflects actual playback.
+- Movie UI is distinct from Anime episode UI.
+- Download status reflects actual file state.
+- Source availability is not confused with playability.
+
+Preserve the existing ProphecyVerse visual identity.
+
+Do not redesign the entire application unnecessarily.
+
+---
+
+PART 21 — APK.md DOCUMENTATION
+
+Create or update "APK.md" at the project root.
+
+Document:
+
+- Project architecture
+- Package/application ID
+- Version Name and Code
+- Firebase project identity
+- Firebase app registration requirements
+- Firestore collection structure
+- Installation identity
+- FCM token lifecycle
+- IP-based country tracking
+- Permission requirements
+- Privacy behavior
+- Backend API contract
+- Source discovery/playback workflow
+- Movie playback
+- Episode loading
+- Download manager
+- Offline behavior
+- Version verification
+- Build instructions
+- Test instructions
+- Known external blockers
+- Firebase Console actions
+- Required server-side actions
+
+"APK.md" must be included in the source repository and final source ZIP.
+
+It must NOT be packaged inside APK assets or resources.
+
+---
+
+PART 22 — REQUIRED TESTING
+
+Run tests actually supported by the project and environment.
+
+A. Project integrity
+
+- Verify repository/branch/commit.
+- Verify changes are on the repair branch.
+- Verify package identity.
+- Verify version values.
+- Verify Firebase configuration.
+- Verify no original source files were silently lost.
+- Inspect all changed files.
+
+B. Build
+
+Attempt the appropriate Gradle build using the repository's Gradle wrapper.
+
+Verify:
+
+- Java runtime
+- "javac"
+- Gradle wrapper
+- Android SDK
+- SDK platforms
+- Build tools
+- Dependency resolution
+- Compilation
+- Manifest merge
+- Kotlin errors
+- Resource errors
+- DEX
+- APK packaging
+
+If a dependency is missing, report the exact limitation.
+
+Do not fake a successful build.
+
+Do not stop after the first compilation error. Fix all safely repairable errors and retry.
+
+C. Firebase
+
+Where genuine credentials/access permit:
+
+- Firebase initialization
+- Anonymous authentication
+- Installation registration
+- Duplicate prevention
+- FCM token retrieval
+- Token refresh
+- Firestore permission handling
+- Offline behavior
+- Sync retry
+- Analytics queue
+
+Separate source-level validation from live Firebase validation.
+
+D. Tracking
+
+Test:
+
+1. Fresh installation without login.
+2. Launch without login.
+3. Installation ID persistence.
+4. FCM token retrieval.
+5. Token refresh.
+6. Restart.
+7. Network unavailable.
+8. Network restored.
+9. Genuine IP-country lookup success.
+10. IP-country lookup failure.
+11. VPN/proxy caveat.
+12. No Location permission.
+13. No duplicate installation count.
+14. Login/logout preserves installation identity.
+
+Never use a fake result to claim a real country lookup passed.
+
+E. Playback
+
+Test:
+
+- Anime search
+- Anime detail
+- Season loading
+- Episode loading
+- Source discovery
+- Multiple providers
+- Direct-play resolution
+- Source identity
+- Media3 initialization
+- Audio playback
+- Video playback
+- Error reporting
+- Movie S1/Episode 1 playback
+
+Use actual backend responses only when live testing is available.
+
+Do not fabricate playback success.
+
+F. Downloads
+
+Test:
+
+- Login requirement
+- Start
+- Progress
+- Pause
+- Resume
+- Cancel
+- Retry
+- URL expiry
+- Headers
+- File integrity
+- Correct extension
+- Completion
+- Offline playback
+- Logout followed by offline playback
+- Transcoding only if genuinely supported
+
+G. Offline
+
+Test:
+
+- Cold offline launch
+- Cached Home
+- Cached Anime detail
+- Cached Movie detail
+- Watch history
+- Watchlist
+- Completed downloads
+- Reconnection and sync
+
+H. Regression
+
+Verify:
+
+- Anime functionality
+- Movie-specific handling
+- Login/logout
+- Notifications
+- Watch history
+- Watchlist
+- Mandatory update
+- Offline downloaded playback
+- Existing notification scheduler fixes
+
+Do not claim device tests unless a real emulator/device was used.
+
+---
+
+PART 23 — REPAIR LOOP
+
+Follow this process:
+
+Round 1 — Full source audit
+
+Identify confirmed problems and create the issue register.
+
+Round 2 — Prioritized repairs
+
+P0:
+
+- Firebase package identity validation
+- Installation identity
+- Login-independent installation registration
+- FCM token management
+- Playback readiness/resolution
+- Movie playback
+
+P1:
+
+- IP-country integration
+- Firestore data safety
+- Episode loading
+- Download integrity
+- Offline playback
+
+P2:
+
+- Shared catalog integration where supported
+- Home performance
+- Version verification
+- Notices caching
+- Analytics reliability
+
+P3:
+
+- UI polish
+- Logging improvements
+- Additional optimizations
+
+Priority does not authorize external backend or Firebase changes.
+
+Round 3 — Post-fix audit
+
+Re-read modified files.
+
+Search for:
+
+- Newly introduced TODOs
+- Empty implementations
+- Fake return values
+- Hardcoded demo data
+- Unused dependencies
+- Duplicate listeners
+- Missing error handling
+- Race conditions
+- Memory leaks
+- Incorrect permissions
+- Security weaknesses
+- Unhandled coroutine failures
+
+Round 4 — Build and test
+
+Run all supported checks.
+
+Round 5 — Repair new failures
+
+Fix defects introduced by changes.
+
+Repeat verification.
+
+Round 6 — Final verification
+
+Verify the actual final remote source state.
+
+If an external blocker exists, document it accurately.
+
+---
+
+PART 24 — GITHUB COMMIT AND PUSH REQUIREMENTS
+
+After completing repairs and verification:
+
+1. Inspect "git status".
+2. Review every changed file.
+3. Run "git diff --check".
+4. Review the full diff.
+5. Ensure no credentials, service-account files, private keys, signing keys, secrets, build caches, or generated APKs are accidentally committed.
+6. Ensure only authorized APK project changes are included.
+7. Commit the verified changes to "ai-studio/apk-v3-repair".
+8. Push the branch to GitHub.
+9. Verify the remote HEAD commit.
+10. Verify that the pushed diff matches the local verified diff.
+
+Use clear, descriptive commit messages.
+
+Do not force-push.
+
+Do not merge the PR.
+
+If GitHub write access is unavailable, do not pretend the push succeeded. Provide the exact local changes and blocker.
+
+---
+
+PART 25 — FINAL DELIVERABLES
+
+1. GitHub source
+
+Provide:
+
+- Repository link
+- Repair branch link
+- Final commit SHA
+- Changed file list
+- Pull Request link
+
+2. Updated source ZIP
+
+Prepare a complete source ZIP based on the final verified repair branch.
+
+Include:
+
+- Complete Android project
+- Root "APK.md"
+- Required source files
+- Tests
+- Documentation
+
+Exclude:
+
+- Temporary build files
+- Gradle caches
+- IDE caches
+- Secrets
+- Service-account credentials
+- Private signing keys
+- Unnecessary generated artifacts
+
+Do not overwrite the original branch or original project history.
+
+3. Build output
+
+If build succeeds, provide the actual generated APK.
+
+Expected:
+
+- Version Name: "3.0.1"
+- Version Code: "6"
+
+Provide an APK link only if the artifact genuinely exists.
+
+If signing credentials are unavailable, report whether a debug APK or unsigned artifact was produced. Do not call it a production-signed release.
+
+4. Final audit report
+
+Include:
+
+- Starting commit
+- Final commit
+- Original issue count
+- Confirmed issues
+- Issues fixed
+- Issues partially fixed
+- Issues unresolved
+- External blockers
+- Files changed
+- Tests passed
+- Tests failed
+- Tests not run
+- Build status
+- APK artifact status
+- Remaining risks
+
+5. Firebase action list
+
+Give exact Firebase Console steps if required.
+
+Do not claim they were performed.
+
+6. Backend/server action list
+
+Document exact requirements for:
+
+- Trusted IP-country detection/persistence
+- Shared catalog synchronization
+- Any other required server-side operation
+
+Do not modify or deploy the backend.
+
+7. Final permission audit
+
+List every permission in the final "AndroidManifest.xml".
+
+Explicitly confirm whether these are present:
+
+- "ACCESS_FINE_LOCATION"
+- "ACCESS_COARSE_LOCATION"
+- "ACCESS_BACKGROUND_LOCATION"
+
+IP-country tracking must not require any of these permissions.
+
+8. Final change summary
+
+For each important fix, provide:
+
+- Before
+- Confirmed root cause
+- What changed
+- Files affected
+- Verification result
+
+---
+
+PART 26 — ABSOLUTE QUALITY RULES
+
+1. No fake success reports.
+2. Do not skip source files merely because the project is large.
+3. Do not replace real data with sample data.
+4. Do not hide unresolved problems.
+5. Do not silently remove features.
+6. Do not change the backend.
+7. Do not change live Firebase configuration or security rules.
+8. Do not introduce GPS permission for IP-country tracking.
+9. Do not require login for installation tracking or FCM registration.
+10. Do not claim IP geolocation has GPS accuracy.
+11. Do not expose secrets or tokens.
+12. Do not break Anime functionality to fix Movies.
+13. Do not report a source as playable before actual resolution/playback evidence.
+14. Do not report a download complete before file validation.
+15. Do not claim offline support without offline verification.
+16. Do not claim a build passed unless it actually passed.
+17. Do not stop at the first compilation error.
+18. Do not stop at the first successful build if other tests remain.
+19. Preserve the original "apk-v3" branch.
+20. Keep changes limited to the authorized Android APK project.
+21. Do not repeat the already completed notification scheduler fix without a newly confirmed reason.
+22. Never force-push or merge the PR automatically.
+23. Never claim GitHub changes were pushed without verifying the remote commit.
+24. Never invent Firebase registrations, API fields, endpoints, source data, or test results.
+
+---
+
+START NOW — CONTINUE THE EXISTING GITHUB REPAIR
+
+Do not ask me to upload the original ZIP again.
+
+Begin by:
+
+1. Connecting to "newprophecy2-cloud/ProphecyVerse".
+2. Verifying "ai-studio/apk-v3-repair".
+3. Verifying commit "743a3924237d81429fa07186fab415be19243877" and all newer remote commits.
+4. Inspecting the existing notification scheduler repair.
+5. Creating a safe working copy of the latest repair branch.
+6. Auditing the complete current Android source.
+7. Producing the issue register.
+8. Fixing all confirmed APK-side problems.
+9. Re-auditing every changed area.
+10. Running available tests and Gradle build.
+11. Fixing newly discovered defects.
+12. Repeating verification.
+13. Creating the updated root "APK.md".
+14. Preparing the final source ZIP and actual APK artifact if build/signing permits.
+15. Committing and pushing verified changes to "ai-studio/apk-v3-repair".
+16. Providing the complete final report.
+
+Do not stop after analysis. Continue with actual authorized repairs.
+
+If an external Firebase or backend dependency prevents one feature from being completed safely, implement the independent APK-side portion, document the exact blocker, and continue with every other repair that can be completed.
+
+The existing repair branch is the working branch. Preserve its history and continue from its latest verified commit.

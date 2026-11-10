@@ -22,9 +22,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DownloadEntry::class,
         LocalProfile::class,
         EpisodeSourceSnapshotRecord::class,
-        EpisodeSourceCandidateRecord::class
+        EpisodeSourceCandidateRecord::class,
+        SharedCatalogCacheEntry::class,
+        SharedCatalogPendingEntry::class
     ],
-    version = 6,
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -36,6 +38,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun userPreferenceDao(): UserPreferenceDao
     abstract fun downloadDao(): DownloadDao
     abstract fun localProfileDao(): LocalProfileDao
+    abstract fun sharedCatalogDao(): SharedCatalogDao
 
     companion object {
         @Volatile
@@ -199,6 +202,23 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `season_entries` ADD COLUMN `backendSeasonId` TEXT")
+            }
+        }
+
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `shared_catalog_cache` (`documentId` TEXT NOT NULL, `contentType` TEXT NOT NULL, `canonicalId` TEXT, `backendId` TEXT, `schemaVersion` INTEGER NOT NULL, `metadataHash` TEXT NOT NULL, `payloadJson` TEXT NOT NULL, `lastSyncedAt` INTEGER, PRIMARY KEY(`documentId`))")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shared_catalog_cache_contentType` ON `shared_catalog_cache` (`contentType`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shared_catalog_cache_backendId` ON `shared_catalog_cache` (`backendId`)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `shared_catalog_pending` (`documentId` TEXT NOT NULL, `collectionName` TEXT NOT NULL, `contentType` TEXT NOT NULL, `metadataHash` TEXT NOT NULL, `payloadJson` TEXT NOT NULL, `queuedAt` INTEGER NOT NULL, `retryCount` INTEGER NOT NULL, `nextAttemptAt` INTEGER NOT NULL, `lastErrorCategory` TEXT, `state` TEXT NOT NULL, PRIMARY KEY(`documentId`))")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shared_catalog_pending_state` ON `shared_catalog_pending` (`state`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shared_catalog_pending_nextAttemptAt` ON `shared_catalog_pending` (`nextAttemptAt`)")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -206,7 +226,15 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "prophecyverse.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                    .addMigrations(
+                        MIGRATION_1_2,
+                        MIGRATION_2_3,
+                        MIGRATION_3_4,
+                        MIGRATION_4_5,
+                        MIGRATION_5_6,
+                        MIGRATION_6_7,
+                        MIGRATION_7_8
+                    )
                     .build()
                 INSTANCE = instance
                 instance

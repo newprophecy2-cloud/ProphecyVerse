@@ -51,7 +51,8 @@ class PreResolveQueueManager(
         val directData: DirectPlayData,
         val resolvedAtMs: Long
     ) {
-        fun isExpired(): Boolean = System.currentTimeMillis() - resolvedAtMs > CACHE_TTL_MS
+        fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean =
+            nowMs - resolvedAtMs > CACHE_TTL_MS || SourceExpiryTime.isExpired(directData.expiresAt, nowMs)
     }
 
     // In-memory cache for resolved stream data
@@ -206,6 +207,12 @@ class PreResolveQueueManager(
             preparedCache.remove(cacheKey(backendAnimeId, episodeId))
             null
         }
+    }
+
+    /** Discard a prepared URL after playback failure so retry cannot reuse the same stale resolution. */
+    fun discardPreparedSource(backendAnimeId: String, episodeId: String) {
+        preparedCache.remove(cacheKey(backendAnimeId, episodeId))
+        updateStatusFor(episodeId, ResolutionStatus.FAILED)
     }
 
     private fun updateStatusFor(episodeId: String, status: ResolutionStatus) {
