@@ -65,18 +65,18 @@ jobs:
             } >> "$GITHUB_ENV"
             ./gradlew --no-daemon --stacktrace :app:assembleRelease
             signing_status="signed with configured release keystore"
+            apk_path="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           elif [[ "$signing_count" -eq 0 ]]; then
-            export CI_UNSIGNED_RELEASE=true
-            ./gradlew --no-daemon --stacktrace :app:assembleRelease
-            signing_status="unsigned release APK (no release signing secrets configured)"
+            ./gradlew --no-daemon --stacktrace :app:assembleDebug
+            signing_status="debug-signed APK (no release signing secrets configured)"
+            apk_path="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
           else
             echo "Release signing secrets are only partially configured; refusing to build with incomplete signing material." >&2
             exit 1
           fi
 
-          apk_path="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           if [[ -z "$apk_path" || ! -s "$apk_path" ]]; then
-            echo "Gradle completed but no non-empty release APK was generated." >&2
+            echo "Gradle completed but no non-empty APK was generated." >&2
             exit 1
           fi
 
