@@ -2,6 +2,8 @@ package com.example
 
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.EpisodeNumberWindow
+import com.example.data.repository.EpisodeSourceAggregator
+import com.example.data.repository.EpisodeSourceResponseState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -37,16 +39,39 @@ class EpisodeWindowAndSourcesTest {
     }
 
     @Test
-    fun sourceCandidatesWithSameIdButDifferentProviderLabelsRemainDistinct() {
+    fun sameSourceIdUpdatesMetadataWhileDifferentIdsPreserveProviderIdentity() {
         val sourceA = ProphecySourceDto(id = "same", label = "Provider A", quality = "1080p")
         val sourceB = ProphecySourceDto(id = "same", label = "Provider B", quality = "1080p")
-        val unique = listOf(sourceA, sourceB, sourceA).distinct()
-        assertEquals(2, unique.size)
-        assertEquals(2, unique.map { it.stableIdentity }.distinct().size)
+        val updated = EpisodeSourceAggregator.aggregate(
+            apiCandidates = listOf(sourceA, sourceB),
+            rawStatus = "available",
+            partial = false,
+            errorMessage = null,
+            nowMs = 0L
+        )
+        assertEquals(1, updated.sources.size)
+        assertEquals("Provider B", updated.sources.single().label)
+
+        val separateProviders = EpisodeSourceAggregator.aggregate(
+            apiCandidates = listOf(sourceA.copy(id = "provider-a"), sourceB.copy(id = "provider-b")),
+            rawStatus = "available",
+            partial = false,
+            errorMessage = null,
+            nowMs = 0L
+        )
+        assertEquals(2, separateProviders.sources.size)
         assertFalse(
             ProphecySourceDto(id = "s", label = "A\u001fB", quality = "C").stableIdentity ==
                 ProphecySourceDto(id = "s", label = "A", quality = "B\u001fC").stableIdentity
         )
+    }
+
+    @Test
+    fun declaredSuccessfulEmptyResponseIsNotTreatedAsNetworkFailure() {
+        val confirmedEmpty = EpisodeSourceAggregator.aggregate(emptyList(), "empty", false, null, 0L)
+        val unknownEmpty = EpisodeSourceAggregator.aggregate(null, null, false, null, 0L)
+        assertEquals(EpisodeSourceResponseState.EMPTY, confirmedEmpty.state)
+        assertEquals(EpisodeSourceResponseState.UNKNOWN, unknownEmpty.state)
     }
 
     @Test

@@ -69,9 +69,10 @@ internal fun preserveMovieMediaCategory(
 internal fun isAuthoritativeEpisodeSnapshot(
     partial: Boolean?,
     seasons: List<ProphecySeasonDto>?
-): Boolean = partial == false && seasons != null && seasons.all { season ->
-    season.number > 0 && season.episodes.orEmpty().all { episode ->
-        episode.id.isNotBlank() && episode.number > 0
+): Boolean = partial == false && !seasons.isNullOrEmpty() && seasons.all { season ->
+    season.number > 0 && season.episodes != null && season.episodes.all { episode ->
+        episode.id.isNotBlank() && episode.number > 0 &&
+            (episode.season == null || episode.season == season.number)
     }
 }
 
@@ -112,25 +113,20 @@ class AnimeRepository(
     }
 
     private data class SourceCacheEntry(val snapshot: EpisodeSourceSnapshot)
+    private data class SourceRetryState(val failures: Int, val retryAtMs: Long)
 
     // Short-lived memory tier; Room is the bounded persistent metadata tier.
     private val memorySourcesCache = LinkedHashMap<String, SourceCacheEntry>(16, 0.75f, true)
     private val sourceCacheMutex = Mutex()
-    private data class SourceRetryState(val failures: Int, val retryAtMs: Long)
-    private val sourceRetryStates = LinkedHashMap<String, SourceRetryState>(16, 0.75f, true)
-    private val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
     private data class ResolvedCacheEntry(val data: DirectPlayData, val cachedAtMs: Long)
     private val resolvedPlaybackCache = ConcurrentHashMap<String, ResolvedCacheEntry>()
     private val resolveMutexes = ConcurrentHashMap<String, Mutex>()
-    private val searchMutex = Mutex()
     private val sourceCacheTtlMs = 2 * 60 * 1000L
     private val maxMemorySourceSnapshots = 120
 
     private val homeRefreshMutex = Mutex()
     private var lastHomeRefreshTimestamp: Long = 0L
 
-    // In-memory query cache to avoid repeating identical searches within 5 minutes
-    private val searchCache = LruCache<String, Long>(30)
     private val searchCatalogResults = ConcurrentHashMap<String, List<com.example.data.remote.ProphecySearchResultItem>>()
 
     // Database observation flows (Database-First)
@@ -469,28 +465,95 @@ class AnimeRepository(
      *    and update Room.
      * Never marks an item as playable unless a valid playable source has actually been confirmed.
      */
-    private suspend fun fetchAllProphecySearchResults(query: String): List<com.example.data.remote.ProphecySearchResultItem> {
+    private suspend fun persistProphecySearchPage(
+        normalizedQuery: String,
+        pageItems: List<com.example.data.remote.ProphecySearchResultItem>,
+        rankOffset: Int
+    ) {
+        if (pageItems.isEmpty()) return
+        val writeStartedAt = System.currentTimeMillis()
+        val entries = mutableListOf<AnimeEntry>()
+        val aliases = mutableListOf<AnimeAlias>()
+        val refs = mutableListOf<SearchResultRef>()
+        pageItems.forEachIndexed { index, item ->
+            val existing = animeDao.getAnimeById(item.id)
+            entries += AnimeEntry(
+                id = item.id,
+                aniListId = existing?.aniListId,
+                backendAnimeId = item.id,
+                preferredTitle = item.title,
+                titleEnglish = item.title,
+                format = item.mediaType,
+                year = item.year,
+                posterUrl = item.posterUrl ?: existing?.posterUrl,
+                mediaCategory = backendMediaCategory(item.mediaType) ?: existing?.mediaCategory ?: "ANIME",
+                genres = existing?.genres ?: "",
+                isPlayable = true,
+                updatedAt = System.currentTimeMillis()
+            )
+            aliases += AnimeAlias(
+                animeId = item.id,
+                alias = TitleMatcher.normalize(item.title),
+                originalAlias = item.title
+            )
+            refs += SearchResultRef(
+                normalizedQuery = normalizedQuery,
+                animeId = item.id,
+                rankIndex = rankOffset + index
+            )
+        }
+        animeDao.upsertAnimeList(entries.distinctBy { it.id })
+        animeDao.insertAliases(aliases)
+        if (rankOffset == 0) searchDao.clearSearchResultsForQuery(normalizedQuery)
+        searchDao.insertSearchResultRefs(refs)
+        searchDao.upsertSearchQuery(
+            SearchQuery(query = normalizedQuery, totalResults = rankOffset + refs.size)
+        )
+        Log.i("AnimeRepository", "search_room_update duration_ms=${System.currentTimeMillis() - writeStartedAt} results=${rankOffset + refs.size}")
+    }
+
+    private suspend fun fetchAllProphecySearchResults(
+        query: String,
+        onPage: suspend (items: List<com.example.data.remote.ProphecySearchResultItem>, rankOffset: Int) -> Unit
+    ): List<com.example.data.remote.ProphecySearchResultItem> {
         val results = LinkedHashMap<String, com.example.data.remote.ProphecySearchResultItem>()
         var cursor: String? = null
         val seenCursors = mutableSetOf<String?>()
         var page = 0
+        val searchStartedAt = System.currentTimeMillis()
         do {
             if (!seenCursors.add(cursor) || page >= 10 || results.size >= 500) break
-            val response = prophecyApi.searchAnime(query = query, limit = 50, cursor = cursor)
+            val requestStartedAt = System.currentTimeMillis()
+            val response = try {
+                prophecyApi.searchAnime(query = query, limit = 50, cursor = cursor)
+            } finally {
+                Log.i("AnimeRepository", "search_page duration_ms=${System.currentTimeMillis() - requestStartedAt}")
+            }
             if (!response.isSuccessful) break
             val body = response.body() ?: break
-            body.results.forEach { item -> results.putIfAbsent(item.id, item) }
+            val pageItems = mutableListOf<com.example.data.remote.ProphecySearchResultItem>()
+            body.results.forEach { item ->
+                if (item.id.isNotBlank() && results.putIfAbsent(item.id, item) == null) pageItems += item
+            }
+            if (pageItems.isNotEmpty()) {
+                onPage(pageItems, results.size - pageItems.size)
+                if (page == 0) {
+                    Log.i("AnimeRepository", "search_first_results_available_ms=${System.currentTimeMillis() - searchStartedAt}")
+                }
+            }
             val next = body.nextCursor?.takeIf { it.isNotBlank() }
             val shouldContinue = body.partial == true || next != null
             cursor = if (shouldContinue) next else null
             page++
         } while (cursor != null && results.size < 500)
+        Log.i("AnimeRepository", "search_full_catalog_complete_ms=${System.currentTimeMillis() - searchStartedAt} pages=$page")
         return results.values.toList()
     }
 
     suspend fun searchAnime(query: String): Result<Int> = withContext(Dispatchers.IO) {
         val normQuery = TitleMatcher.normalize(query)
         if (normQuery.isBlank()) return@withContext Result.success(0)
+        val fullSearchStartedAt = System.currentTimeMillis()
 
         // Check if query was run recently (< 3 minutes) and results already exist in Room
         val cachedTime = searchCache.get(normQuery)
@@ -503,7 +566,7 @@ class AnimeRepository(
         }
 
         try {
-            searchMutex.withLock {
+            searchMutexes.computeIfAbsent(normQuery) { Mutex() }.withLock {
                 // Re-check after waiting for an in-flight identical search.
                 val lockedCachedTime = searchCache.get(normQuery)
                 if (lockedCachedTime != null && System.currentTimeMillis() - lockedCachedTime < 3 * 60 * 1000L) {
@@ -514,7 +577,11 @@ class AnimeRepository(
                 // Launch both queries in parallel with bounded concurrency
                 val prophecyDeferred = async {
                     try {
-                            fetchAllProphecySearchResults(query)
+                        fetchAllProphecySearchResults(query) { pageItems, rankOffset ->
+                            persistProphecySearchPage(normQuery, pageItems, rankOffset)
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) {
                         emptyList()
                     }
@@ -528,50 +595,18 @@ class AnimeRepository(
                         )
                         val resp = aniListApi.postQuery(anilistReq)
                         if (resp.isSuccessful) resp.body()?.data?.page?.media ?: emptyList() else emptyList()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) {
                         emptyList()
                     }
                 }
 
-                // Tier 1: Wait for ProphecyVerse results and display progressively if fast
+                // First page was already written by the fetch callback; subsequent pages also
+                // update Room before optional AniList matching completes.
                 val prophecyItems = prophecyDeferred.await()
                 searchCatalogResults[normQuery] = prophecyItems.take(20)
                 if (searchCatalogResults.size > 20) searchCatalogResults.keys.filter { it != normQuery }.take(5).forEach { searchCatalogResults.remove(it) }
-                if (prophecyItems.isNotEmpty()) {
-                    val tier1Entries = mutableListOf<AnimeEntry>()
-                    val tier1Aliases = mutableListOf<AnimeAlias>()
-                    val tier1Refs = mutableListOf<SearchResultRef>()
-                    var r1 = 0
-
-                    for (pItem in prophecyItems) {
-                        val existing = animeDao.getAnimeById(pItem.id)
-                        val entry = AnimeEntry(
-                            id = pItem.id,
-                            aniListId = existing?.aniListId,
-                            backendAnimeId = pItem.id,
-                            preferredTitle = pItem.title,
-                            titleEnglish = pItem.title,
-                            format = pItem.mediaType,
-                            year = pItem.year,
-                            posterUrl = pItem.posterUrl ?: existing?.posterUrl,
-                            mediaCategory = backendMediaCategory(pItem.mediaType) ?: existing?.mediaCategory ?: "ANIME",
-                            genres = existing?.genres ?: "",
-                            isPlayable = true,
-                            updatedAt = System.currentTimeMillis()
-                        )
-                        tier1Entries.add(entry)
-                        tier1Aliases.add(AnimeAlias(animeId = pItem.id, alias = TitleMatcher.normalize(pItem.title), originalAlias = pItem.title))
-                        tier1Refs.add(SearchResultRef(normalizedQuery = normQuery, animeId = pItem.id, rankIndex = r1++))
-                    }
-
-                    // Progressive write: update Room so the UI immediately shows confirmed playable results!
-                    animeDao.upsertAnimeList(tier1Entries)
-                    animeDao.insertAliases(tier1Aliases)
-                    searchDao.clearSearchResultsForQuery(normQuery)
-                    searchDao.insertSearchResultRefs(tier1Refs)
-                    searchDao.upsertSearchQuery(SearchQuery(query = normQuery, totalResults = tier1Refs.size))
-                }
-
                 // Tier 2: Process AniList results and enhance metadata
                 val aniListItems = anilistDeferred.await()
                 val entriesToUpsert = mutableListOf<AnimeEntry>()
@@ -671,6 +706,7 @@ class AnimeRepository(
                 }
 
                 if (entriesToUpsert.isNotEmpty()) {
+                    val finalWriteStartedAt = System.currentTimeMillis()
                     val uniqueEntries = entriesToUpsert.distinctBy { it.id }
                     val uniqueRefs = finalRefs.distinctBy { it.animeId }
                     animeDao.upsertAnimeList(uniqueEntries)
@@ -679,11 +715,15 @@ class AnimeRepository(
                     searchDao.insertSearchResultRefs(uniqueRefs.mapIndexed { index, ref -> ref.copy(rankIndex = index) })
                     searchDao.upsertSearchQuery(SearchQuery(query = normQuery, totalResults = uniqueRefs.size))
                     searchCache.put(normQuery, System.currentTimeMillis())
+                    Log.i("AnimeRepository", "search_final_room_update_ms=${System.currentTimeMillis() - finalWriteStartedAt} results=${uniqueRefs.size}")
                 }
 
+                    Log.i("AnimeRepository", "search_full_completion_ms=${System.currentTimeMillis() - fullSearchStartedAt}")
                     Result.success(finalRefs.distinctBy { it.animeId }.size.coerceAtLeast(prophecyItems.size))
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -693,10 +733,18 @@ class AnimeRepository(
      * Refreshes details and seasons/episodes for a given anime.
      * Persists seasons and episodes to Room so the UI observes Room.
      */
-    suspend fun refreshAnimeDetails(animeId: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun refreshAnimeDetails(animeId: String): Result<EpisodeCatalogRefreshStatus> = withContext(Dispatchers.IO) {
+      detailRefreshMutexes.computeIfAbsent(animeId) { Mutex() }.withLock {
+        val refreshStartedAt = System.currentTimeMillis()
         try {
             var currentEntry = animeDao.getAnimeById(animeId)
             var backendId = currentEntry?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
+            var detailsSucceeded = false
+            var episodeListSucceeded = false
+            var snapshotComplete = false
+            var detailHttpCode: Int? = null
+            var episodeHttpCode: Int? = null
+            var currentRefreshEpisodeIds: Set<String> = emptySet()
 
             // Check existing catalog mapping table first
             if (backendId == null && currentEntry?.aniListId != null) {
@@ -761,24 +809,39 @@ class AnimeRepository(
             if (backendId != null) {
                 val (detailResp, epResp) = coroutineScope {
                     val detailDeferred = async {
-                        try { prophecyApi.getAnimeDetails(backendId) }
+                        val startedAt = System.currentTimeMillis()
+                        try { prophecyApi.getAnimeDetails(backendId).also {
+                            Log.i("AnimeRepository", "detail_endpoint_ms=${System.currentTimeMillis() - startedAt}")
+                        } }
                         catch (cancelled: CancellationException) { throw cancelled }
-                        catch (_: Exception) { null }
+                        catch (_: Exception) {
+                            Log.i("AnimeRepository", "detail_endpoint_ms=${System.currentTimeMillis() - startedAt} failed=true")
+                            null
+                        }
                     }
                     val episodesDeferred = async {
-                        try { prophecyApi.getAnimeEpisodes(backendId) }
+                        val startedAt = System.currentTimeMillis()
+                        try { prophecyApi.getAnimeEpisodes(backendId).also {
+                            Log.i("AnimeRepository", "episode_endpoint_ms=${System.currentTimeMillis() - startedAt}")
+                        } }
                         catch (cancelled: CancellationException) { throw cancelled }
-                        catch (_: Exception) { null }
+                        catch (_: Exception) {
+                            Log.i("AnimeRepository", "episode_endpoint_ms=${System.currentTimeMillis() - startedAt} failed=true")
+                            null
+                        }
                     }
                     detailDeferred.await() to episodesDeferred.await()
                 }
+                detailHttpCode = detailResp?.code()
+                episodeHttpCode = epResp?.code()
 
                 val seasonsList = mutableListOf<SeasonEntry>()
-                val episodesList = mutableListOf<EpisodeEntry>()
+                val episodeCandidates = mutableListOf<EpisodeRecordCandidate>()
                 var episodeSnapshotComplete = false
                 val sharedRecords = mutableListOf<SharedCatalogMetadata>()
 
                 if (detailResp?.isSuccessful == true && detailResp.body() != null) {
+                    detailsSucceeded = true
                     val body = detailResp.body()!!
 
                     // Update AnimeEntry
@@ -826,6 +889,7 @@ class AnimeRepository(
                     // Current responses can explicitly be partial. Unknown completeness is treated
                     // conservatively so a partial/older response cannot erase cached Episodes.
                     episodeSnapshotComplete = isAuthoritativeEpisodeSnapshot(body.partial, body.seasons)
+                    snapshotComplete = episodeSnapshotComplete
                     body.seasons?.forEach { s ->
                         if (s.number <= 0) return@forEach
                         val sNum = s.number
@@ -843,21 +907,26 @@ class AnimeRepository(
                             if (ep.id.isBlank() || ep.number <= 0) return@episodeLoop
                             // The containing backend season is authoritative when an episode omits its season.
                             val epSeason = ep.season?.takeIf { it > 0 } ?: sNum
-                            episodesList.add(
-                                EpisodeEntry(
+                            episodeCandidates.add(
+                                EpisodeRecordCandidate(
+                                    episode = EpisodeEntry(
                                     id = ep.id,
                                     animeId = animeId,
                                     seasonNumber = epSeason,
                                     episodeNumber = ep.number,
                                     title = ep.title,
                                     overview = ep.overview
+                                    ),
+                                    canonicalId = ep.canonicalId,
+                                    source = EpisodeRecordSource.DETAILS
                                 )
                             )
                         }
                     }
                 }
 
-                if (epResp?.isSuccessful == true && !epResp.body().isNullOrEmpty()) {
+                if (epResp?.isSuccessful == true && epResp.body() != null) {
+                    episodeListSucceeded = true
                     // This endpoint has no explicit partial/completeness marker, so merge its
                     // records but never use it alone as authority to delete cached Episodes.
                     val dtoList = epResp.body()!!
@@ -866,20 +935,19 @@ class AnimeRepository(
                         if (ep.id.isBlank() || ep.season == null || ep.season <= 0 || ep.number <= 0) return@episodeLoop
                         val sNum = ep.season
                         seasonsSet.add(sNum)
-                        val newEp = EpisodeEntry(
-                            id = ep.id,
-                            animeId = animeId,
-                            seasonNumber = sNum,
-                            episodeNumber = ep.number,
-                            title = ep.title,
-                            overview = ep.overview
+                        val newEp = EpisodeRecordCandidate(
+                            episode = EpisodeEntry(
+                                id = ep.id,
+                                animeId = animeId,
+                                seasonNumber = sNum,
+                                episodeNumber = ep.number,
+                                title = ep.title,
+                                overview = ep.overview
+                            ),
+                            canonicalId = ep.canonicalId,
+                            source = EpisodeRecordSource.EPISODE_LIST
                         )
-                        val existingIndex = episodesList.indexOfFirst { it.id == ep.id }
-                        if (existingIndex >= 0) {
-                            episodesList[existingIndex] = newEp
-                        } else {
-                            episodesList.add(newEp)
-                        }
+                        episodeCandidates.add(newEp)
                     }
                     seasonsSet.sorted().forEach { sNum ->
                         if (seasonsList.none { it.seasonNumber == sNum }) {
@@ -895,6 +963,7 @@ class AnimeRepository(
                     }
                 }
 
+                val episodesList = EpisodeCatalogIdentity.merge(episodeCandidates)
                 // Ensure every season present in episodesList has a corresponding SeasonEntry
                 episodesList.map { it.seasonNumber }.distinct().sorted().forEach { sNum ->
                     if (seasonsList.none { it.seasonNumber == sNum }) {
@@ -911,53 +980,84 @@ class AnimeRepository(
 
                 val incomingSeasons = seasonsList.distinctBy { it.id }
                 val incomingEpisodes = episodesList.distinctBy { it.id }
+                currentRefreshEpisodeIds = incomingEpisodes.map { it.id }.toSet()
+                val roomWriteStartedAt = System.currentTimeMillis()
                 if (episodeSnapshotComplete) {
                     episodeDao.replaceEpisodeSnapshot(animeId, incomingSeasons, incomingEpisodes)
                 } else if (incomingSeasons.isNotEmpty() || incomingEpisodes.isNotEmpty()) {
                     episodeDao.mergeEpisodeSnapshot(animeId, incomingSeasons, incomingEpisodes)
                 }
+                Log.i("AnimeRepository", "catalog_room_update_ms=${System.currentTimeMillis() - roomWriteStartedAt} episodes=${incomingEpisodes.size}")
                 // All backend-driven Room writes are committed before optional Firestore traffic.
                 sharedRecords.forEach { sharedCatalog.acceptBackendMetadata(it) }
                 sharedCatalog.processPendingQueue()
             }
 
-            // Also enrich metadata via AniList if available
-            if (currentEntry?.aniListId != null) {
-                val alResp = try {
-                    aniListApi.postQuery(
-                        AniListGraphQLRequest(
-                            query = AniListQueries.MEDIA_DETAILS,
-                            variables = mapOf("id" to currentEntry.aniListId)
-                        )
-                    )
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    null
+            val cachedEpisodeCount = episodeDao.getEpisodesForAnime(animeId).size
+            val state = resolveEpisodeCatalogState(
+                snapshotComplete = snapshotComplete,
+                cachedEpisodeCount = cachedEpisodeCount,
+                backendIdKnown = backendId != null,
+                detailsEndpointSucceeded = detailsSucceeded,
+                episodeListEndpointSucceeded = episodeListSucceeded
+            )
+            val endpointErrors = buildList {
+                if (backendId != null && !detailsSucceeded) {
+                    add("Anime details endpoint failed${detailHttpCode?.let { " (HTTP $it)" }.orEmpty()}.")
                 }
-
-                if (alResp?.isSuccessful == true && alResp.body()?.data?.media != null) {
-                    val m = alResp.body()!!.data!!.media!!
-                    val enriched = (animeDao.getAnimeById(animeId) ?: currentEntry).copy(
-                        titleRomaji = m.title?.romaji,
-                        titleEnglish = m.title?.english,
-                        titleNative = m.title?.native,
-                        synopsis = m.description ?: currentEntry.synopsis,
-                        bannerUrl = m.bannerImage ?: currentEntry.bannerUrl,
-                        score = m.averageScore?.let { it / 10.0 } ?: currentEntry.score,
-                        studios = m.studios?.nodes?.firstOrNull()?.name ?: currentEntry.studios,
-                        episodeCount = m.episodes ?: currentEntry.episodeCount,
-                        duration = m.duration ?: currentEntry.duration
-                    )
-                    animeDao.upsertAnime(enriched)
+                if (backendId != null && !episodeListSucceeded) {
+                    add("Episode list endpoint failed${episodeHttpCode?.let { " (HTTP $it)" }.orEmpty()}.")
                 }
             }
-
-            Result.success(Unit)
+            val refreshStatus = EpisodeCatalogRefreshStatus(
+                state = state,
+                detailsEndpointSucceeded = detailsSucceeded,
+                episodeListEndpointSucceeded = episodeListSucceeded,
+                errorMessage = endpointErrors.takeIf { it.isNotEmpty() }?.joinToString(" "),
+                currentRefreshEpisodeIds = currentRefreshEpisodeIds
+            )
+            Log.i("AnimeRepository", "detail_catalog_full_completion_ms=${System.currentTimeMillis() - refreshStartedAt} state=${state.name}")
+            Result.success(refreshStatus)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
             Result.failure(e)
+        }
+      }
+    }
+
+    /** Optional metadata enrichment runs after core catalog rows are already available to the UI. */
+    suspend fun refreshOptionalAniListMetadata(animeId: String) = withContext(Dispatchers.IO) {
+        val existing = animeDao.getAnimeById(animeId) ?: return@withContext
+        val aniListId = existing.aniListId ?: return@withContext
+        val startedAt = System.currentTimeMillis()
+        try {
+            val response = aniListApi.postQuery(
+                AniListGraphQLRequest(
+                    query = AniListQueries.MEDIA_DETAILS,
+                    variables = mapOf("id" to aniListId)
+                )
+            )
+            Log.i("AnimeRepository", "optional_anilist_metadata_ms=${System.currentTimeMillis() - startedAt} success=${response.isSuccessful}")
+            val media = response.body()?.data?.media.takeIf { response.isSuccessful } ?: return@withContext
+            val current = animeDao.getAnimeById(animeId) ?: existing
+            animeDao.upsertAnime(
+                current.copy(
+                    titleRomaji = media?.title?.romaji ?: current.titleRomaji,
+                    titleEnglish = media?.title?.english ?: current.titleEnglish,
+                    titleNative = media?.title?.native ?: current.titleNative,
+                    synopsis = media?.description ?: current.synopsis,
+                    bannerUrl = media?.bannerImage ?: current.bannerUrl,
+                    score = media?.averageScore?.let { it / 10.0 } ?: current.score,
+                    studios = media?.studios?.nodes?.firstOrNull()?.name ?: current.studios,
+                    episodeCount = media?.episodes ?: current.episodeCount,
+                    duration = media?.duration ?: current.duration
+                )
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            Log.i("AnimeRepository", "optional_anilist_metadata_ms=${System.currentTimeMillis() - startedAt} failed=true")
         }
     }
 
@@ -1003,22 +1103,29 @@ class AnimeRepository(
         episodeNumber: Int? = null
     ): Result<EpisodeSourceSnapshot> = withContext(Dispatchers.IO) {
         val cacheKey = sourceCacheKey(backendAnimeId, seasonNumber, episodeId)
+        val generationAtStart = sourceFetchGenerations.computeIfAbsent(cacheKey) { java.util.concurrent.atomic.AtomicLong() }.get()
         val cachedAtStart = readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
         if (!forceRefresh && cachedAtStart != null && !cachedAtStart.isStale) {
             return@withContext Result.success(cachedAtStart)
         }
         sourceFetchMutexes.computeIfAbsent(cacheKey) { Mutex() }.withLock {
             val cached = readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
+            if (forceRefresh && sourceFetchGenerations[cacheKey]?.get()?.let { it > generationAtStart } == true && cached != null) {
+                return@withContext Result.success(cached)
+            }
             if (!forceRefresh && cached != null && !cached.isStale) {
                 return@withContext Result.success(cached)
             }
             val retryRemainingMs = sourceRetryRemainingMs(cacheKey)
-            if (retryRemainingMs > 0L) {
+            if (EpisodeSourceRetryBackoff.shouldDelay(forceRefresh, retryRemainingMs)) {
                 val message = "Source retry is delayed by backoff for ${(retryRemainingMs + 999L) / 1000L} seconds."
                 return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
             }
+            val sourceDiscoveryStartedAt = System.currentTimeMillis()
             try {
+                val requestStartedAt = System.currentTimeMillis()
                 val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
+                Log.i("AnimeRepository", "source_lookup_http_ms=${System.currentTimeMillis() - requestStartedAt}")
                 if (!response.isSuccessful || response.body() == null) {
                     val retryable = response.code() == 408 || response.code() == 429 || response.code() >= 500 || response.body() == null
                     val retryRemaining = if (retryable) recordSourceFailure(cacheKey) else 0L
@@ -1026,6 +1133,7 @@ class AnimeRepository(
                         append("Episode source request failed with HTTP ${response.code()}.")
                         if (retryRemaining > 0L) append(" Retry after ${(retryRemaining + 999L) / 1000L} seconds.")
                     }
+                    Log.i("AnimeRepository", "source_discovery_total_ms=${System.currentTimeMillis() - sourceDiscoveryStartedAt} outcome=failed")
                     return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
                 }
                 val body = response.body()!!
@@ -1047,15 +1155,17 @@ class AnimeRepository(
                         ?: "The response did not confirm an empty source list."
                     return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
                 }
-                val authoritativeComplete = body.sourcesPartial == false && body.sourceError.isNullOrBlank()
+                val authoritativeComplete = body.sourcesPartial == false && body.sources != null && body.sourceError.isNullOrBlank()
                 val mergedCandidates = EpisodeSourceCachePolicy.mergeRefreshCandidates(
                     existingCandidates = cached?.sources.orEmpty(),
                     incomingCandidates = aggregated.sources,
                     authoritativeComplete = authoritativeComplete,
                     nowMs = System.currentTimeMillis()
                 )
-                val retainedCachedCandidates = !authoritativeComplete &&
-                    cached?.sources.orEmpty().any { it !in aggregated.sources }
+                val incomingIds = aggregated.sources.mapNotNull { it.id.trim().takeIf(String::isNotEmpty) }.toSet()
+                val retainedCachedCandidates = !authoritativeComplete && cached?.sources.orEmpty().any { old ->
+                    if (old.hasUsableSourceId) old.id.trim() !in incomingIds else old !in aggregated.sources
+                }
                 val snapshotState = if (retainedCachedCandidates && aggregated.state == EpisodeSourceResponseState.AVAILABLE) {
                     EpisodeSourceResponseState.UNKNOWN
                 } else {
@@ -1083,6 +1193,8 @@ class AnimeRepository(
                     exactDuplicateCount = aggregated.exactDuplicateCount
                 )
                 storeSourceSnapshot(cacheKey, backendAnimeId, episodeId, snapshot)
+                sourceFetchGenerations.computeIfAbsent(cacheKey) { java.util.concurrent.atomic.AtomicLong() }.incrementAndGet()
+                Log.i("AnimeRepository", "source_discovery_total_ms=${System.currentTimeMillis() - sourceDiscoveryStartedAt} state=${snapshot.state.name} candidates=${snapshot.sources.size}")
                 Result.success(snapshot)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -1092,6 +1204,7 @@ class AnimeRepository(
                     append(if (isTimeoutFailure(e)) "Source refresh timed out." else "Source refresh failed.")
                     append(" Retry after ${(retryRemaining + 999L) / 1000L} seconds.")
                 }
+                Log.i("AnimeRepository", "source_discovery_total_ms=${System.currentTimeMillis() - sourceDiscoveryStartedAt} outcome=failed timeout=${isTimeoutFailure(e)}")
                 staleSourceFallback(cached, seasonNumber, episodeNumber, message, IllegalStateException(message, e))
             }
         }
@@ -1233,24 +1346,24 @@ class AnimeRepository(
         }
     }
 
-    private suspend fun sourceRetryRemainingMs(cacheKey: String): Long = sourceCacheMutex.withLock {
+    private suspend fun sourceRetryRemainingMs(cacheKey: String): Long = sourceRetryMutex.withLock {
         ((sourceRetryStates[cacheKey]?.retryAtMs ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
     }
 
-    private suspend fun recordSourceFailure(cacheKey: String): Long = sourceCacheMutex.withLock {
-        val now = System.currentTimeMillis()
-        val failures = (sourceRetryStates[cacheKey]?.failures ?: 0) + 1
-        val jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(0L, 30_001L)
-        val delayMs = EpisodeSourceRetryBackoff.delayMs(failures, jitter)
-        sourceRetryStates[cacheKey] = SourceRetryState(failures, now + delayMs)
-        while (sourceRetryStates.size > maxMemorySourceSnapshots) {
-            sourceRetryStates.remove(sourceRetryStates.keys.iterator().next())
+    private suspend fun recordSourceFailure(cacheKey: String): Long = sourceRetryMutex.withLock {
+            val now = System.currentTimeMillis()
+            val failures = (sourceRetryStates[cacheKey]?.failures ?: 0) + 1
+            val jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(0L, 30_001L)
+            val delayMs = EpisodeSourceRetryBackoff.delayMs(failures, jitter)
+            sourceRetryStates[cacheKey] = SourceRetryState(failures, now + delayMs)
+            while (sourceRetryStates.size > maxMemorySourceSnapshots) {
+                sourceRetryStates.remove(sourceRetryStates.keys.firstOrNull() ?: break)
+            }
+            delayMs
         }
-        delayMs
-    }
 
     private suspend fun clearSourceFailure(cacheKey: String) {
-        sourceCacheMutex.withLock { sourceRetryStates.remove(cacheKey) }
+        sourceRetryMutex.withLock { sourceRetryStates.remove(cacheKey) }
     }
 
     private fun candidateCacheKey(cacheKey: String, source: ProphecySourceDto): String {
@@ -1278,7 +1391,9 @@ class AnimeRepository(
                 return@withContext Result.success(cached.data)
             }
         try {
+            val resolutionStartedAt = System.currentTimeMillis()
             val response = prophecyApi.resolveDirectPlay(DirectPlayRequest(sourceId = sourceId))
+            Log.i("AnimeRepository", "direct_play_resolution_ms=${System.currentTimeMillis() - resolutionStartedAt} http_status=${response.code()}")
             if (!response.isSuccessful || response.body() == null) {
                 return@withContext Result.failure(Exception("Direct playback resolution failed: ${response.code()}"))
             }
@@ -1407,5 +1522,15 @@ class AnimeRepository(
             searchDao.clearAllSearchResultRefs()
             animeDao.clearUnsavedCache()
         }
+    }
+
+    private companion object {
+        val searchCache = LruCache<String, Long>(30)
+        val searchMutexes = ConcurrentHashMap<String, Mutex>()
+        val detailRefreshMutexes = ConcurrentHashMap<String, Mutex>()
+        val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
+        val sourceFetchGenerations = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+        val sourceRetryMutex = Mutex()
+        val sourceRetryStates = ConcurrentHashMap<String, SourceRetryState>()
     }
 }

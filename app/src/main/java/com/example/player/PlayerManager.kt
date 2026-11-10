@@ -118,11 +118,16 @@ class PlayerManager(
         val isSupported: Boolean = true
     )
 
+    enum class PlaybackFailureCategory {
+        HTTP, NETWORK_TIMEOUT, NETWORK, CONTENT_TYPE, CONTAINER, AUDIO_DECODER, DECODER, MANIFEST, OTHER
+    }
+
     fun initializePlayer(
         directData: DirectPlayData,
         startPositionMs: Long = 0L,
         onPlaybackFailed: (() -> Unit)? = null,
-        onRetryNeeded: () -> Unit
+        onRetryNeeded: () -> Unit,
+        providerName: String? = null
     ): ExoPlayer {
         release()
         val generation = playbackGeneration
@@ -134,6 +139,8 @@ class PlayerManager(
         _isBuffering.value = true
         _duration.value = 0L
         _currentPosition.value = startPositionMs
+        val providerDiagnostic = providerName?.replace(Regex("[\\r\\n\\t]"), " ")?.take(64) ?: "unknown"
+        Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
         // Build safe HTTP DataSource with response-authorized headers
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -143,12 +150,13 @@ class PlayerManager(
 
         val headerMap = mutableMapOf<String, String>()
         var userAgentConfigured = false
-
         if (directData.headers.isNotEmpty()) {
             for (headerPair in directData.headers) {
                 if (headerPair.size >= 2) {
                     val key = headerPair[0]
                     val value = headerPair[1]
+                    if (key.isBlank() || value.contains('\r') || value.contains('\n') ||
+                        isRedirectSensitiveHeader(key)) continue
                     if (key.equals("User-Agent", ignoreCase = true)) {
                         httpDataSourceFactory.setUserAgent(value)
                         userAgentConfigured = true
@@ -291,7 +299,7 @@ class PlayerManager(
                 initializedTimestampMs: Long,
                 initializationDurationMs: Long
             ) {
-                Log.i(TAG, "Audio decoder initialized: $decoderName (init took ${initializationDurationMs}ms)")
+                Log.i(TAG, "Audio decoder initialized: $decoderName init_ms=${initializationDurationMs} provider=$providerDiagnostic")
                 _activeAudioDecoder.value = decoderName
             }
         })
@@ -358,7 +366,7 @@ class PlayerManager(
 
             override fun onTracksChanged(tracks: Tracks) {
                 if (generation != playbackGeneration || player !== exoPlayer) return
-                extractTracks(tracks)
+                extractTracks(tracks, providerDiagnostic)
                 val dur = player.duration
                 if (dur > 0 && dur != C.TIME_UNSET) {
                     _duration.value = dur
@@ -369,13 +377,15 @@ class PlayerManager(
                 if (generation != playbackGeneration || player !== exoPlayer) return
                 if (videoSize.height > 0) {
                     _videoResolution.value = "${videoSize.height}p"
+                    Log.i(TAG, "media3_video_resolution=${videoSize.height}p provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"}")
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
                 if (generation != playbackGeneration || player !== exoPlayer) return
                 _isBuffering.value = false
-                Log.e(TAG, "ExoPlayer error [${error.errorCode}]: ${error.message}", error)
+                val failureCategory = classifyPlaybackError(error)
+                Log.e(TAG, "ExoPlayer failure category=$failureCategory code=${error.errorCode} provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
                 // If track switching failed due to unsupported decoder on selected track, recover smoothly
                 if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
@@ -410,11 +420,16 @@ class PlayerManager(
                     _errorMessage.value = "Source failed to play. Trying alternative source..."
                     onPlaybackFailedCallback?.invoke()
                 } else {
-                    val msg = when (error.errorCode) {
-                        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "Source unavailable (HTTP error)"
-                        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED -> "Audio/video decoder unsupported on this device"
-                        PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> "Media container not supported by device"
-                        else -> "Playback error encountered. Please select another source."
+                    val msg = when (failureCategory) {
+                        PlaybackFailureCategory.HTTP -> "The stream request was rejected by the server (HTTP error)."
+                        PlaybackFailureCategory.NETWORK_TIMEOUT -> "The stream request timed out. Check the connection and retry."
+                        PlaybackFailureCategory.NETWORK -> "The stream could not be reached. Check the connection and retry."
+                        PlaybackFailureCategory.CONTENT_TYPE -> "The server returned a content type Media3 could not use."
+                        PlaybackFailureCategory.CONTAINER -> "The media container is not supported by this device."
+                        PlaybackFailureCategory.AUDIO_DECODER -> "The audio codec could not be decoded on this device."
+                        PlaybackFailureCategory.DECODER -> "The media codec could not be decoded on this device."
+                        PlaybackFailureCategory.MANIFEST -> "The HLS/DASH manifest could not be parsed."
+                        PlaybackFailureCategory.OTHER -> "Playback failed. Please select another source."
                     }
                     _errorMessage.value = msg
                 }
@@ -437,7 +452,7 @@ class PlayerManager(
         return player
     }
 
-    private fun extractTracks(tracks: Tracks) {
+    private fun extractTracks(tracks: Tracks, providerDiagnostic: String) {
         val audioList = mutableListOf<TrackOption>()
         val subList = mutableListOf<TrackOption>()
         val qualityList = mutableListOf<TrackOption>()
@@ -447,13 +462,20 @@ class PlayerManager(
         var anyVideoSelected = false
 
         for ((groupIndex, groupInfo) in tracks.groups.withIndex()) {
-            val trackGroup = groupInfo.mediaTrackGroup
-            val type = trackGroup.type
+                val trackGroup = groupInfo.mediaTrackGroup
+                val type = trackGroup.type
 
             for (i in 0 until trackGroup.length) {
                 val format = trackGroup.getFormat(i)
                 val isSelected = groupInfo.isTrackSelected(i)
                 val isSupported = groupInfo.isTrackSupported(i)
+                if (type == C.TRACK_TYPE_AUDIO || type == C.TRACK_TYPE_VIDEO) {
+                    Log.i(
+                        TAG,
+                        "media3_track provider=${providerDiagnostic} type=${if (type == C.TRACK_TYPE_VIDEO) "video" else "audio"} " +
+                            "sample_mime=${format.sampleMimeType ?: "unknown"} codec=${format.codecs ?: "unknown"}"
+                    )
+                }
 
                 when (type) {
                     C.TRACK_TYPE_AUDIO -> {
@@ -715,39 +737,72 @@ class PlayerManager(
     companion object {
         const val TAG = "PlayerManager"
 
+        /** Custom credential headers are not forwarded through uncontrolled CDN redirects. */
+        fun isRedirectSensitiveHeader(headerName: String): Boolean {
+            val name = headerName.trim().lowercase()
+            val sensitiveTerms = listOf(
+                "auth", "cookie", "token", "signature", "secret", "credential", "password", "key",
+                "api-key", "api_key", "apikey", "access-key", "access_key", "private-key", "private_key"
+            )
+            return sensitiveTerms.any(name::contains)
+        }
+
+        fun classifyPlaybackError(error: PlaybackException): PlaybackFailureCategory {
+            if (generateSequence(error as Throwable?) { it.cause }.any { it is java.net.SocketTimeoutException }) {
+                return PlaybackFailureCategory.NETWORK_TIMEOUT
+            }
+            return when (error.errorCode) {
+                PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> PlaybackFailureCategory.HTTP
+                PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE -> PlaybackFailureCategory.CONTENT_TYPE
+                PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> PlaybackFailureCategory.NETWORK
+                PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+                PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED -> PlaybackFailureCategory.DECODER
+                PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED -> PlaybackFailureCategory.AUDIO_DECODER
+                PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> PlaybackFailureCategory.CONTAINER
+                else -> {
+                    val causes = generateSequence(error as Throwable?) { it.cause }
+                    if (causes.any { it.javaClass.simpleName.contains("Manifest", ignoreCase = true) ||
+                            it.javaClass.simpleName.contains("Parser", ignoreCase = true) }) {
+                        PlaybackFailureCategory.MANIFEST
+                    } else {
+                        PlaybackFailureCategory.OTHER
+                    }
+                }
+            }
+        }
+
         /**
          * Infers MIME type from direct response data (url_type, content_type, filename, or URI path).
          * This prevents ExoPlayer from failing when Cloudflare R2, S3, or CDN token URLs lack
          * a file extension in their path.
          */
         fun detectMimeType(directData: DirectPlayData): String? {
-            val urlType = directData.urlType.lowercase()
+            val urlType = directData.urlType.lowercase().trim()
             val contentType = directData.contentType?.lowercase() ?: ""
-            val playbackUrl = directData.playbackUrl.lowercase()
+            val path = Uri.parse(directData.playbackUrl).path.orEmpty().lowercase()
 
             return when {
-                urlType == "hls" ||
-                contentType.contains("mpegurl") ||
-                contentType.contains("m3u8") ||
-                playbackUrl.contains(".m3u8") -> MimeTypes.APPLICATION_M3U8
+                contentType.contains("mpegurl") || contentType.contains("m3u8") -> MimeTypes.APPLICATION_M3U8
 
-                urlType == "dash" ||
-                contentType.contains("dash") ||
-                contentType.contains("mpd") ||
-                playbackUrl.contains(".mpd") -> MimeTypes.APPLICATION_MPD
+                contentType.contains("dash") || contentType.contains("mpd") -> MimeTypes.APPLICATION_MPD
 
-                contentType.contains("matroska") ||
-                playbackUrl.contains(".mkv") ||
-                playbackUrl.contains("mkv%22") ||
-                playbackUrl.contains("filename%3d%22") && playbackUrl.contains(".mkv") -> MimeTypes.VIDEO_MATROSKA
+                contentType.contains("matroska") || contentType.contains("x-mkv") -> MimeTypes.VIDEO_MATROSKA
 
-                contentType.contains("mp4") ||
-                playbackUrl.contains(".mp4") ||
-                playbackUrl.contains("mp4%22") ||
-                playbackUrl.contains("filename%3d%22") && playbackUrl.contains(".mp4") -> MimeTypes.VIDEO_MP4
+                contentType.contains("mp4") -> MimeTypes.VIDEO_MP4
 
-                contentType.contains("webm") ||
-                playbackUrl.contains(".webm") -> MimeTypes.VIDEO_WEBM
+                contentType.contains("webm") -> MimeTypes.VIDEO_WEBM
+
+                urlType == "hls" || urlType == "m3u8" -> MimeTypes.APPLICATION_M3U8
+                urlType == "dash" || urlType == "mpd" -> MimeTypes.APPLICATION_MPD
+                urlType == "mkv" || urlType == "matroska" -> MimeTypes.VIDEO_MATROSKA
+                urlType == "mp4" -> MimeTypes.VIDEO_MP4
+                urlType == "webm" -> MimeTypes.VIDEO_WEBM
+
+                path.endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
+                path.endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
+                path.endsWith(".mkv") -> MimeTypes.VIDEO_MATROSKA
+                path.endsWith(".mp4") -> MimeTypes.VIDEO_MP4
+                path.endsWith(".webm") -> MimeTypes.VIDEO_WEBM
 
                 else -> null
             }

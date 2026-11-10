@@ -70,6 +70,9 @@ object EpisodeSourceRetryBackoff {
         val base = (2_000L * (1L shl (attempts - 1).coerceAtMost(6))).coerceAtMost(120_000L)
         return base + jitterMs.coerceIn(0L, base / 4L)
     }
+
+    fun shouldDelay(forceRefresh: Boolean, remainingMs: Long): Boolean =
+        !forceRefresh && remainingMs > 0L
 }
 
 object EpisodeSourceCachePolicy {
@@ -80,10 +83,11 @@ object EpisodeSourceCachePolicy {
         nowMs: Long
     ): List<ProphecySourceDto> {
         val candidates = if (authoritativeComplete) incomingCandidates else existingCandidates + incomingCandidates
-        return candidates.filterNot { candidate ->
+        val unexpired = candidates.filterNot { candidate ->
             val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
             expiry != null && expiry <= nowMs
-        }.distinct()
+        }
+        return mergeBySourceIdentity(unexpired)
     }
 
     fun staleAfterRefreshFailure(
@@ -121,15 +125,26 @@ object EpisodeSourceAggregator {
             val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
             expiry != null && expiry <= nowMs
         }
-        val candidates = nonExpired.distinct()
+        val candidates = mergeBySourceIdentity(nonExpired)
         val status = rawStatus?.trim()?.takeIf(String::isNotEmpty)
+        val declaredState = status?.uppercase(Locale.US)
+            ?.let { value -> EpisodeSourceResponseState.values().firstOrNull { it.name == value } }
         val explicitTimeout = errorMessage?.contains("timed out", ignoreCase = true) == true ||
-            errorMessage?.contains("timeout", ignoreCase = true) == true
+            errorMessage?.contains("timeout", ignoreCase = true) == true ||
+            declaredState == EpisodeSourceResponseState.TIMEOUT
         val state = when {
             explicitTimeout -> EpisodeSourceResponseState.TIMEOUT
-            partial == true -> EpisodeSourceResponseState.PARTIAL
             !errorMessage.isNullOrBlank() -> EpisodeSourceResponseState.FAILED
+            partial == true || declaredState == EpisodeSourceResponseState.PARTIAL -> EpisodeSourceResponseState.PARTIAL
+            declaredState == EpisodeSourceResponseState.FAILED -> EpisodeSourceResponseState.FAILED
+            declaredState == EpisodeSourceResponseState.STALE -> EpisodeSourceResponseState.STALE
+            declaredState == EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceResponseState.UNKNOWN
+            declaredState == EpisodeSourceResponseState.EMPTY && candidates.isEmpty() -> EpisodeSourceResponseState.EMPTY
+            declaredState == EpisodeSourceResponseState.AVAILABLE && candidates.isNotEmpty() -> EpisodeSourceResponseState.AVAILABLE
             candidates.isNotEmpty() -> EpisodeSourceResponseState.AVAILABLE
+            declaredState == EpisodeSourceResponseState.EMPTY -> EpisodeSourceResponseState.PARTIAL
+            declaredState == EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceResponseState.UNKNOWN
+            partial == false && apiCandidates != null -> EpisodeSourceResponseState.EMPTY
             else -> EpisodeSourceResponseState.UNKNOWN
         }
         return EpisodeSourceAggregationResult(
@@ -143,6 +158,28 @@ object EpisodeSourceAggregator {
             exactDuplicateCount = nonExpired.size - candidates.size
         )
     }
+}
+
+/** Valid IDs identify a source; blank IDs are retained separately for diagnostics. */
+private fun mergeBySourceIdentity(candidates: List<ProphecySourceDto>): List<ProphecySourceDto> {
+    val result = mutableListOf<ProphecySourceDto>()
+    val indexById = mutableMapOf<String, Int>()
+    for (candidate in candidates) {
+        val id = candidate.id.trim()
+        if (id.isEmpty()) {
+            if (candidate !in result) result += candidate
+            continue
+        }
+        val index = indexById[id]
+        if (index == null) {
+            indexById[id] = result.size
+            result += candidate
+        } else {
+            // Later metadata for the same backend identity updates the same provider candidate.
+            result[index] = candidate
+        }
+    }
+    return result
 }
 
 data class EpisodeCatalogSnapshot(

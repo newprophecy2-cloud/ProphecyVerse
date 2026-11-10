@@ -31,7 +31,7 @@ class SourceCacheAndQuotaGuardTest {
     private val now = Instant.parse("2026-11-09T00:00:00Z").toEpochMilli()
 
     @Test
-    fun exactDuplicatesAreRemovedButProviderQualityAndLanguageVariantsRemain() {
+    fun repeatedSourceIdUpdatesMetadataWithoutCreatingProviderDuplicates() {
         val first = ProphecySourceDto(id = "same", label = "Provider A", quality = "720p", language = "ja")
         val qualityVariant = first.copy(quality = "1080p")
         val languageVariant = first.copy(language = "en")
@@ -47,10 +47,10 @@ class SourceCacheAndQuotaGuardTest {
 
         assertEquals(EpisodeSourceResponseState.AVAILABLE, result.state)
         assertEquals(5, result.apiCandidateCount)
-        assertEquals(4, result.sources.size)
-        assertEquals(1, result.exactDuplicateCount)
-        assertEquals(setOf("720p", "1080p"), result.sources.mapNotNull { it.quality }.toSet())
-        assertEquals(2, result.sources.map { it.displayProviderName }.distinct().size)
+        assertEquals(1, result.sources.size)
+        assertEquals(4, result.exactDuplicateCount)
+        assertEquals("Provider B", result.sources.single().displayProviderName)
+        assertEquals("720p", result.sources.single().quality)
     }
 
     @Test
@@ -77,6 +77,20 @@ class SourceCacheAndQuotaGuardTest {
             nowMs = now
         )
         assertEquals(EpisodeSourceResponseState.TIMEOUT, result.state)
+    }
+
+    @Test
+    fun existingStatusNamesMapToTheirMatchingStatesWithoutTreatingUnknownAsEmpty() {
+        EpisodeSourceResponseState.values().forEach { expected ->
+            val result = EpisodeSourceAggregator.aggregate(
+                apiCandidates = if (expected == EpisodeSourceResponseState.AVAILABLE) listOf(ProphecySourceDto(id = "s")) else emptyList(),
+                rawStatus = expected.name.lowercase(),
+                partial = null,
+                errorMessage = null,
+                nowMs = now
+            )
+            assertEquals(expected, result.state)
+        }
     }
 
     @Test
@@ -178,7 +192,8 @@ class SourceCacheAndQuotaGuardTest {
             nowMs = now
         )
         assertEquals(setOf("old", "same"), partial.map { it.id }.toSet())
-        assertEquals(2, partial.count { it.id == "same" })
+        assertEquals(1, partial.count { it.id == "same" })
+        assertEquals("New label", partial.single { it.id == "same" }.label)
 
         val complete = EpisodeSourceCachePolicy.mergeRefreshCandidates(
             existingCandidates = listOf(oldCandidate, oldVariant),
@@ -207,6 +222,9 @@ class SourceCacheAndQuotaGuardTest {
         assertEquals(2_500L, EpisodeSourceRetryBackoff.delayMs(1, 10_000L))
         assertEquals(4_000L, EpisodeSourceRetryBackoff.delayMs(2))
         assertEquals(150_000L, EpisodeSourceRetryBackoff.delayMs(9, 100_000L))
+        assertTrue(EpisodeSourceRetryBackoff.shouldDelay(forceRefresh = false, remainingMs = 1L))
+        assertFalse(EpisodeSourceRetryBackoff.shouldDelay(forceRefresh = true, remainingMs = 1L))
+        assertFalse(EpisodeSourceRetryBackoff.shouldDelay(forceRefresh = false, remainingMs = 0L))
     }
 
     @Test

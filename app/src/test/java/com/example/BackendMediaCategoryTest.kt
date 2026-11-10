@@ -38,7 +38,7 @@ class BackendMediaCategoryTest {
     }
 
     @Test
-    fun `only complete valid detail records may replace cached episodes`() {
+    fun `only explicit structurally valid complete detail snapshots may replace cached episodes`() {
         val movieSeasonOne = listOf(
             ProphecySeasonDto(
                 number = 1,
@@ -46,8 +46,14 @@ class BackendMediaCategoryTest {
             )
         )
         assertEquals(true, isAuthoritativeEpisodeSnapshot(false, movieSeasonOne))
-        assertEquals(true, isAuthoritativeEpisodeSnapshot(false, emptyList()))
+        assertEquals(false, isAuthoritativeEpisodeSnapshot(false, emptyList()))
+        assertEquals(false, isAuthoritativeEpisodeSnapshot(false, null))
         assertEquals(false, isAuthoritativeEpisodeSnapshot(true, movieSeasonOne))
+        assertEquals(false, isAuthoritativeEpisodeSnapshot(false, listOf(ProphecySeasonDto(number = 1))))
+        assertEquals(
+            true,
+            isAuthoritativeEpisodeSnapshot(false, listOf(ProphecySeasonDto(number = 1, episodes = emptyList())))
+        )
         assertEquals(false, isAuthoritativeEpisodeSnapshot(false, listOf(ProphecySeasonDto(number = 0))))
         assertEquals(
             false,

@@ -3,6 +3,7 @@ package com.example
 import com.example.BuildConfig
 import com.example.data.local.DownloadEntry
 import com.example.data.local.EpisodeEntry
+import com.example.data.remote.DirectPlayData
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
 import com.example.ui.screens.groupDownloads
@@ -101,6 +102,45 @@ class V3CriticalBugFixesTest {
         assertFalse(PlayerManager.isEac3MimeType("audio/mp4a-latm"))
         assertFalse(PlayerManager.isEac3MimeType("audio/mpeg"))
         assertFalse(PlayerManager.isEac3MimeType(null))
+    }
+
+    @Test
+    fun playbackMimeDetection_prefersBackendMetadataThenExistingUrlTypeAndExtension() {
+        val backendMetadataWins = DirectPlayData(
+            sourceId = "source-1",
+            playbackUrl = "https://cdn.example/video.mp4?signature=redacted",
+            urlType = "hls",
+            contentType = "video/mp4"
+        )
+        assertEquals(androidx.media3.common.MimeTypes.VIDEO_MP4, PlayerManager.detectMimeType(backendMetadataWins))
+
+        val urlTypeWinsOverExtension = backendMetadataWins.copy(contentType = null)
+        assertEquals(androidx.media3.common.MimeTypes.APPLICATION_M3U8, PlayerManager.detectMimeType(urlTypeWinsOverExtension))
+
+        val arbitraryUrlIsNotGuessed = backendMetadataWins.copy(
+            playbackUrl = "https://cdn.example/signed-object?file=video.mp4",
+            urlType = "direct",
+            contentType = null
+        )
+        assertEquals(null, PlayerManager.detectMimeType(arbitraryUrlIsNotGuessed))
+    }
+
+    @Test
+    fun playbackErrors_areClassifiedFromTheAvailableMedia3Evidence() {
+        val httpError = androidx.media3.common.PlaybackException(
+            "HTTP", null, androidx.media3.common.PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+        )
+        val timeoutError = androidx.media3.common.PlaybackException(
+            "timeout", java.net.SocketTimeoutException("timeout"),
+            androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
+        )
+        val containerError = androidx.media3.common.PlaybackException(
+            "container", null,
+            androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+        )
+        assertEquals(PlayerManager.PlaybackFailureCategory.HTTP, PlayerManager.classifyPlaybackError(httpError))
+        assertEquals(PlayerManager.PlaybackFailureCategory.NETWORK_TIMEOUT, PlayerManager.classifyPlaybackError(timeoutError))
+        assertEquals(PlayerManager.PlaybackFailureCategory.CONTAINER, PlayerManager.classifyPlaybackError(containerError))
     }
 
     @Test

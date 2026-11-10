@@ -112,6 +112,10 @@ fun DetailScreen(
     val lastPlayed by viewModel.lastPlayed.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val syncError by viewModel.syncError.collectAsStateWithLifecycle()
+    val catalogRefreshStatus by viewModel.catalogRefreshStatus.collectAsStateWithLifecycle()
+    val canLoadNextEpisodePage by viewModel.canLoadNextEpisodePage.collectAsStateWithLifecycle()
+    val canLoadPreviousEpisodePage by viewModel.canLoadPreviousEpisodePage.collectAsStateWithLifecycle()
+    val selectedSeasonEpisodeCount by viewModel.selectedSeasonEpisodeCount.collectAsStateWithLifecycle()
 
     val selectedEpisodeForSources by viewModel.selectedEpisodeForSources.collectAsStateWithLifecycle()
     val episodeSources by viewModel.episodeSources.collectAsStateWithLifecycle()
@@ -537,24 +541,14 @@ fun DetailScreen(
                         }
                     }
 
-                    if (!isMovie) {
+                    if (!isMovie && !catalogRefreshStatus.errorMessage.isNullOrBlank()) {
                         item {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                if (episodeWindowStart > 1) {
-                                    TextButton(onClick = { viewModel.loadPreviousEpisodeWindow() }) {
-                                        Text("Previous episodes", color = AccentCyan)
-                                    }
-                                } else {
-                                    Spacer(modifier = Modifier.width(1.dp))
-                                }
-                                TextButton(onClick = { viewModel.loadNextEpisodeWindow() }) {
-                                    Text("Next episodes", color = AccentCyan)
-                                }
-                            }
+                            Text(
+                                text = catalogRefreshStatus.errorMessage.orEmpty(),
+                                color = TextMuted,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                            )
                         }
                     }
 
@@ -612,6 +606,14 @@ fun DetailScreen(
                                     }
                                 }
                             } else {
+                                val emptyTitle = when {
+                                    selectedSeasonEpisodeCount > 0 -> "No episodes in this page"
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes in catalog"
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE -> "No episodes in this season"
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.FAILED -> "Episode catalog could not be refreshed"
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.PARTIAL -> "Episode catalog is partial"
+                                    else -> "Episode catalog not yet confirmed"
+                                }
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -635,7 +637,7 @@ fun DetailScreen(
                                                 modifier = Modifier.size(32.dp)
                                             )
                                             Text(
-                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else "Episode list not confirmed",
+                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else emptyTitle,
                                                 color = TextPrimary,
                                                 fontSize = 15.sp,
                                                 fontWeight = FontWeight.Bold,
@@ -644,8 +646,12 @@ fun DetailScreen(
                                             Text(
                                                 text = if (item.backendAnimeId == null) {
                                                     "Playable episodes for \"${item.preferredTitle}\" are not currently available in the streaming provider catalog.\n(Live Action was strictly excluded to prevent incorrect playback)."
+                                                } else if (selectedSeasonEpisodeCount > 0) {
+                                                    "No records are in the current page. ${if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE) "The selected season catalog is complete." else "More episodes may exist; catalog completeness is unknown."}"
+                                                } else if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY) {
+                                                    "The current response explicitly confirmed an empty episode catalog."
                                                 } else {
-                                                    "Episodes for Season $selectedSeason have not been confirmed. The catalog response may be incomplete or unavailable; retry or select another season."
+                                                    "Episodes for Season $selectedSeason are not available in the current local catalog. ${catalogRefreshStatus.errorMessage ?: "The catalog may be partial or unconfirmed."}"
                                                 },
                                                 color = TextMuted,
                                                 fontSize = 12.sp,
@@ -740,6 +746,43 @@ fun DetailScreen(
                                     }
                                 }
                             )
+                        }
+                    }
+                    if (!isMovie) {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                TextButton(
+                                    enabled = canLoadPreviousEpisodePage,
+                                    onClick = { viewModel.loadPreviousEpisodeWindow() }
+                                ) {
+                                    Text("Previous episodes", color = if (canLoadPreviousEpisodePage) AccentCyan else TextMuted)
+                                }
+                                val firstVisibleRecord = if (episodes.isEmpty()) 0 else episodeWindowStart + 1
+                                val lastVisibleRecord = episodeWindowStart + episodes.size
+                                val totalLabel = if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE ||
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY) {
+                                    "of $selectedSeasonEpisodeCount"
+                                } else {
+                                    "of $selectedSeasonEpisodeCount known"
+                                }
+                                Text(
+                                    text = if (episodes.isEmpty()) "No records · $selectedSeasonEpisodeCount known"
+                                    else "Showing $firstVisibleRecord–$lastVisibleRecord $totalLabel",
+                                    color = TextMuted,
+                                    fontSize = 11.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                TextButton(
+                                    enabled = canLoadNextEpisodePage,
+                                    onClick = { viewModel.loadNextEpisodeWindow() }
+                                ) {
+                                    Text("Next episodes", color = if (canLoadNextEpisodePage) AccentCyan else TextMuted)
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1081,6 +1124,9 @@ fun SourceCandidateCard(
                     color = TextMuted,
                     fontSize = 11.sp
                 )
+                if (!source.hasUsableSourceId) {
+                    Text("Cannot play: backend source ID is missing.", color = AccentCoral, fontSize = 11.sp)
+                }
             }
 
             Icon(

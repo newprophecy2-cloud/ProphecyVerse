@@ -12,3 +12,35 @@ internal suspend fun <T> withLoadingFlag(
         setLoading(false)
     }
 }
+
+enum class EpisodeCatalogState {
+    UNKNOWN,
+    PARTIAL,
+    COMPLETE,
+    CONFIRMED_EMPTY,
+    FAILED
+}
+
+internal fun resolveEpisodeCatalogState(
+    snapshotComplete: Boolean,
+    cachedEpisodeCount: Int,
+    backendIdKnown: Boolean,
+    detailsEndpointSucceeded: Boolean,
+    episodeListEndpointSucceeded: Boolean
+): EpisodeCatalogState = when {
+    snapshotComplete && cachedEpisodeCount == 0 -> EpisodeCatalogState.CONFIRMED_EMPTY
+    snapshotComplete -> EpisodeCatalogState.COMPLETE
+    backendIdKnown && !detailsEndpointSucceeded && !episodeListEndpointSucceeded -> EpisodeCatalogState.FAILED
+    cachedEpisodeCount > 0 -> EpisodeCatalogState.PARTIAL
+    detailsEndpointSucceeded || episodeListEndpointSucceeded -> EpisodeCatalogState.UNKNOWN
+    backendIdKnown -> EpisodeCatalogState.FAILED
+    else -> EpisodeCatalogState.UNKNOWN
+}
+
+data class EpisodeCatalogRefreshStatus(
+    val state: EpisodeCatalogState,
+    val detailsEndpointSucceeded: Boolean,
+    val episodeListEndpointSucceeded: Boolean,
+    val errorMessage: String? = null,
+    val currentRefreshEpisodeIds: Set<String> = emptySet()
+)

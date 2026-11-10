@@ -12,8 +12,10 @@ import com.example.data.local.WatchlistEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.EpisodeCatalogRefreshStatus
+import com.example.data.repository.EpisodeCatalogState
+import com.example.data.repository.EpisodeRecordPagination
 import com.example.data.repository.EpisodeSourceResponseState
-import com.example.data.repository.EpisodeNumberWindow
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
 import android.content.Context
@@ -30,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -207,17 +210,34 @@ class DetailViewModel(
     private val _selectedSeason = MutableStateFlow(1)
     val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
 
-    private val _episodeWindowStart = MutableStateFlow(1)
+    private val _episodeWindowStart = MutableStateFlow(0)
     val episodeWindowStart: StateFlow<Int> = _episodeWindowStart.asStateFlow()
-    private val _episodeWindowSize = MutableStateFlow(30)
-    val episodeWindowSize: StateFlow<Int> = _episodeWindowSize.asStateFlow()
-
-    val episodes: StateFlow<List<EpisodeEntry>> = combine(_selectedSeason, _episodeWindowStart, _episodeWindowSize) { season, start, size ->
-        Triple(season, start, size)
-    }.flatMapLatest { (season, start, size) ->
-        val window = EpisodeNumberWindow(start, size)
-        repository.observeEpisodeWindow(animeId, season, window.firstEpisode, window.episodeLimitExclusive)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val allCatalogEpisodes = repository.observeAllEpisodes(animeId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val _catalogRefreshStatus = MutableStateFlow(
+        EpisodeCatalogRefreshStatus(EpisodeCatalogState.UNKNOWN, false, false)
+    )
+    val catalogRefreshStatus: StateFlow<EpisodeCatalogRefreshStatus> = _catalogRefreshStatus.asStateFlow()
+    private val episodePage = combine(
+        _selectedSeason, _episodeWindowStart, allCatalogEpisodes, _catalogRefreshStatus
+    ) { season, offset, records, status ->
+        val ordered = episodesForDisplay(records, season, status.currentRefreshEpisodeIds)
+        EpisodeRecordPagination.page(
+            orderedRecords = ordered,
+            offset = offset,
+            pageSize = 30,
+            catalogComplete = status.state == EpisodeCatalogState.COMPLETE ||
+                status.state == EpisodeCatalogState.CONFIRMED_EMPTY
+        )
+    }
+    val episodes: StateFlow<List<EpisodeEntry>> = episodePage.map { it.items }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val canLoadNextEpisodePage: StateFlow<Boolean> = episodePage.map { it.hasNext }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+    val canLoadPreviousEpisodePage: StateFlow<Boolean> = episodePage.map { it.hasPrevious }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val selectedSeasonEpisodeCount: StateFlow<Int> = episodePage.map { it.totalKnownRecords }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     val watchlistEntry: StateFlow<WatchlistEntry?> = repository.observeWatchlistEntry(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
@@ -271,14 +291,17 @@ class DetailViewModel(
                 }
         }
         viewModelScope.launch {
-            lastPlayed.collect { history ->
+            combine(lastPlayed, allCatalogEpisodes) { history, records -> history to records }
+                .collect { (history, records) ->
                 if (history != null) {
                     _selectedSeason.value = history.seasonNumber
-                    if (history.episodeNumber > 30) {
-                        val window = EpisodeNumberWindow.aroundSelected(history.episodeNumber)
-                        _episodeWindowStart.value = window.firstEpisode
-                        _episodeWindowSize.value = window.episodeCount
-                    }
+                    val ordered = episodesForDisplay(
+                        records, history.seasonNumber, _catalogRefreshStatus.value.currentRefreshEpisodeIds
+                    )
+                    val index = ordered.indexOfFirst { it.id == history.episodeId }
+                        .takeIf { it >= 0 }
+                        ?: ordered.indexOfFirst { it.episodeNumber == history.episodeNumber }
+                    _episodeWindowStart.value = if (index >= 0) (index / 30) * 30 else 0
                 }
             }
         }
@@ -306,12 +329,27 @@ class DetailViewModel(
                         // Analytics is optional; it must not prevent catalog refresh.
                     }
                     val result = repository.refreshAnimeDetails(animeId)
-                    if (result.isFailure) {
+                    val outcome = result.getOrNull()
+                    if (outcome != null) {
+                        _catalogRefreshStatus.value = outcome
+                        if (!outcome.errorMessage.isNullOrBlank()) {
+                            _syncError.value = outcome.errorMessage
+                        }
+                        viewModelScope.launch { repository.refreshOptionalAniListMetadata(animeId) }
+                    } else {
+                        _catalogRefreshStatus.value = EpisodeCatalogRefreshStatus(
+                            EpisodeCatalogState.FAILED, false, false,
+                            "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                        )
                         _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
+                    _catalogRefreshStatus.value = EpisodeCatalogRefreshStatus(
+                        EpisodeCatalogState.FAILED, false, false,
+                        "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                    )
                     _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
                 }
             }
@@ -320,34 +358,41 @@ class DetailViewModel(
 
     fun selectSeason(seasonNumber: Int) {
         _selectedSeason.value = seasonNumber
-        _episodeWindowStart.value = 1
-        _episodeWindowSize.value = 30
+        _episodeWindowStart.value = 0
         viewModelScope.launch { repository.syncOpenedSeason(animeId, seasonNumber) }
     }
 
     fun loadNextEpisodeWindow() {
-        _episodeWindowStart.value += _episodeWindowSize.value
-        _episodeWindowSize.value = 30
+        if (canLoadNextEpisodePage.value) _episodeWindowStart.value += 30
     }
 
     fun loadPreviousEpisodeWindow() {
-        val size = _episodeWindowSize.value
-        _episodeWindowStart.value = (_episodeWindowStart.value - size).coerceAtLeast(1)
-        _episodeWindowSize.value = 30
+        if (canLoadPreviousEpisodePage.value) _episodeWindowStart.value = (_episodeWindowStart.value - 30).coerceAtLeast(0)
     }
 
     fun focusEpisodeWindow(episode: EpisodeEntry) {
         _selectedSeason.value = episode.seasonNumber
-        if (episode.episodeNumber > 30) {
-            val window = EpisodeNumberWindow.aroundSelected(episode.episodeNumber)
-            _episodeWindowStart.value = window.firstEpisode
-            _episodeWindowSize.value = window.episodeCount
-        } else {
-            val window = EpisodeNumberWindow.initial()
-            _episodeWindowStart.value = window.firstEpisode
-            _episodeWindowSize.value = window.episodeCount
-        }
+        val ordered = episodesForDisplay(
+            allCatalogEpisodes.value, episode.seasonNumber, _catalogRefreshStatus.value.currentRefreshEpisodeIds
+        )
+        val index = ordered.indexOfFirst { it.id == episode.id }
+        _episodeWindowStart.value = if (index >= 0) (index / 30) * 30 else 0
     }
+
+    private fun episodesForDisplay(
+        records: List<EpisodeEntry>,
+        seasonNumber: Int,
+        currentRefreshIds: Set<String>
+    ): List<EpisodeEntry> = records.asSequence()
+        .filter { it.seasonNumber == seasonNumber }
+        .sortedWith(compareBy<EpisodeEntry> { it.episodeNumber }.thenBy { it.id })
+        .groupBy { it.episodeNumber }
+        .toSortedMap()
+        .values
+        .flatMap { sameNumber ->
+            val refreshed = sameNumber.filter { it.id in currentRefreshIds }
+            if (refreshed.size == 1) listOf(refreshed.single()) else sameNumber
+        }
 
     private fun queueAutomaticSourceDiscovery(
         window: List<EpisodeEntry>,
@@ -378,8 +423,7 @@ class DetailViewModel(
         ordered.forEach { episode ->
             val existingState = _episodeSourceStates.value[episode.id]
             if (existingState in setOf(EpisodeSourceState.LOADING, EpisodeSourceState.AVAILABLE,
-                    EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL, EpisodeSourceState.FAILED,
-                    EpisodeSourceState.TIMEOUT, EpisodeSourceState.UNKNOWN, EpisodeSourceState.STALE)) return@forEach
+                    EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL)) return@forEach
             if (automaticSourceJobs[episode.id]?.isActive == true) return@forEach
             _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
             automaticSourceJobs[episode.id] = viewModelScope.launch {
@@ -829,7 +873,8 @@ class PlayerViewModel(
                         directData = directData,
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = null,
-                        onRetryNeeded = {}
+                        onRetryNeeded = {},
+                        providerName = "Offline"
                     )
                     return@launch
                 }
@@ -900,7 +945,8 @@ class PlayerViewModel(
                                     }
                                 }
                             }
-                        }
+                        },
+                        providerName = prepared.source.displayProviderName
                     )
 
                     // Slide the bounded pre-resolve queue forward.
@@ -1062,7 +1108,8 @@ class PlayerViewModel(
                                 )
                             }
                         }
-                    }
+                    },
+                    providerName = source.displayProviderName
                 )
 
                 // Trigger 17-episode sliding queue in background
