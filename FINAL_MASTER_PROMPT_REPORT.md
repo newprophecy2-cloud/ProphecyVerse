@@ -5,6 +5,7 @@
 - Repository: `newprophecy2-cloud/ProphecyVerse`
 - Branch: `apk-v3`
 - Starting commit: `47c7711c2e7066fe934c077334d565a219939d2b`
+- Validated source commit: `83a1d000d4da59d4763b8a2c63cd34e3555e709f`
 - Working tree before this pass: clean
 - Application ID: `com.aistudio.prophecyverse.vykqtb`
 - Version name/code: `3.0.1` / `6`
@@ -68,12 +69,13 @@ No files were deleted. No backend repository, backend service, Firebase project,
 - Playback URL references remain confined to the existing live playback DTO/player/test path; no playback URL field was added to shared catalog metadata serialization.
 - Existing metadata test coverage was updated for schema v2 and searchable tokens.
 - New Smart Search tests cover exact/prefix precedence, aliases, native titles, multi-word matching, typo tolerance, and Unicode normalization.
+- GitHub Actions run `42971835711` passed on an x86_64 hosted runner. The JVM unit-test task completed successfully, the APK build completed successfully, package/version validation passed, and the APK-only artifact upload completed successfully.
 
 ## Not verified in this environment
 
-The sandbox is ARM64 and has no Android SDK (`ANDROID_HOME`/`ANDROID_SDK_ROOT` unset, no `local.properties`, and no `sdkmanager`/`kotlinc`). The baseline command `./gradlew --no-daemon :app:testDebugUnitTest :app:compileDebugKotlin` failed during Gradle configuration with `SDK location not found`, before compilation or test execution. Therefore this pass does not claim unit-test, lint, APK-build, emulator, physical-device, live-Firebase, or live-playback success.
+The local sandbox is ARM64 and has no Android SDK (`ANDROID_HOME`/`ANDROID_SDK_ROOT` unset, no `local.properties`, and no `sdkmanager`/`kotlinc`), so local Gradle validation was blocked. The final GitHub Actions run provided hosted x86_64 validation instead. Physical-device, emulator, live-Firebase, live-provider, and live-playback verification were not performed.
 
-No APK artifact was generated in this pass. No production Firestore write or rules deployment was performed.
+The hosted APK artifact is `ProphecyVerse-v3-APK`, artifact ID `13834185821`, approximately 34.4 MB, available from the successful run at `https://github.com/newprophecy2-cloud/ProphecyVerse/actions/runs/42971835711`. No production Firestore write or rules deployment was performed.
 
 ## Requirement classification
 
@@ -85,5 +87,5 @@ No APK artifact was generated in this pass. No production Firestore write or rul
 - Shared catalog write authorization/trust model: **PARTIALLY IMPLEMENTED**; repository rules permit authenticated catalog writes, but client-side rules cannot cryptographically prove backend provenance. A trusted server publisher remains the secure production recommendation.
 - Room migration safety: **IMPLEMENTED, NOT DEVICE-TESTED**; existing additive v7→v8 migration was preserved.
 - Existing backend playback contract and live URL handling: **IMPLEMENTED, NOT DEVICE-TESTED**; routes were preserved and playback URLs remain out of Firestore metadata.
-- Automated tests and APK build: **BLOCKED** by missing Android SDK in this environment.
+- Automated JVM tests and APK build: **IMPLEMENTED AND TESTED** by GitHub Actions run `42971835711`; local execution remains blocked by the ARM64 sandbox’s missing SDK.
 - Physical device/emulator verification: **NOT IMPLEMENTED** in this environment because no device/emulator was available.
