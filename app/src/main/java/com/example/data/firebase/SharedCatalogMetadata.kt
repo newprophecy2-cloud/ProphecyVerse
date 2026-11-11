@@ -120,7 +120,7 @@ data class SharedCatalogMetadata(
             val kind = when (media) { "anime" -> "anime"; "movie" -> "movie"; else -> return null }
             val type = if (kind == "anime") "ANIME" else "MOVIE"
             val id = stableId(kind, item.id)
-            val aliases = listOf(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles
+            val aliases = listOf<String?>(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles.orEmpty()
             return SharedCatalogMetadata(id, item.canonicalId, item.id, type, title = item.title,
                 normalizedTitle = normalizeSharedTitle(item.title),
                 searchKeywords = searchableAliases(listOf(item.title) + aliases),
@@ -138,7 +138,7 @@ data class SharedCatalogMetadata(
             val type = if (kind == "anime") "ANIME" else "MOVIE"
             val genres = item.genres.orEmpty().distinct().sorted()
             val id = stableId(kind, item.id)
-            val aliases = listOf(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles
+            val aliases = listOf<String?>(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles.orEmpty()
             return SharedCatalogMetadata(id, item.canonicalId, item.id, type, title = item.title,
                 normalizedTitle = normalizeSharedTitle(item.title),
                 searchKeywords = searchableAliases(listOf(item.title) + aliases),
