@@ -602,7 +602,7 @@ class AnimeRepository(
                 .plus(media.synonyms.orEmpty()).filter(String::isNotBlank).distinct()
                 .forEach { alias -> aliases += AnimeAlias(animeId = animeId,
                     alias = TitleMatcher.normalize(alias), originalAlias = alias) }
-            refs += SearchResultRef(normalizedQuery, animeId, index)
+            refs += SearchResultRef(normalizedQuery = normalizedQuery, animeId = animeId, rankIndex = index)
         }
         animeDao.upsertAnimeList(entries.distinctBy { it.id })
         if (aliases.isNotEmpty()) animeDao.insertAliases(aliases.distinctBy { it.animeId to it.alias })
