@@ -25,6 +25,14 @@ class SharedCatalogMetadataTest {
         val b = SharedCatalogMetadata.fromSearch(ProphecySearchResultItem("id", title="B", mediaType="anime"))!!
         assertNotEquals(a.metadataHash, b.metadataHash)
     }
+    @Test fun searchMetadataHasNormalizedTitleAndStableDocumentId() {
+        val item = SharedCatalogMetadata.fromSearch(
+            ProphecySearchResultItem("naruto-1", title = "Naruto: Shippuden", mediaType = "anime")
+        )!!
+        assertEquals("naruto shippuden", item.normalizedTitle)
+        assertEquals(listOf("naruto shippuden"), item.searchKeywords)
+        assertEquals(item.documentId, SharedCatalogMetadata.documentIdFor("ANIME", "naruto-1"))
+    }
     @Test fun realSeasonAndEpisodeNumbersAndParentAreRequired() {
         assertNull(SharedCatalogMetadata.fromSeason("parent", null, ProphecySeasonDto(number=0)))
         assertNull(SharedCatalogMetadata.fromEpisode("parent", null, 1, ProphecyEpisodeDto(id="", number=1)))

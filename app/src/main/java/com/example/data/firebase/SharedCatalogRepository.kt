@@ -33,7 +33,7 @@ class SharedCatalogRepository(
         private const val CACHE_READ_TTL = 6L * 60 * 60 * 1000
         private val allowedMetadataFields = setOf(
             "documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
-            "title", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
+            "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
             "seasonNumber", "episodeNumber", "episodeTitle", "episodeDescription", "parentCanonicalId",
             "parentBackendId", "source", "createdAt", "updatedAt", "lastSyncedAt"
         )
@@ -61,6 +61,50 @@ class SharedCatalogRepository(
     suspend fun readGenre(documentId: String, forceServer: Boolean = false) = read("shared_catalog_genres", documentId, forceServer)
     suspend fun readCategory(documentId: String, forceServer: Boolean = false) = read("shared_catalog_categories", documentId, forceServer)
 
+    /** Firestore-first bounded prefix search. Playback/source fields are never queried or returned. */
+    suspend fun searchTitles(query: String, limit: Long = 50): List<SharedCatalogCacheEntry> {
+        val normalized = SharedCatalogMetadata.normalizeTitle(query)
+        if (normalized.isBlank() || !networkAvailable() || auth.currentUser == null) return emptyList()
+        return try {
+            val end = normalized + "\uf8ff"
+            listOf("shared_catalog_anime", "shared_catalog_movies").flatMap { collection ->
+                firestore.collection(collection)
+                    .orderBy("normalizedTitle")
+                    .startAt(normalized)
+                    .endAt(end)
+                    .limit(limit)
+                    .get().await().documents.mapNotNull { document ->
+                        val data = document.data ?: return@mapNotNull null
+                        val type = data["contentType"] as? String ?: return@mapNotNull null
+                        val id = data["documentId"] as? String ?: return@mapNotNull null
+                        val backendId = data["backendId"] as? String ?: return@mapNotNull null
+                        val hash = data["metadataHash"] as? String ?: return@mapNotNull null
+                        if (document.id != id || data["source"] != SharedCatalogMetadata.SOURCE ||
+                            (data["schemaVersion"] as? Number)?.toInt() != SharedCatalogMetadata.SCHEMA_VERSION ||
+                            !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
+                            data["normalizedTitle"] !is String ||
+                            data["createdAt"] !is Timestamp || data["updatedAt"] !is Timestamp ||
+                            data["lastSyncedAt"] !is Timestamp) return@mapNotNull null
+                        val safe = JSONObject()
+                        listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
+                            "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl",
+                            "mediaType", "releaseYear", "genres", "source").forEach { key ->
+                            data[key]?.let { safe.put(key, it) }
+                        }
+                        SharedCatalogCacheEntry(id, type, data["canonicalId"] as? String, backendId,
+                            SharedCatalogMetadata.SCHEMA_VERSION, hash, safe.toString(), now()).also { dao.putCache(it) }
+                    }
+            }.sortedWith(compareBy<SharedCatalogCacheEntry> {
+                val title = runCatching { JSONObject(it.payloadJson).optString("normalizedTitle") }.getOrDefault("")
+                if (title == normalized) 0 else if (title.startsWith(normalized)) 1 else 2
+            }.thenBy { it.documentId }).take(limit.toInt().coerceIn(1, 50))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     /** Cache-first read. It only returns validated schema v1 docs, and never writes them over backend state. */
     suspend fun read(collection: String, documentId: String, forceServer: Boolean = false): SharedCatalogCacheEntry? {
         if (collection !in allowedCollections || documentId.isBlank()) return null
@@ -83,9 +127,10 @@ class SharedCatalogRepository(
                 collectionFor(type) != collection || hash.isBlank() ||
                 !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
                 data["source"] != SharedCatalogMetadata.SOURCE) return cached
-            val stringFields = listOf("canonicalId", "backendId", "title", "description", "posterUrl", "bannerUrl",
+            val stringFields = listOf("canonicalId", "backendId", "title", "normalizedTitle", "description", "posterUrl", "bannerUrl",
                 "mediaType", "releaseYear", "episodeTitle", "episodeDescription", "parentCanonicalId", "parentBackendId")
             if (stringFields.any { data[it] != null && data[it] !is String }) return cached
+            if (data["searchKeywords"] != null && ((data["searchKeywords"] as? List<*>)?.all { it is String } != true)) return cached
             if (data["genres"] != null && ((data["genres"] as? List<*>)?.all { it is String } != true)) return cached
             if (listOf("seasonNumber", "episodeNumber").any { key -> data[key] != null && data[key] !is Number }) return cached
             if (type == "SEASON" && ((data["seasonNumber"] as? Number)?.toInt()?.let { it > 0 } != true || backendId.isNullOrBlank())) return cached
@@ -94,7 +139,7 @@ class SharedCatalogRepository(
                     (data["parentBackendId"] as? String).isNullOrBlank())) return cached
             val safe = JSONObject()
             listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
-                "title", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
+                "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
                 "seasonNumber", "episodeNumber", "episodeTitle", "episodeDescription", "parentCanonicalId",
                 "parentBackendId", "source").forEach { key ->
                 data[key]?.let { safe.put(key, it) }

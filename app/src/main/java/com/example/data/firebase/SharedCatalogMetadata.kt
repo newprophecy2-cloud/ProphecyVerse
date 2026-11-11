@@ -7,6 +7,11 @@ import com.example.data.remote.ProphecySeasonDto
 import java.security.MessageDigest
 import java.util.Locale
 
+private fun normalizeSharedTitle(value: String): String = value.trim().lowercase(Locale.ROOT)
+    .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+    .trim()
+    .replace(Regex("\\s+"), " ")
+
 /** Backend-origin catalog metadata only; playback/source data is deliberately not represented. */
 data class SharedCatalogMetadata(
     val documentId: String,
@@ -15,6 +20,8 @@ data class SharedCatalogMetadata(
     val contentType: String,
     val schemaVersion: Int = SCHEMA_VERSION,
     val title: String? = null,
+    val normalizedTitle: String? = title?.let(::normalizeSharedTitle),
+    val searchKeywords: List<String> = listOfNotNull(normalizedTitle),
     val description: String? = null,
     val posterUrl: String? = null,
     val bannerUrl: String? = null,
@@ -32,7 +39,8 @@ data class SharedCatalogMetadata(
     fun firestoreFields(createdAt: Any, updatedAt: Any, syncedAt: Any): Map<String, Any?> = mapOf(
         "documentId" to documentId, "canonicalId" to canonicalId, "backendId" to backendId,
         "contentType" to contentType, "schemaVersion" to schemaVersion, "metadataHash" to metadataHash,
-        "title" to title, "description" to description, "posterUrl" to posterUrl, "bannerUrl" to bannerUrl,
+        "title" to title, "normalizedTitle" to normalizedTitle, "searchKeywords" to searchKeywords,
+        "description" to description, "posterUrl" to posterUrl, "bannerUrl" to bannerUrl,
         "mediaType" to mediaType, "releaseYear" to releaseYear, "genres" to genres,
         "seasonNumber" to seasonNumber, "episodeNumber" to episodeNumber, "episodeTitle" to episodeTitle,
         "episodeDescription" to episodeDescription, "parentCanonicalId" to parentCanonicalId,
@@ -43,6 +51,19 @@ data class SharedCatalogMetadata(
     companion object {
         const val SCHEMA_VERSION = 1
         const val SOURCE = "prophecyverse_backend"
+        fun normalizeTitle(value: String): String = normalizeSharedTitle(value)
+        fun documentIdFor(contentType: String, backendId: String): String {
+            val prefix = when (contentType) {
+                "ANIME" -> "anime"
+                "MOVIE" -> "movie"
+                "SEASON" -> "season"
+                "EPISODE" -> "episode"
+                "GENRE" -> "genre"
+                "CATEGORY" -> "category"
+                else -> error("Unsupported shared catalog type")
+            }
+            return stableId(prefix, backendId)
+        }
         private fun stableId(type: String, backendId: String): String {
             require(backendId.isNotBlank()) { "Backend ID must not be blank" }
             val bytes = MessageDigest.getInstance("SHA-256").digest(backendId.toByteArray(Charsets.UTF_8))

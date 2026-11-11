@@ -45,6 +45,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
+import org.json.JSONObject
 
 /** Map only explicit backend media types; unknown values remain unclassified. */
 internal fun backendMediaCategory(mediaType: String?): String? = when (mediaType?.trim()?.lowercase()) {
@@ -555,18 +556,12 @@ class AnimeRepository(
         if (normQuery.isBlank()) return@withContext Result.success(0)
         val fullSearchStartedAt = System.currentTimeMillis()
 
-        // Check if query was run recently (< 3 minutes) and results already exist in Room
-        val cachedTime = searchCache.get(normQuery)
-        val now = System.currentTimeMillis()
-        if (cachedTime != null && (now - cachedTime < 3 * 60 * 1000L)) {
-            val existingCount = searchDao.getSearchQuery(normQuery)?.totalResults ?: 0
-            if (existingCount > 0) {
-                return@withContext Result.success(existingCount)
-            }
-        }
-
         try {
             searchMutexes.computeIfAbsent(normQuery) { Mutex() }.withLock {
+                // Firestore is the shared metadata authority. Hydrate Room/UI from it before
+                // consulting the local cache or calling live metadata providers.
+                val sharedCount = hydrateFirestoreSearchResults(normQuery)
+                if (sharedCount > 0) return@withLock Result.success(sharedCount)
                 // Re-check after waiting for an in-flight identical search.
                 val lockedCachedTime = searchCache.get(normQuery)
                 if (lockedCachedTime != null && System.currentTimeMillis() - lockedCachedTime < 3 * 60 * 1000L) {
@@ -729,6 +724,47 @@ class AnimeRepository(
         }
     }
 
+    private suspend fun hydrateFirestoreSearchResults(normalizedQuery: String): Int {
+        val records = sharedCatalog.searchTitles(normalizedQuery)
+        if (records.isEmpty()) return 0
+        val entries = records.mapNotNull { record ->
+            val json = JSONObject(record.payloadJson)
+            val backendId = record.backendId?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val title = json.optString("title").takeIf { it.isNotBlank() } ?: backendId
+            val category = if (record.contentType == "MOVIE") "MOVIE" else "ANIME"
+            val existing = animeDao.getAnimeByBackendId(backendId)
+            AnimeEntry(
+                id = existing?.id ?: backendId,
+                aniListId = existing?.aniListId,
+                backendAnimeId = backendId,
+                titleEnglish = existing?.titleEnglish ?: title,
+                titleRomaji = existing?.titleRomaji,
+                titleNative = existing?.titleNative,
+                preferredTitle = title,
+                synopsis = json.optString("description").takeIf { it.isNotBlank() } ?: existing?.synopsis,
+                year = json.optString("releaseYear").takeIf { it.isNotBlank() } ?: existing?.year,
+                format = json.optString("mediaType").takeIf { it.isNotBlank() } ?: existing?.format,
+                genres = (json.optJSONArray("genres")?.let { array ->
+                    (0 until array.length()).map { array.optString(it) }.filter { it.isNotBlank() }.joinToString(", ")
+                } ?: existing?.genres ?: ""),
+                posterUrl = json.optString("posterUrl").takeIf { it.isNotBlank() } ?: existing?.posterUrl,
+                bannerUrl = json.optString("bannerUrl").takeIf { it.isNotBlank() } ?: existing?.bannerUrl,
+                isPlayable = true,
+                mediaCategory = category,
+                updatedAt = System.currentTimeMillis()
+            )
+        }.distinctBy { it.id }
+        if (entries.isEmpty()) return 0
+        animeDao.upsertAnimeList(entries)
+        searchDao.clearSearchResultsForQuery(normalizedQuery)
+        searchDao.insertSearchResultRefs(entries.mapIndexed { index, entry ->
+            SearchResultRef(normalizedQuery = normalizedQuery, animeId = entry.id, rankIndex = index)
+        })
+        searchDao.upsertSearchQuery(SearchQuery(normalizedQuery, entries.size))
+        searchCache.put(normalizedQuery, System.currentTimeMillis())
+        return entries.size
+    }
+
     /**
      * Refreshes details and seasons/episodes for a given anime.
      * Persists seasons and episodes to Room so the UI observes Room.
@@ -802,6 +838,34 @@ class AnimeRepository(
                             break
                         }
                     }
+                }
+            }
+
+            // Firestore-first detail hydration. Live backend remains responsible for missing
+            // fields and season/episode metadata; playback sources never come from Firestore.
+            if (backendId != null) {
+                val contentType = if (currentEntry?.mediaCategory.equals("MOVIE", ignoreCase = true)) "MOVIE" else "ANIME"
+                val shared = runCatching {
+                    sharedCatalog.readAnime(SharedCatalogMetadata.documentIdFor(contentType, backendId))
+                }.getOrNull()
+                if (shared != null) {
+                    val json = JSONObject(shared.payloadJson)
+                    val sharedTitle = json.optString("title").takeIf { it.isNotBlank() }
+                    val hydrated = (currentEntry ?: AnimeEntry(backendId, preferredTitle = sharedTitle ?: backendId)).copy(
+                        backendAnimeId = backendId,
+                        preferredTitle = sharedTitle ?: currentEntry?.preferredTitle ?: backendId,
+                        synopsis = json.optString("description").takeIf { it.isNotBlank() } ?: currentEntry?.synopsis,
+                        year = json.optString("releaseYear").takeIf { it.isNotBlank() } ?: currentEntry?.year,
+                        posterUrl = json.optString("posterUrl").takeIf { it.isNotBlank() } ?: currentEntry?.posterUrl,
+                        bannerUrl = json.optString("bannerUrl").takeIf { it.isNotBlank() } ?: currentEntry?.bannerUrl,
+                        genres = json.optJSONArray("genres")?.let { array ->
+                            (0 until array.length()).map { array.optString(it) }.filter { it.isNotBlank() }.joinToString(", ")
+                        } ?: currentEntry?.genres.orEmpty(),
+                        isPlayable = true,
+                        updatedAt = System.currentTimeMillis()
+                    )
+                    animeDao.upsertAnime(hydrated)
+                    currentEntry = hydrated
                 }
             }
 

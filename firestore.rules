@@ -84,7 +84,7 @@ service cloud.firestore {
         ])
         && request.resource.data.keys().hasOnly([
           'documentId', 'canonicalId', 'backendId', 'contentType', 'schemaVersion', 'metadataHash',
-          'title', 'description', 'posterUrl', 'bannerUrl', 'mediaType', 'releaseYear', 'genres',
+          'title', 'normalizedTitle', 'searchKeywords', 'description', 'posterUrl', 'bannerUrl', 'mediaType', 'releaseYear', 'genres',
           'seasonNumber', 'episodeNumber', 'episodeTitle', 'episodeDescription',
           'parentCanonicalId', 'parentBackendId', 'source', 'createdAt', 'updatedAt', 'lastSyncedAt'
         ])
@@ -101,6 +101,8 @@ service cloud.firestore {
         && request.resource.data.lastSyncedAt is timestamp
         && (!('canonicalId' in request.resource.data.keys()) || request.resource.data.canonicalId is string)
         && (!('title' in request.resource.data.keys()) || request.resource.data.title is string)
+        && (!('normalizedTitle' in request.resource.data.keys()) || request.resource.data.normalizedTitle is string)
+        && (!('searchKeywords' in request.resource.data.keys()) || request.resource.data.searchKeywords is list)
         && (!('description' in request.resource.data.keys()) || request.resource.data.description is string)
         && (!('posterUrl' in request.resource.data.keys()) || request.resource.data.posterUrl is string)
         && (!('bannerUrl' in request.resource.data.keys()) || request.resource.data.bannerUrl is string)
