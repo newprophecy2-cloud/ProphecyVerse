@@ -7,7 +7,7 @@ import java.util.Locale
 
 object TitleMatcher {
     private val DIACRITICS_REGEX = "\\p{InCombiningDiacriticalMarks}+".toRegex()
-    private val PUNCTUATION_REGEX = "[^a-zA-Z0-9\\s]".toRegex()
+    private val PUNCTUATION_REGEX = "[\\p{Punct}&&[^_]]".toRegex()
     private val WHITESPACE_REGEX = "\\s+".toRegex()
 
     fun normalize(input: String?): String {
@@ -18,6 +18,22 @@ object TitleMatcher {
         return WHITESPACE_REGEX.replace(withoutPunctuation, " ")
             .trim()
             .lowercase(Locale.ROOT)
+    }
+
+    /** Lower-is-better rank: exact/prefix/token matches always beat fuzzy matches. */
+    fun rank(query: String, aliases: List<String>): Int {
+        val normalizedQuery = normalize(query)
+        if (normalizedQuery.isBlank()) return Int.MAX_VALUE
+        val normalizedAliases = aliases.map(::normalize).filter { it.isNotBlank() }.distinct()
+        if (normalizedAliases.any { it == normalizedQuery }) return 0
+        if (normalizedAliases.any { it.startsWith(normalizedQuery) }) return 10
+        val tokens = normalizedQuery.split(" ").filter { it.isNotBlank() }
+        if (normalizedAliases.any { alias -> tokens.all { token -> alias.split(" ").any { it.startsWith(token) } } }) return 20
+        if (normalizedAliases.any { it.contains(normalizedQuery) }) return 30
+        val similarity = normalizedAliases.maxOfOrNull { titleSimilarity(it, normalizedQuery) } ?: 0f
+        return if (similarity >= if (normalizedQuery.length <= 3) 0.75f else if (normalizedQuery.length <= 6) 0.62f else 0.55f) {
+            100 + ((1f - similarity) * 100).toInt()
+        } else Int.MAX_VALUE
     }
 
     /**
@@ -211,6 +227,27 @@ object TitleMatcher {
             return maxOf(jaccard, 0.85f)
         }
 
-        return jaccard
+        val distance = levenshtein(s1, s2)
+        val editSimilarity = 1f - distance.toFloat() / maxOf(s1.length, s2.length)
+        return maxOf(jaccard, editSimilarity)
+    }
+
+    private fun levenshtein(left: String, right: String): Int {
+        if (left.isEmpty()) return right.length
+        if (right.isEmpty()) return left.length
+        var previous = IntArray(right.length + 1) { it }
+        for (i in left.indices) {
+            val current = IntArray(right.length + 1)
+            current[0] = i + 1
+            for (j in right.indices) {
+                current[j + 1] = minOf(
+                    current[j] + 1,
+                    previous[j + 1] + 1,
+                    previous[j] + if (left[i] == right[j]) 0 else 1
+                )
+            }
+            previous = current
+        }
+        return previous[right.length]
     }
 }

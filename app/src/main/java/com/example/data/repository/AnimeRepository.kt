@@ -781,6 +781,7 @@ class AnimeRepository(
             var detailHttpCode: Int? = null
             var episodeHttpCode: Int? = null
             var currentRefreshEpisodeIds: Set<String> = emptySet()
+            var firestoreDetailComplete = false
 
             // Check existing catalog mapping table first
             if (backendId == null && currentEntry?.aniListId != null) {
@@ -846,10 +847,15 @@ class AnimeRepository(
             if (backendId != null) {
                 val contentType = if (currentEntry?.mediaCategory.equals("MOVIE", ignoreCase = true)) "MOVIE" else "ANIME"
                 val shared = runCatching {
-                    sharedCatalog.readAnime(SharedCatalogMetadata.documentIdFor(contentType, backendId))
+                    if (contentType == "MOVIE") {
+                        sharedCatalog.readMovie(SharedCatalogMetadata.documentIdFor(contentType, backendId))
+                    } else {
+                        sharedCatalog.readAnime(SharedCatalogMetadata.documentIdFor(contentType, backendId))
+                    }
                 }.getOrNull()
                 if (shared != null) {
                     val json = JSONObject(shared.payloadJson)
+                    firestoreDetailComplete = json.optBoolean("metadataComplete", false)
                     val sharedTitle = json.optString("title").takeIf { it.isNotBlank() }
                     val hydrated = (currentEntry ?: AnimeEntry(backendId, preferredTitle = sharedTitle ?: backendId)).copy(
                         backendAnimeId = backendId,
@@ -873,6 +879,7 @@ class AnimeRepository(
             if (backendId != null) {
                 val (detailResp, epResp) = coroutineScope {
                     val detailDeferred = async {
+                        if (firestoreDetailComplete) return@async null
                         val startedAt = System.currentTimeMillis()
                         try { prophecyApi.getAnimeDetails(backendId).also {
                             Log.i("AnimeRepository", "detail_endpoint_ms=${System.currentTimeMillis() - startedAt}")

@@ -12,6 +12,18 @@ private fun normalizeSharedTitle(value: String): String = value.trim().lowercase
     .trim()
     .replace(Regex("\\s+"), " ")
 
+private fun searchableAliases(values: List<String?>): List<String> = values
+    .asSequence()
+    .filterNotNull()
+    .map(::normalizeSharedTitle)
+    .filter { it.isNotBlank() }
+    .flatMap { normalized ->
+        sequenceOf(normalized) + normalized.split(" ").asSequence().filter { it.isNotBlank() }
+    }
+    .distinct()
+    .sorted()
+    .toList()
+
 /** Backend-origin catalog metadata only; playback/source data is deliberately not represented. */
 data class SharedCatalogMetadata(
     val documentId: String,
@@ -28,6 +40,15 @@ data class SharedCatalogMetadata(
     val mediaType: String? = null,
     val releaseYear: String? = null,
     val genres: List<String> = emptyList(),
+    val titleEnglish: String? = null,
+    val titleRomaji: String? = null,
+    val titleNative: String? = null,
+    val alternativeTitles: List<String> = emptyList(),
+    val status: String? = null,
+    val durationMinutes: Int? = null,
+    val seasonCount: Int? = null,
+    val episodeCount: Int? = null,
+    val metadataComplete: Boolean = false,
     val seasonNumber: Int? = null,
     val episodeNumber: Int? = null,
     val episodeTitle: String? = null,
@@ -42,6 +63,9 @@ data class SharedCatalogMetadata(
         "title" to title, "normalizedTitle" to normalizedTitle, "searchKeywords" to searchKeywords,
         "description" to description, "posterUrl" to posterUrl, "bannerUrl" to bannerUrl,
         "mediaType" to mediaType, "releaseYear" to releaseYear, "genres" to genres,
+        "titleEnglish" to titleEnglish, "titleRomaji" to titleRomaji, "titleNative" to titleNative,
+        "alternativeTitles" to alternativeTitles, "status" to status, "durationMinutes" to durationMinutes,
+        "seasonCount" to seasonCount, "episodeCount" to episodeCount, "metadataComplete" to metadataComplete,
         "seasonNumber" to seasonNumber, "episodeNumber" to episodeNumber, "episodeTitle" to episodeTitle,
         "episodeDescription" to episodeDescription, "parentCanonicalId" to parentCanonicalId,
         "parentBackendId" to parentBackendId, "createdAt" to createdAt, "updatedAt" to updatedAt,
@@ -49,7 +73,7 @@ data class SharedCatalogMetadata(
     ).filterValues { it != null }
 
     companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
         const val SOURCE = "prophecyverse_backend"
         fun normalizeTitle(value: String): String = normalizeSharedTitle(value)
         fun documentIdFor(contentType: String, backendId: String): String {
@@ -91,24 +115,40 @@ data class SharedCatalogMetadata(
                 .joinToString("") { "%02x".format(it) }
         }
         fun fromSearch(item: ProphecySearchResultItem): SharedCatalogMetadata? {
+            if (item.id.isBlank() || item.title.isBlank()) return null
             val media = item.mediaType?.trim()?.lowercase(Locale.ROOT)
             val kind = when (media) { "anime" -> "anime"; "movie" -> "movie"; else -> return null }
             val type = if (kind == "anime") "ANIME" else "MOVIE"
             val id = stableId(kind, item.id)
+            val aliases = listOf(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles
             return SharedCatalogMetadata(id, item.canonicalId, item.id, type, title = item.title,
-                posterUrl = item.posterUrl, mediaType = media, releaseYear = item.year,
-                metadataHash = hash(item.canonicalId, item.id, type, item.title, item.posterUrl, item.year, media))
+                normalizedTitle = normalizeSharedTitle(item.title),
+                searchKeywords = searchableAliases(listOf(item.title) + aliases),
+                titleEnglish = item.titleEnglish, titleRomaji = item.titleRomaji, titleNative = item.titleNative,
+                alternativeTitles = item.alternativeTitles.orEmpty(), posterUrl = item.posterUrl, bannerUrl = item.bannerUrl,
+                mediaType = media, releaseYear = item.year, status = item.status, seasonCount = item.seasonCount,
+                episodeCount = item.episodeCount, metadataComplete = false,
+                metadataHash = hash(item.canonicalId, item.id, type, item.title, aliases, item.posterUrl, item.bannerUrl, item.year, media,
+                    item.status, item.seasonCount, item.episodeCount))
         }
         fun fromDetail(item: ProphecyAnimeDetailsResponse): SharedCatalogMetadata? {
+            if (item.id.isBlank() || item.title.isBlank()) return null
             val media = item.mediaType?.trim()?.lowercase(Locale.ROOT)
             val kind = when (media) { "anime" -> "anime"; "movie" -> "movie"; else -> return null }
             val type = if (kind == "anime") "ANIME" else "MOVIE"
             val genres = item.genres.orEmpty().distinct().sorted()
             val id = stableId(kind, item.id)
+            val aliases = listOf(item.titleEnglish, item.titleRomaji, item.titleNative) + item.alternativeTitles
             return SharedCatalogMetadata(id, item.canonicalId, item.id, type, title = item.title,
-                description = item.description, posterUrl = item.posterUrl, mediaType = media,
-                releaseYear = item.year, genres = genres,
-                metadataHash = hash(item.canonicalId, item.id, type, item.title, item.description, item.posterUrl, media, item.year, genres))
+                normalizedTitle = normalizeSharedTitle(item.title),
+                searchKeywords = searchableAliases(listOf(item.title) + aliases),
+                description = item.description, posterUrl = item.posterUrl, bannerUrl = item.bannerUrl, mediaType = media,
+                releaseYear = item.year, genres = genres, titleEnglish = item.titleEnglish, titleRomaji = item.titleRomaji,
+                titleNative = item.titleNative, alternativeTitles = item.alternativeTitles.orEmpty(), status = item.status,
+                durationMinutes = item.durationMinutes, seasonCount = item.seasonCount, episodeCount = item.episodeCount,
+                metadataComplete = true,
+                metadataHash = hash(item.canonicalId, item.id, type, item.title, aliases, item.description, item.posterUrl,
+                    item.bannerUrl, media, item.year, genres, item.status, item.durationMinutes, item.seasonCount, item.episodeCount))
         }
         fun fromSeason(parentBackendId: String, parentCanonicalId: String?, season: ProphecySeasonDto): SharedCatalogMetadata? {
             if (parentBackendId.isBlank() || season.number <= 0) return null

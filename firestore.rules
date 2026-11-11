@@ -85,6 +85,7 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly([
           'documentId', 'canonicalId', 'backendId', 'contentType', 'schemaVersion', 'metadataHash',
           'title', 'normalizedTitle', 'searchKeywords', 'description', 'posterUrl', 'bannerUrl', 'mediaType', 'releaseYear', 'genres',
+          'titleEnglish', 'titleRomaji', 'titleNative', 'alternativeTitles', 'status', 'durationMinutes', 'seasonCount', 'episodeCount', 'metadataComplete',
           'seasonNumber', 'episodeNumber', 'episodeTitle', 'episodeDescription',
           'parentCanonicalId', 'parentBackendId', 'source', 'createdAt', 'updatedAt', 'lastSyncedAt'
         ])
@@ -92,7 +93,7 @@ service cloud.firestore {
         && request.resource.data.backendId is string
         && request.resource.data.backendId.size() > 0
         && request.resource.data.contentType == expectedType
-        && request.resource.data.schemaVersion == 1
+        && request.resource.data.schemaVersion == 2
         && request.resource.data.metadataHash is string
         && request.resource.data.metadataHash.size() == 64
         && request.resource.data.source == 'prophecyverse_backend'
@@ -102,13 +103,22 @@ service cloud.firestore {
         && (!('canonicalId' in request.resource.data.keys()) || request.resource.data.canonicalId is string)
         && (!('title' in request.resource.data.keys()) || request.resource.data.title is string)
         && (!('normalizedTitle' in request.resource.data.keys()) || request.resource.data.normalizedTitle is string)
-        && (!('searchKeywords' in request.resource.data.keys()) || request.resource.data.searchKeywords is list)
+        && (!('searchKeywords' in request.resource.data.keys()) || (request.resource.data.searchKeywords is list && request.resource.data.searchKeywords.size() <= 128))
         && (!('description' in request.resource.data.keys()) || request.resource.data.description is string)
-        && (!('posterUrl' in request.resource.data.keys()) || request.resource.data.posterUrl is string)
-        && (!('bannerUrl' in request.resource.data.keys()) || request.resource.data.bannerUrl is string)
+        && (!('posterUrl' in request.resource.data.keys()) || (request.resource.data.posterUrl is string && request.resource.data.posterUrl.size() <= 2048))
+        && (!('bannerUrl' in request.resource.data.keys()) || (request.resource.data.bannerUrl is string && request.resource.data.bannerUrl.size() <= 2048))
         && (!('mediaType' in request.resource.data.keys()) || request.resource.data.mediaType is string)
         && (!('releaseYear' in request.resource.data.keys()) || request.resource.data.releaseYear is string)
         && (!('genres' in request.resource.data.keys()) || request.resource.data.genres is list)
+        && (!('titleEnglish' in request.resource.data.keys()) || request.resource.data.titleEnglish is string)
+        && (!('titleRomaji' in request.resource.data.keys()) || request.resource.data.titleRomaji is string)
+        && (!('titleNative' in request.resource.data.keys()) || request.resource.data.titleNative is string)
+        && (!('alternativeTitles' in request.resource.data.keys()) || (request.resource.data.alternativeTitles is list && request.resource.data.alternativeTitles.size() <= 64))
+        && (!('status' in request.resource.data.keys()) || request.resource.data.status is string)
+        && (!('durationMinutes' in request.resource.data.keys()) || request.resource.data.durationMinutes is int)
+        && (!('seasonCount' in request.resource.data.keys()) || request.resource.data.seasonCount is int)
+        && (!('episodeCount' in request.resource.data.keys()) || request.resource.data.episodeCount is int)
+        && (!('metadataComplete' in request.resource.data.keys()) || request.resource.data.metadataComplete is bool)
         && (!('seasonNumber' in request.resource.data.keys()) || request.resource.data.seasonNumber is int)
         && (!('episodeNumber' in request.resource.data.keys()) || request.resource.data.episodeNumber is int)
         && (!('episodeTitle' in request.resource.data.keys()) || request.resource.data.episodeTitle is string)

@@ -45,6 +45,7 @@ interface AnimeDao {
         WHERE a.preferredTitle LIKE '%' || :query || '%'
            OR a.titleEnglish LIKE '%' || :query || '%'
            OR a.titleRomaji LIKE '%' || :query || '%'
+           OR a.titleNative LIKE '%' || :query || '%'
            OR al.alias LIKE '%' || :query || '%'
         ORDER BY a.score DESC, a.updatedAt DESC
         LIMIT 50

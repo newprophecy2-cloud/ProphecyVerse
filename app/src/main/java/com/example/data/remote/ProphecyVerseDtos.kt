@@ -19,7 +19,14 @@ data class ProphecySearchResultItem(
     @Json(name = "year") val year: String? = null,
     @Json(name = "poster_url") val posterUrl: String? = null,
     @Json(name = "season_count") val seasonCount: Int? = null,
-    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null
+    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null,
+    @Json(name = "title_english") val titleEnglish: String? = null,
+    @Json(name = "title_romaji") val titleRomaji: String? = null,
+    @Json(name = "title_native") val titleNative: String? = null,
+    @Json(name = "alternative_titles") val alternativeTitles: List<String>? = null,
+    @Json(name = "banner_url") val bannerUrl: String? = null,
+    @Json(name = "status") val status: String? = null,
+    @Json(name = "episode_count") val episodeCount: Int? = null
 )
 
 /** Anime/Episode catalog mapping only; this is not an Episode source-resolution result. */
@@ -42,7 +49,16 @@ data class ProphecyAnimeDetailsResponse(
     @Json(name = "genres") val genres: List<String>? = null,
     @Json(name = "seasons") val seasons: List<ProphecySeasonDto>? = null,
     @Json(name = "partial") val partial: Boolean? = null,
-    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null
+    @Json(name = "provider_mappings") val providerMappings: List<ProphecyProviderMappingDto>? = null,
+    @Json(name = "title_english") val titleEnglish: String? = null,
+    @Json(name = "title_romaji") val titleRomaji: String? = null,
+    @Json(name = "title_native") val titleNative: String? = null,
+    @Json(name = "alternative_titles") val alternativeTitles: List<String>? = null,
+    @Json(name = "banner_url") val bannerUrl: String? = null,
+    @Json(name = "status") val status: String? = null,
+    @Json(name = "duration_minutes") val durationMinutes: Int? = null,
+    @Json(name = "season_count") val seasonCount: Int? = null,
+    @Json(name = "episode_count") val episodeCount: Int? = null
 )
 
 @JsonClass(generateAdapter = true)

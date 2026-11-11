@@ -12,6 +12,7 @@ import com.google.firebase.Timestamp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
+import com.example.data.repository.TitleMatcher
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.min
@@ -34,6 +35,7 @@ class SharedCatalogRepository(
         private val allowedMetadataFields = setOf(
             "documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
             "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
+            "titleEnglish", "titleRomaji", "titleNative", "alternativeTitles", "status", "durationMinutes", "seasonCount", "episodeCount", "metadataComplete",
             "seasonNumber", "episodeNumber", "episodeTitle", "episodeDescription", "parentCanonicalId",
             "parentBackendId", "source", "createdAt", "updatedAt", "lastSyncedAt"
         )
@@ -67,19 +69,24 @@ class SharedCatalogRepository(
         if (normalized.isBlank() || !networkAvailable() || auth.currentUser == null) return emptyList()
         return try {
             val end = normalized + "\uf8ff"
-            listOf("shared_catalog_anime", "shared_catalog_movies").flatMap { collection ->
-                firestore.collection(collection)
-                    .orderBy("normalizedTitle")
-                    .startAt(normalized)
-                    .endAt(end)
-                    .limit(limit)
-                    .get().await().documents.mapNotNull { document ->
+            val tokens = normalized.split(" ").filter { it.length >= 2 }.take(3)
+            val candidates = linkedMapOf<String, Pair<String, com.google.firebase.firestore.DocumentSnapshot>>()
+            listOf("shared_catalog_anime", "shared_catalog_movies").forEach { collection ->
+                val queries = buildList {
+                    add(firestore.collection(collection).orderBy("normalizedTitle").startAt(normalized).endAt(end).limit(limit))
+                    tokens.forEach { token -> add(firestore.collection(collection).whereArrayContains("searchKeywords", token).limit(limit)) }
+                }
+                queries.forEach { queryRef ->
+                    queryRef.get().await().documents.forEach { document -> candidates.putIfAbsent("$collection/${document.id}", collection to document) }
+                }
+            }
+            candidates.values.mapNotNull { (collection, document) ->
                         val data = document.data ?: return@mapNotNull null
                         val type = data["contentType"] as? String ?: return@mapNotNull null
                         val id = data["documentId"] as? String ?: return@mapNotNull null
                         val backendId = data["backendId"] as? String ?: return@mapNotNull null
                         val hash = data["metadataHash"] as? String ?: return@mapNotNull null
-                        if (document.id != id || data["source"] != SharedCatalogMetadata.SOURCE ||
+                        if (document.id != id || collectionFor(type) != collection || data["source"] != SharedCatalogMetadata.SOURCE ||
                             (data["schemaVersion"] as? Number)?.toInt() != SharedCatalogMetadata.SCHEMA_VERSION ||
                             !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
                             data["normalizedTitle"] !is String ||
@@ -88,16 +95,23 @@ class SharedCatalogRepository(
                         val safe = JSONObject()
                         listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
                             "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl",
-                            "mediaType", "releaseYear", "genres", "source").forEach { key ->
+                            "mediaType", "releaseYear", "genres", "titleEnglish", "titleRomaji", "titleNative", "alternativeTitles",
+                            "status", "durationMinutes", "seasonCount", "episodeCount", "metadataComplete", "source").forEach { key ->
                             data[key]?.let { safe.put(key, it) }
                         }
                         SharedCatalogCacheEntry(id, type, data["canonicalId"] as? String, backendId,
                             SharedCatalogMetadata.SCHEMA_VERSION, hash, safe.toString(), now()).also { dao.putCache(it) }
-                    }
-            }.sortedWith(compareBy<SharedCatalogCacheEntry> {
-                val title = runCatching { JSONObject(it.payloadJson).optString("normalizedTitle") }.getOrDefault("")
-                if (title == normalized) 0 else if (title.startsWith(normalized)) 1 else 2
-            }.thenBy { it.documentId }).take(limit.toInt().coerceIn(1, 50))
+                    }.sortedWith(compareBy<SharedCatalogCacheEntry> {
+                        val json = runCatching { JSONObject(it.payloadJson) }.getOrNull()
+                        val aliases = buildList {
+                            json?.optString("title")?.takeIf { it.isNotBlank() }?.let(::add)
+                            json?.optString("titleEnglish")?.takeIf { it.isNotBlank() }?.let(::add)
+                            json?.optString("titleRomaji")?.takeIf { it.isNotBlank() }?.let(::add)
+                            json?.optString("titleNative")?.takeIf { it.isNotBlank() }?.let(::add)
+                            json?.optJSONArray("alternativeTitles")?.let { array -> (0 until array.length()).map { array.optString(it) }.forEach(::add) }
+                        }
+                        TitleMatcher.rank(normalized, aliases)
+                    }.thenBy { it.documentId }).take(limit.toInt().coerceIn(1, 50))
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -128,10 +142,13 @@ class SharedCatalogRepository(
                 !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
                 data["source"] != SharedCatalogMetadata.SOURCE) return cached
             val stringFields = listOf("canonicalId", "backendId", "title", "normalizedTitle", "description", "posterUrl", "bannerUrl",
-                "mediaType", "releaseYear", "episodeTitle", "episodeDescription", "parentCanonicalId", "parentBackendId")
+                "mediaType", "releaseYear", "titleEnglish", "titleRomaji", "titleNative", "status", "episodeTitle", "episodeDescription", "parentCanonicalId", "parentBackendId")
             if (stringFields.any { data[it] != null && data[it] !is String }) return cached
             if (data["searchKeywords"] != null && ((data["searchKeywords"] as? List<*>)?.all { it is String } != true)) return cached
             if (data["genres"] != null && ((data["genres"] as? List<*>)?.all { it is String } != true)) return cached
+            if (data["alternativeTitles"] != null && ((data["alternativeTitles"] as? List<*>)?.all { it is String } != true)) return cached
+            if (data["metadataComplete"] != null && data["metadataComplete"] !is Boolean) return cached
+            if (listOf("durationMinutes", "seasonCount", "episodeCount").any { key -> data[key] != null && data[key] !is Number }) return cached
             if (listOf("seasonNumber", "episodeNumber").any { key -> data[key] != null && data[key] !is Number }) return cached
             if (type == "SEASON" && ((data["seasonNumber"] as? Number)?.toInt()?.let { it > 0 } != true || backendId.isNullOrBlank())) return cached
             if (type == "EPISODE" && ((data["seasonNumber"] as? Number)?.toInt()?.let { it > 0 } != true ||
@@ -140,6 +157,7 @@ class SharedCatalogRepository(
             val safe = JSONObject()
             listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
                 "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
+                "titleEnglish", "titleRomaji", "titleNative", "alternativeTitles", "status", "durationMinutes", "seasonCount", "episodeCount", "metadataComplete",
                 "seasonNumber", "episodeNumber", "episodeTitle", "episodeDescription", "parentCanonicalId",
                 "parentBackendId", "source").forEach { key ->
                 data[key]?.let { safe.put(key, it) }

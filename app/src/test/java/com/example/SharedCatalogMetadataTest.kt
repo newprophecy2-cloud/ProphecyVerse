@@ -30,7 +30,8 @@ class SharedCatalogMetadataTest {
             ProphecySearchResultItem("naruto-1", title = "Naruto: Shippuden", mediaType = "anime")
         )!!
         assertEquals("naruto shippuden", item.normalizedTitle)
-        assertEquals(listOf("naruto shippuden"), item.searchKeywords)
+        assertTrue(item.searchKeywords.containsAll(listOf("naruto shippuden", "naruto", "shippuden")))
+        assertEquals(2, item.schemaVersion)
         assertEquals(item.documentId, SharedCatalogMetadata.documentIdFor("ANIME", "naruto-1"))
     }
     @Test fun realSeasonAndEpisodeNumbersAndParentAreRequired() {
