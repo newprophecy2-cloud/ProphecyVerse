@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
@@ -34,6 +36,8 @@ import java.security.cert.CertificateException
 import javax.net.ssl.SSLException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
+import org.json.JSONArray
+import org.json.JSONObject
 
 data class DownloadSource(
     val id: String = "",
@@ -72,6 +76,11 @@ internal fun parseAdminUpdatedAtMillis(value: Any?): Long = when (value) {
 
 internal fun requiresDownloadMetadata(currentCode: Int, latestCode: Int, minimumCode: Int): Boolean =
     currentCode < latestCode || currentCode < minimumCode
+
+internal fun verificationFailureFallback(
+    cachedState: VersionCheckState?,
+    defaultConfig: VersionControlConfig
+): VersionCheckState = cachedState ?: VersionCheckState.UpToDate(defaultConfig)
 
 sealed class VersionCheckState {
     data object Checking : VersionCheckState()
@@ -167,6 +176,21 @@ class VersionControlManager private constructor(private val context: Context) {
 
     private val _versionState = MutableStateFlow<VersionCheckState>(VersionCheckState.Checking)
     val versionState: StateFlow<VersionCheckState> = _versionState.asStateFlow()
+    private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            checkForUpdates()
+        }
+    }
+
+    init {
+        readCachedVerification()?.let { _versionState.value = it }
+        try {
+            connectivityManager?.registerDefaultNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not register background version-refresh callback", e)
+        }
+    }
 
     private val _apkDownloadState = MutableStateFlow<ApkDownloadState>(ApkDownloadState.Idle)
     val apkDownloadState: StateFlow<ApkDownloadState> = _apkDownloadState.asStateFlow()
@@ -203,8 +227,6 @@ class VersionControlManager private constructor(private val context: Context) {
             val startedAt = SystemClock.elapsedRealtime()
             logVersionCheck("START", startedAt)
             try {
-                _versionState.value = VersionCheckState.Checking
-
                 val snapshot = try {
                     FirestoreRequestGuard.execute("read app version configuration") {
                         firestore.collection("app_config")
@@ -216,17 +238,13 @@ class VersionControlManager private constructor(private val context: Context) {
                 } catch (e: Exception) {
                     val failure = classifyVersionVerificationFailure(e)
                     logVersionCheck("FAILED", startedAt, failure)
-                    _versionState.value = VersionCheckState.VerificationFailed(
-                        failure.userMessage,
-                        failure.isNetworkError
-                    )
+                    _versionState.value = verificationFailureFallback(readCachedVerification(), getDefaultConfig())
                     return@launch
                 }
                 if (!snapshot.exists()) {
                     logVersionCheck("FAILED", startedAt, message = "DOCUMENT_NOT_FOUND")
-                    _versionState.value = VersionCheckState.VerificationFailed(
-                        "Version configuration is unavailable. Retry later.", false
-                    )
+                    _versionState.value = readCachedVerification()
+                        ?: VersionCheckState.UpToDate(getDefaultConfig())
                     return@launch
                 }
 
@@ -234,7 +252,7 @@ class VersionControlManager private constructor(private val context: Context) {
                 val enabled = snapshot.getBoolean("enabled")
                     ?: throw IllegalArgumentException("Missing or invalid enabled flag")
                 if (!enabled) {
-                    _versionState.value = VersionCheckState.UpToDate(
+                    publishVerifiedState(VersionCheckState.UpToDate(
                         VersionControlConfig(
                             enabled = false,
                             latestVersionName = currentVersionName,
@@ -242,7 +260,7 @@ class VersionControlManager private constructor(private val context: Context) {
                             minSupportedVersionCode = currentVersionCode,
                             packageName = BuildConfig.APPLICATION_ID
                         )
-                    )
+                    ))
                     logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
                     return@launch
                 }
@@ -280,7 +298,7 @@ class VersionControlManager private constructor(private val context: Context) {
                 // A current/supported installation does not need release-download fields to determine
                 // its state. Older builds need at least one actionable HTTPS download source.
                 if (!requiresDownloadMetadata(currentVersionCode, latestCode, minCode)) {
-                    _versionState.value = VersionCheckState.UpToDate(
+                    publishVerifiedState(VersionCheckState.UpToDate(
                         VersionControlConfig(
                             enabled = enabled,
                             forceUpdate = forceUpdate,
@@ -292,7 +310,7 @@ class VersionControlManager private constructor(private val context: Context) {
                                 snapshot.get("updated_at") ?: snapshot.get("updatedAt")
                             )
                         )
-                    )
+                    ))
                     logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
                     return@launch
                 }
@@ -365,7 +383,7 @@ class VersionControlManager private constructor(private val context: Context) {
                     updatedBy = snapshot.getString("updated_by") ?: snapshot.getString("updatedBy") ?: ""
                 )
 
-                _versionState.value = evaluateVersionState(currentVersionCode, config)
+                publishVerifiedState(evaluateVersionState(currentVersionCode, config))
                 logVersionCheck("SUCCESS", startedAt, message = _versionState.value::class.simpleName ?: "UNKNOWN")
 
             } catch (e: CancellationException) {
@@ -375,10 +393,7 @@ class VersionControlManager private constructor(private val context: Context) {
                 Log.e(TAG, "Failed to verify version configuration", e)
                 val failure = classifyVersionVerificationFailure(e)
                 logVersionCheck("FAILED", startedAt, failure)
-                _versionState.value = VersionCheckState.VerificationFailed(
-                    failure.userMessage,
-                    failure.isNetworkError
-                )
+                _versionState.value = verificationFailureFallback(readCachedVerification(), getDefaultConfig())
             }
         }
     }
@@ -567,4 +582,58 @@ class VersionControlManager private constructor(private val context: Context) {
             }
         }
     }
+    private fun publishVerifiedState(state: VersionCheckState) {
+        _versionState.value = state
+        val config = when (state) {
+            is VersionCheckState.UpToDate -> state.config
+            is VersionCheckState.OptionalUpdate -> state.config
+            is VersionCheckState.ForceUpdate -> state.config
+            else -> return
+        }
+        val downloads = JSONArray().apply {
+            config.downloads.forEach { source -> put(JSONObject()
+                .put("id", source.id).put("enabled", source.enabled).put("label", source.label)
+                .put("url", source.url).put("priority", source.priority).put("direct", source.isDirectApk))
+        } }
+        context.getSharedPreferences("version_control_verification", Context.MODE_PRIVATE).edit()
+            .putString("state", when (state) {
+                is VersionCheckState.ForceUpdate -> "force"
+                is VersionCheckState.OptionalUpdate -> "optional"
+                else -> "current"
+            })
+            .putBoolean("enabled", config.enabled).putBoolean("force", config.forceUpdate)
+            .putString("name", config.latestVersionName).putInt("code", config.latestVersionCode)
+            .putInt("minimum", config.minSupportedVersionCode).putString("package", config.packageName)
+            .putString("downloads", downloads.toString()).putString("notesBn", config.releaseNotes.bn)
+            .putString("notesEn", config.releaseNotes.en).putString("sha256", config.sha256)
+            .putString("cert", config.signingCertificateSha256).putLong("updated", config.updatedAt)
+            .putString("updatedBy", config.updatedBy).apply()
+    }
+
+    private fun readCachedVerification(): VersionCheckState? = runCatching {
+        val prefs = context.getSharedPreferences("version_control_verification", Context.MODE_PRIVATE)
+        val type = prefs.getString("state", null) ?: return null
+        val items = JSONArray(prefs.getString("downloads", "[]"))
+        val downloads = (0 until items.length()).mapNotNull { i -> items.optJSONObject(i)?.let { item ->
+            DownloadSource(item.optString("id"), item.optBoolean("enabled"), item.optString("label"),
+                item.optString("url"), item.optInt("priority"), item.optBoolean("direct"))
+        } }
+        val config = VersionControlConfig(
+            enabled = prefs.getBoolean("enabled", true), forceUpdate = prefs.getBoolean("force", false),
+            latestVersionName = prefs.getString("name", currentVersionName) ?: currentVersionName,
+            latestVersionCode = prefs.getInt("code", currentVersionCode),
+            minSupportedVersionCode = prefs.getInt("minimum", currentVersionCode),
+            packageName = prefs.getString("package", BuildConfig.APPLICATION_ID) ?: BuildConfig.APPLICATION_ID,
+            downloads = downloads, sha256 = prefs.getString("sha256", "") ?: "",
+            signingCertificateSha256 = prefs.getString("cert", "") ?: "",
+            releaseNotes = ReleaseNotes(prefs.getString("notesBn", "") ?: "", prefs.getString("notesEn", "") ?: ""),
+            updatedAt = prefs.getLong("updated", 0L), updatedBy = prefs.getString("updatedBy", "") ?: ""
+        )
+        when (type) {
+            "force" -> VersionCheckState.ForceUpdate(config)
+            "optional" -> VersionCheckState.OptionalUpdate(config)
+            "current" -> VersionCheckState.UpToDate(config)
+            else -> null
+        }
+    }.getOrNull()
 }

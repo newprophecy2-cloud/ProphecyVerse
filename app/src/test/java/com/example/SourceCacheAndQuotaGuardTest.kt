@@ -19,6 +19,7 @@ import com.example.data.repository.EpisodeSourceRetryBackoff
 import com.example.data.repository.EpisodeSourceAggregator
 import com.example.data.repository.EpisodeSourceResponseState
 import com.example.data.repository.SourceExpiryTime
+import com.example.data.repository.isValidPlaybackUrl
 import com.squareup.moshi.JsonDataException
 import com.squareup.moshi.Moshi
 import org.junit.Assert.assertEquals
@@ -29,6 +30,18 @@ import java.time.Instant
 
 class SourceCacheAndQuotaGuardTest {
     private val now = Instant.parse("2026-11-09T00:00:00Z").toEpochMilli()
+
+    @Test
+    fun directPlaybackAcceptsOnlyWellFormedHttpOrFileUrls() {
+        assertTrue(isValidPlaybackUrl("https://media.example.invalid/video.m3u8"))
+        assertTrue(isValidPlaybackUrl("http://media.example.invalid/video.mp4"))
+        assertTrue(isValidPlaybackUrl("file:///data/user/0/app/cache/video.mp4"))
+        assertFalse(isValidPlaybackUrl(""))
+        assertFalse(isValidPlaybackUrl("https://"))
+        assertFalse(isValidPlaybackUrl("https:/missing-host"))
+        assertFalse(isValidPlaybackUrl("ftp://media.example.invalid/video"))
+        assertFalse(isValidPlaybackUrl("javascript:alert(1)"))
+    }
 
     @Test
     fun repeatedSourceIdUpdatesMetadataWithoutCreatingProviderDuplicates() {

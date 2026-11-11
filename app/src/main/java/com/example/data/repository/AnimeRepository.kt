@@ -33,19 +33,32 @@ import com.example.data.remote.ProphecyVerseApiService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import android.util.Log
-import android.util.LruCache
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 import org.json.JSONObject
+
+internal fun isValidPlaybackUrl(value: String): Boolean {
+    val uri = runCatching { java.net.URI(value.trim()) }.getOrNull() ?: return false
+    return when (uri.scheme?.lowercase()) {
+        "http", "https" -> !uri.host.isNullOrBlank()
+        "file" -> !uri.path.isNullOrBlank()
+        else -> false
+    }
+}
+
+internal fun uniqueAniListMedia(items: List<AniListMedia>): List<AniListMedia> = items.distinctBy { it.id }
 
 /** Map only explicit backend media types; unknown values remain unclassified. */
 internal fun backendMediaCategory(mediaType: String?): String? = when (mediaType?.trim()?.lowercase()) {
@@ -551,6 +564,53 @@ class AnimeRepository(
         return results.values.toList()
     }
 
+    /** Immediately expose live AniList results; backend identity is attached only when already known. */
+    private suspend fun publishAniListSearchResults(
+        normalizedQuery: String,
+        mediaItems: List<AniListMedia>
+    ) {
+        val uniqueMedia = uniqueAniListMedia(mediaItems)
+        if (uniqueMedia.isEmpty()) return
+        val entries = mutableListOf<AnimeEntry>()
+        val aliases = mutableListOf<AnimeAlias>()
+        val refs = mutableListOf<SearchResultRef>()
+        uniqueMedia.forEachIndexed { index, media ->
+            val existing = animeDao.getAnimeByAniListId(media.id)
+            val backendId = existing?.backendAnimeId?.takeIf(String::isNotBlank)
+            val animeId = backendId ?: existing?.id?.takeUnless { it.startsWith("anilist_") }
+                ?: "anilist_${media.id}"
+            val title = media.title?.english ?: media.title?.romaji ?: media.title?.native ?: "Anime #${media.id}"
+            entries += AnimeEntry(
+                id = animeId, aniListId = media.id, backendAnimeId = backendId,
+                titleRomaji = media.title?.romaji, titleEnglish = media.title?.english,
+                titleNative = media.title?.native, preferredTitle = title,
+                synopsis = media.description ?: existing?.synopsis,
+                year = (media.startDate?.year ?: media.seasonYear)?.toString() ?: existing?.year,
+                season = media.season ?: existing?.season, format = media.format ?: existing?.format,
+                status = media.status ?: existing?.status,
+                genres = media.genres?.joinToString(", ") ?: existing?.genres.orEmpty(),
+                score = media.averageScore?.div(10.0) ?: existing?.score,
+                episodeCount = media.episodes ?: existing?.episodeCount,
+                duration = media.duration ?: existing?.duration,
+                studios = media.studios?.nodes?.firstOrNull()?.name ?: existing?.studios,
+                posterUrl = media.coverImage?.large ?: media.coverImage?.medium ?: existing?.posterUrl,
+                bannerUrl = media.bannerImage ?: existing?.bannerUrl,
+                isPlayable = backendId != null || existing?.isPlayable == true,
+                mediaCategory = existing?.mediaCategory ?: "ANIME", updatedAt = System.currentTimeMillis()
+            )
+            listOfNotNull(media.title?.romaji, media.title?.english, media.title?.native)
+                .plus(media.synonyms.orEmpty()).filter(String::isNotBlank).distinct()
+                .forEach { alias -> aliases += AnimeAlias(animeId = animeId,
+                    alias = TitleMatcher.normalize(alias), originalAlias = alias) }
+            refs += SearchResultRef(normalizedQuery, animeId, index)
+        }
+        animeDao.upsertAnimeList(entries.distinctBy { it.id })
+        if (aliases.isNotEmpty()) animeDao.insertAliases(aliases.distinctBy { it.animeId to it.alias })
+        searchDao.clearSearchResultsForQuery(normalizedQuery)
+        searchDao.insertSearchResultRefs(refs.distinctBy { it.animeId })
+        searchDao.upsertSearchQuery(SearchQuery(normalizedQuery, refs.distinctBy { it.animeId }.size))
+    }
+
     suspend fun searchAnime(query: String): Result<Int> = withContext(Dispatchers.IO) {
         val normQuery = TitleMatcher.normalize(query)
         if (normQuery.isBlank()) return@withContext Result.success(0)
@@ -560,14 +620,8 @@ class AnimeRepository(
             searchMutexes.computeIfAbsent(normQuery) { Mutex() }.withLock {
                 // Firestore is the shared metadata authority. Hydrate Room/UI from it before
                 // consulting the local cache or calling live metadata providers.
-                val sharedCount = hydrateFirestoreSearchResults(normQuery)
-                if (sharedCount > 0) return@withLock Result.success(sharedCount)
-                // Re-check after waiting for an in-flight identical search.
-                val lockedCachedTime = searchCache.get(normQuery)
-                if (lockedCachedTime != null && System.currentTimeMillis() - lockedCachedTime < 3 * 60 * 1000L) {
-                    val existingCount = searchDao.getSearchQuery(normQuery)?.totalResults ?: 0
-                    if (existingCount > 0) return@withLock Result.success(existingCount)
-                }
+                // Warm Room from shared metadata, but cached results must never suppress live search.
+                hydrateFirestoreSearchResults(normQuery)
                 coroutineScope {
                 // Launch both queries in parallel with bounded concurrency
                 val prophecyDeferred = async {
@@ -589,7 +643,9 @@ class AnimeRepository(
                             variables = mapOf("search" to query, "page" to 1, "perPage" to 20)
                         )
                         val resp = aniListApi.postQuery(anilistReq)
-                        if (resp.isSuccessful) resp.body()?.data?.page?.media ?: emptyList() else emptyList()
+                        val items = if (resp.isSuccessful) resp.body()?.data?.page?.media ?: emptyList() else emptyList()
+                        publishAniListSearchResults(normQuery, items)
+                        items
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
@@ -599,11 +655,12 @@ class AnimeRepository(
 
                 // First page was already written by the fetch callback; subsequent pages also
                 // update Room before optional AniList matching completes.
+                // AniList publishes its live results inside its task before waiting on backend I/O.
+                val aniListItems = anilistDeferred.await()
                 val prophecyItems = prophecyDeferred.await()
                 searchCatalogResults[normQuery] = prophecyItems.take(20)
                 if (searchCatalogResults.size > 20) searchCatalogResults.keys.filter { it != normQuery }.take(5).forEach { searchCatalogResults.remove(it) }
-                // Tier 2: Process AniList results and enhance metadata
-                val aniListItems = anilistDeferred.await()
+                // Enrich the immediate AniList result set with reliable backend mappings.
                 val entriesToUpsert = mutableListOf<AnimeEntry>()
                 val aliasesToInsert = mutableListOf<AnimeAlias>()
                 val finalRefs = mutableListOf<SearchResultRef>()
@@ -709,7 +766,6 @@ class AnimeRepository(
                     searchDao.clearSearchResultsForQuery(normQuery)
                     searchDao.insertSearchResultRefs(uniqueRefs.mapIndexed { index, ref -> ref.copy(rankIndex = index) })
                     searchDao.upsertSearchQuery(SearchQuery(query = normQuery, totalResults = uniqueRefs.size))
-                    searchCache.put(normQuery, System.currentTimeMillis())
                     Log.i("AnimeRepository", "search_final_room_update_ms=${System.currentTimeMillis() - finalWriteStartedAt} results=${uniqueRefs.size}")
                 }
 
@@ -721,6 +777,19 @@ class AnimeRepository(
             throw cancelled
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    /** Silently prefetch details/episode metadata for the latest search's backend candidates. */
+    suspend fun prefetchSearchResults(query: String) = withContext(Dispatchers.IO) {
+        val normalized = TitleMatcher.normalize(query)
+        val candidates = searchCatalogResults[normalized].orEmpty().take(6)
+        coroutineScope {
+            candidates.map { candidate -> async {
+                searchPrefetchSemaphore.withPermit {
+                    refreshAnimeDetails(candidate.id)
+                }
+            } }.awaitAll()
         }
     }
 
@@ -761,7 +830,6 @@ class AnimeRepository(
             SearchResultRef(normalizedQuery = normalizedQuery, animeId = entry.id, rankIndex = index)
         })
         searchDao.upsertSearchQuery(SearchQuery(normalizedQuery, entries.size))
-        searchCache.put(normalizedQuery, System.currentTimeMillis())
         return entries.size
     }
 
@@ -1494,8 +1562,7 @@ class AnimeRepository(
     }
 
     private fun isPlayableUrl(url: String): Boolean {
-        val lower = url.trim().lowercase()
-        return lower.startsWith("https://") || lower.startsWith("http://") || lower.startsWith("file://")
+        return isValidPlaybackUrl(url)
     }
 
     private fun isExpired(expiresAt: String?): Boolean {
@@ -1596,8 +1663,8 @@ class AnimeRepository(
     }
 
     private companion object {
-        val searchCache = LruCache<String, Long>(30)
         val searchMutexes = ConcurrentHashMap<String, Mutex>()
+        val searchPrefetchSemaphore = Semaphore(2)
         val detailRefreshMutexes = ConcurrentHashMap<String, Mutex>()
         val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
         val sourceFetchGenerations = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()

@@ -1,6 +1,9 @@
 package com.example
 
 import com.example.data.repository.TitleMatcher
+import com.example.data.repository.uniqueAniListMedia
+import com.example.data.remote.AniListMedia
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -21,5 +24,10 @@ class SmartSearchMatcherTest {
 
     @Test fun normalizationPreservesNonLatinLetters() {
         assertTrue(TitleMatcher.normalize(" 鬼滅の刃 ") == "鬼滅の刃")
+    }
+
+    @Test fun liveAniListResultsAreDeduplicatedByAniListMediaId() {
+        val results = uniqueAniListMedia(listOf(AniListMedia(id = 23), AniListMedia(id = 23), AniListMedia(id = 24)))
+        assertEquals(listOf(23, 24), results.map { it.id })
     }
 }

@@ -11,6 +11,7 @@ import com.example.data.firebase.VersionVerificationFailureKind
 import com.example.data.firebase.classifyVersionVerificationFailure
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.example.data.firebase.requiresDownloadMetadata
+import com.example.data.firebase.verificationFailureFallback
 import com.example.data.notice.parsePublishedNotice
 import com.google.firebase.Timestamp
 import org.junit.Assert.assertEquals
@@ -30,6 +31,17 @@ import kotlin.coroutines.cancellation.CancellationException
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class VersionControlAndAuthTest {
+
+    @Test
+    fun verificationFailureReusesCachedSuccessOrUsesNonBlockingDefault() {
+        val cached = VersionCheckState.OptionalUpdate(VersionControlConfig(
+            latestVersionCode = 7, minSupportedVersionCode = 6, latestVersionName = "3.1.0"
+        ))
+        assertEquals(cached, verificationFailureFallback(cached, VersionControlConfig()))
+        val fallback = verificationFailureFallback(null, VersionControlConfig())
+        assertTrue(fallback is VersionCheckState.UpToDate)
+        assertFalse(fallback is VersionCheckState.VerificationFailed)
+    }
 
     @Test
     fun `version code 6 with minimum 5 is up to date`() {

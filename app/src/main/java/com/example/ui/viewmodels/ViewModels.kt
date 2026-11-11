@@ -146,7 +146,9 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
-    private var searchDebounceJob: Job? = null
+    private var searchJob: Job? = null
+    private var searchPrefetchJob: Job? = null
+    private var searchRequestSequence = 0L
 
     // Database-First: observe Room query results
     val searchResults: StateFlow<List<AnimeEntry>> = _searchQuery.flatMapLatest { q ->
@@ -163,23 +165,29 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onQueryChange(newQuery: String) {
         _searchQuery.value = newQuery
-        searchDebounceJob?.cancel()
+        val requestId = ++searchRequestSequence
+        searchJob?.cancel()
+        searchPrefetchJob?.cancel()
 
         if (newQuery.isBlank()) {
             _isSearching.value = false
             return
         }
 
-        searchDebounceJob = viewModelScope.launch {
-            delay(250) // Fast 250ms debounce
+        searchJob = viewModelScope.launch {
             _isSearching.value = true
             _error.value = null
             val res = repository.searchAnime(newQuery)
-            if (res.isFailure) {
-                _error.value = "Network search failed. Showing local results."
+            if (requestId == searchRequestSequence) {
+                if (res.isFailure) {
+                    _error.value = "Network search failed. Showing local results."
+                }
+                _isSearching.value = false
+                if (res.isSuccess) {
+                    viewModelScope.launch { repository.syncSearchResults(newQuery) }
+                    searchPrefetchJob = viewModelScope.launch { repository.prefetchSearchResults(newQuery) }
+                }
             }
-            _isSearching.value = false
-            if (res.isSuccess) viewModelScope.launch { repository.syncSearchResults(newQuery) }
         }
     }
 
@@ -468,7 +476,8 @@ class DetailViewModel(
     }
 
     fun openSourceChooser(episode: EpisodeEntry, forceRefresh: Boolean = false) {
-        if (!forceRefresh && _selectedEpisodeForSources.value?.id == episode.id && _episodeSources.value.isNotEmpty()) return
+        if (!forceRefresh && _selectedEpisodeForSources.value?.id == episode.id &&
+            (_episodeSources.value.isNotEmpty() || sourceDiscoveryJob?.isActive == true)) return
         val sameEpisode = _selectedEpisodeForSources.value?.id == episode.id
         val requestGeneration = ++sourceRequestGeneration
         sourceDiscoveryJob?.cancel()
@@ -710,6 +719,8 @@ class PlayerViewModel(
     private var activeSourceId: String? = null
     private var playbackResolutionJob: Job? = null
     private var playbackGeneration: Long = 0L
+    private var retriedSourceGeneration: Long = -1L
+    private val retriedSourceIds = mutableSetOf<String>()
 
     val unifiedAudioTracks: StateFlow<List<PlayerManager.TrackOption>> = combine(
         _availableSources,
@@ -826,7 +837,12 @@ class PlayerViewModel(
         preferredSourceId: String? = null,
         startPositionOverrideMs: Long? = null
     ) {
+        if (_currentEpisode.value?.id == episode.id && _isResolving.value &&
+            playbackResolutionJob?.isActive == true &&
+            (preferredSourceId == null || preferredSourceId == activeSourceId)) return
         val requestGeneration = ++playbackGeneration
+        retriedSourceGeneration = requestGeneration
+        retriedSourceIds.clear()
         playbackResolutionJob?.cancel()
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
@@ -1087,7 +1103,9 @@ class PlayerViewModel(
                         }
                     },
                     onRetryNeeded = {
-                        if (requestGeneration == playbackGeneration) {
+                        if (requestGeneration == playbackGeneration &&
+                            (retriedSourceGeneration != requestGeneration || retriedSourceIds.add(source.id))) {
+                            retriedSourceGeneration = requestGeneration
                             repository.invalidateDirectPlayback(source.id)
                             playbackResolutionJob?.cancel()
                             playbackResolutionJob = viewModelScope.launch {
