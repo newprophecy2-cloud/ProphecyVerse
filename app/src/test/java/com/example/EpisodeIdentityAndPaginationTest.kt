@@ -149,7 +149,7 @@ class EpisodeIdentityAndPaginationTest {
             }
             if (count > 60) {
                 val final = EpisodeRecordPagination.page(records, 60, 30, catalogComplete = true)
-                assertEquals(15, final.items.size)
+                assertEquals(minOf(30, count - 60), final.items.size)
                 assertFalse(final.hasNext)
             }
         }
