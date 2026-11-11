@@ -38,7 +38,7 @@ jobs:
         run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
 
       - name: Run JVM unit tests
-        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+        run: ./gradlew --no-daemon --no-configuration-cache --stacktrace -Dkotlin.compiler.execution.strategy=daemon :app:testDebugUnitTest
 
       - name: Build release APK
         id: build
