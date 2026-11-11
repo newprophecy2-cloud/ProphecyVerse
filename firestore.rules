@@ -74,6 +74,90 @@ service cloud.firestore {
       allow read: if admin();
       allow update, delete: if false;
     }
+    // Shared catalog metadata is backend-shaped, URL-only metadata. Client writes are
+    // constrained to the allow-listed schema; playback/source URLs are not valid fields.
+    function validCatalogRecord(expectedType, documentId) {
+      return signedIn()
+        && request.resource.data.keys().hasAll([
+          'documentId', 'backendId', 'contentType', 'schemaVersion', 'metadataHash',
+          'createdAt', 'updatedAt', 'lastSyncedAt', 'source'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'documentId', 'canonicalId', 'backendId', 'contentType', 'schemaVersion', 'metadataHash',
+          'title', 'description', 'posterUrl', 'bannerUrl', 'mediaType', 'releaseYear', 'genres',
+          'seasonNumber', 'episodeNumber', 'episodeTitle', 'episodeDescription',
+          'parentCanonicalId', 'parentBackendId', 'source', 'createdAt', 'updatedAt', 'lastSyncedAt'
+        ])
+        && request.resource.data.documentId == documentId
+        && request.resource.data.backendId is string
+        && request.resource.data.backendId.size() > 0
+        && request.resource.data.contentType == expectedType
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.metadataHash is string
+        && request.resource.data.metadataHash.size() == 64
+        && request.resource.data.source == 'prophecyverse_backend'
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.lastSyncedAt is timestamp
+        && (!('canonicalId' in request.resource.data.keys()) || request.resource.data.canonicalId is string)
+        && (!('title' in request.resource.data.keys()) || request.resource.data.title is string)
+        && (!('description' in request.resource.data.keys()) || request.resource.data.description is string)
+        && (!('posterUrl' in request.resource.data.keys()) || request.resource.data.posterUrl is string)
+        && (!('bannerUrl' in request.resource.data.keys()) || request.resource.data.bannerUrl is string)
+        && (!('mediaType' in request.resource.data.keys()) || request.resource.data.mediaType is string)
+        && (!('releaseYear' in request.resource.data.keys()) || request.resource.data.releaseYear is string)
+        && (!('genres' in request.resource.data.keys()) || request.resource.data.genres is list)
+        && (!('seasonNumber' in request.resource.data.keys()) || request.resource.data.seasonNumber is int)
+        && (!('episodeNumber' in request.resource.data.keys()) || request.resource.data.episodeNumber is int)
+        && (!('episodeTitle' in request.resource.data.keys()) || request.resource.data.episodeTitle is string)
+        && (!('episodeDescription' in request.resource.data.keys()) || request.resource.data.episodeDescription is string)
+        && (!('parentCanonicalId' in request.resource.data.keys()) || request.resource.data.parentCanonicalId is string)
+        && (!('parentBackendId' in request.resource.data.keys()) || request.resource.data.parentBackendId is string);
+    }
+    function catalogUpdate(expectedType, documentId) {
+      return validCatalogRecord(expectedType, documentId)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.documentId == resource.data.documentId
+        && request.resource.data.backendId == resource.data.backendId
+        && request.resource.data.contentType == resource.data.contentType
+        && request.resource.data.source == resource.data.source;
+    }
+    match /shared_catalog_anime/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('ANIME', id);
+      allow update: if catalogUpdate('ANIME', id);
+      allow delete: if admin();
+    }
+    match /shared_catalog_movies/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('MOVIE', id);
+      allow update: if catalogUpdate('MOVIE', id);
+      allow delete: if admin();
+    }
+    match /shared_catalog_seasons/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('SEASON', id);
+      allow update: if catalogUpdate('SEASON', id);
+      allow delete: if admin();
+    }
+    match /shared_catalog_episodes/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('EPISODE', id);
+      allow update: if catalogUpdate('EPISODE', id);
+      allow delete: if admin();
+    }
+    match /shared_catalog_genres/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('GENRE', id);
+      allow update: if catalogUpdate('GENRE', id);
+      allow delete: if admin();
+    }
+    match /shared_catalog_categories/{id} {
+      allow read: if signedIn();
+      allow create: if validCatalogRecord('CATEGORY', id);
+      allow update: if catalogUpdate('CATEGORY', id);
+      allow delete: if admin();
+    }
     match /update_history/{id} { allow read, write: if admin(); }
     match /analytics_daily/{id} { allow read, write: if admin(); }
     match /admin_settings/{id} { allow read, write: if admin(); }

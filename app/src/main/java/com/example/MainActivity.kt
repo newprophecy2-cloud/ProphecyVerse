@@ -99,7 +99,6 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
             com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
-            com.example.data.firebase.InstallationManager.getInstance(applicationContext).initializeAndSync()
             com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
             com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
