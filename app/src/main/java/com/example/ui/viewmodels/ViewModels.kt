@@ -9,6 +9,7 @@ import com.example.data.local.EpisodeEntry
 import com.example.data.local.PlaybackHistory
 import com.example.data.local.SeasonEntry
 import com.example.data.local.WatchlistEntry
+import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
@@ -669,8 +670,9 @@ class PlayerViewModel(
     val nextEpisode: StateFlow<EpisodeEntry?> = combine(_currentEpisode, allEpisodes) { current, list ->
         if (current == null || list.isEmpty()) null
         else {
-            val currentIndex = list.indexOfFirst { it.id == current.id }
-            if (currentIndex in 0 until list.size - 1) list[currentIndex + 1] else null
+            val canonical = EpisodeCanonicalizer.canonicalize(emptyList(), list)
+            val currentIndex = canonical.indexOfFirst { it.id == current.id }
+            if (currentIndex in 0 until canonical.size - 1) canonical[currentIndex + 1] else null
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 

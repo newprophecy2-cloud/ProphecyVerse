@@ -17,6 +17,7 @@ import com.example.data.local.SearchResultRef
 import com.example.data.local.SeasonEntry
 import com.example.data.local.WatchlistDao
 import com.example.data.local.WatchlistEntry
+import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.remote.AniListGraphQLRequest
 import com.example.data.remote.AniListGraphQLService
 import com.example.data.remote.AniListMedia
@@ -36,6 +37,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -153,15 +155,21 @@ class AnimeRepository(
     fun observeAnimeById(id: String): Flow<AnimeEntry?> = animeDao.observeAnimeById(id)
     fun observeSeasons(animeId: String): Flow<List<SeasonEntry>> = episodeDao.observeSeasons(animeId)
     fun observeEpisodes(animeId: String, seasonNumber: Int): Flow<List<EpisodeEntry>> =
-        episodeDao.observeEpisodes(animeId, seasonNumber)
+        episodeDao.observeEpisodes(animeId, seasonNumber).map {
+            EpisodeCanonicalizer.canonicalize(emptyList(), it)
+        }
     fun observeEpisodeWindow(
         animeId: String,
         seasonNumber: Int,
         firstEpisode: Int,
         episodeLimit: Int
-    ): Flow<List<EpisodeEntry>> = episodeDao.observeEpisodeWindow(animeId, seasonNumber, firstEpisode, episodeLimit)
-    fun observeAllEpisodes(animeId: String): Flow<List<EpisodeEntry>> = episodeDao.observeAllEpisodes(animeId)
-    fun observeFirstEpisode(animeId: String): Flow<EpisodeEntry?> = episodeDao.observeFirstEpisode(animeId)
+    ): Flow<List<EpisodeEntry>> = episodeDao.observeEpisodeWindow(animeId, seasonNumber, firstEpisode, episodeLimit).map {
+        EpisodeCanonicalizer.canonicalize(emptyList(), it)
+    }
+    fun observeAllEpisodes(animeId: String): Flow<List<EpisodeEntry>> =
+        episodeDao.observeAllEpisodes(animeId).map { EpisodeCanonicalizer.canonicalize(emptyList(), it) }
+    fun observeFirstEpisode(animeId: String): Flow<EpisodeEntry?> =
+        observeAllEpisodes(animeId).map { it.firstOrNull() }
 
     /** Pending-only recovery hook; it never scans or republishes the catalog. */
     suspend fun processPendingSharedCatalogWrites(): Int = sharedCatalog.processPendingQueue()

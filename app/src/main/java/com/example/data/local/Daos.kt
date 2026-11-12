@@ -1,5 +1,6 @@
 package com.example.data.local
 
+import com.example.data.identity.EpisodeCanonicalizer
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
@@ -182,7 +183,7 @@ interface EpisodeDao {
         deleteEpisodesForAnime(animeId)
         deleteSeasonsForAnime(animeId)
         upsertSeasons(seasons)
-        upsertEpisodes(episodes)
+        upsertEpisodes(EpisodeCanonicalizer.canonicalize(emptyList(), episodes))
     }
 
     /** Merge a partial response and persist season/episode rows in one Room transaction. */
@@ -205,10 +206,10 @@ interface EpisodeDao {
                 }
             }
             .sortedBy { it.seasonNumber }
-        val mergedEpisodes = (getEpisodesForAnime(animeId) + incomingEpisodes)
-            .associateBy { it.id }
-            .values
-            .sortedWith(compareBy<EpisodeEntry> { it.seasonNumber }.thenBy { it.episodeNumber }.thenBy { it.id })
+        val mergedEpisodes = EpisodeCanonicalizer.canonicalize(
+            existing = getEpisodesForAnime(animeId),
+            incoming = incomingEpisodes
+        )
         if (mergedSeasons.isNotEmpty()) upsertSeasons(mergedSeasons)
         if (mergedEpisodes.isNotEmpty()) upsertEpisodes(mergedEpisodes)
     }
