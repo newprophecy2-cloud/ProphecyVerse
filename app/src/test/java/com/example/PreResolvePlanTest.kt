@@ -13,13 +13,16 @@ class PreResolvePlanTest {
         EpisodeEntry(id, "anime", season, number)
 
     @Test
-    fun queueContinuesPastTheSeventeenthEpisodeInMultipleControlledBatches() {
+    fun queueContainsExactlyTheNextSeventeenAndSlidesForward() {
         val records = (1..42).map { ep(1, it) }
         val upcoming = PreResolvePlan.upcoming(records.first(), records)
         val batches = PreResolvePlan.batches(upcoming)
-        assertEquals(41, upcoming.size)
-        assertEquals(listOf(17, 17, 7), batches.map { it.size })
+        assertEquals(17, upcoming.size)
+        assertEquals(listOf(17), batches.map { it.size })
+        assertEquals((2..18).map { "s1e$it" }, upcoming.map { it.id })
         assertEquals(upcoming, batches.flatten())
+        val nextWindow = PreResolvePlan.upcoming(records[1], records)
+        assertEquals((3..19).map { "s1e$it" }, nextWindow.map { it.id })
     }
 
     @Test

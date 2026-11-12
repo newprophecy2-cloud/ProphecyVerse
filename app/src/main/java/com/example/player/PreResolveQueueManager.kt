@@ -54,11 +54,18 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     @Volatile private var queueGeneration: Long = 0L
     private val queueDispatcher = Dispatchers.IO.limitedParallelism(1)
 
-    /** Queue all canonical episodes after the current episode, including subsequent seasons. */
+    /** Queue the next 17 canonical episodes after the current episode, including season boundaries. */
     fun slideWindow(backendAnimeId: String, currentEpisode: EpisodeEntry, allEpisodes: List<EpisodeEntry>) {
         val upcoming = PreResolvePlan.upcoming(currentEpisode, allEpisodes)
-        if (upcoming.isEmpty()) return
         val generation = ++queueGeneration
+        if (upcoming.isEmpty()) {
+            workerJob?.cancel()
+            workerJob = null
+            updateStatuses { statuses -> statuses.mapValues { (_, state) ->
+                if (state == ResolutionStatus.RESOLVING || state == ResolutionStatus.QUEUED) ResolutionStatus.RETRY_PENDING else state
+            } }
+            return
+        }
         workerJob?.cancel()
         val targetKeys = upcoming.associateBy { identity(backendAnimeId, it) }
         updateStatuses { prior ->
@@ -77,8 +84,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
         workerJob = scope.launch(queueDispatcher) {
             try {
-                // Sequential batches of 17 bound pressure while ensuring the worker continues past
-                // each batch boundary rather than silently stopping at the initial capacity.
+                // Only the rolling next-17 window is scheduled. On episode advance, slideWindow
+                // cancels obsolete work and plans the next 17 from the canonical catalog order.
                 for (batch in PreResolvePlan.batches(upcoming)) {
                     for (episode in batch) {
                         if (!isActive) return@launch

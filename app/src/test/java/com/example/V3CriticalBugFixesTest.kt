@@ -174,7 +174,7 @@ class V3CriticalBugFixesTest {
 
     // --- P0: Bounded Resolution Sequence ---
     @Test
-    fun episodeSequence_continuesPreResolveCoverageAcrossBatchesWithoutChangingEpisodeIdentity() = runTest {
+    fun episodeSequence_usesRollingSeventeenWithoutChangingEpisodeIdentity() = runTest {
         val episodes = (1..42).map { epNum ->
             EpisodeEntry(
                 id = "ep_$epNum",
@@ -186,12 +186,15 @@ class V3CriticalBugFixesTest {
                 isAvailable = true
             )
         }
-        assertEquals("Eligible queue continues after the first 17", 41, PreResolvePlan.upcoming(episodes.first(), episodes).size)
-        val batches = PreResolvePlan.batches(PreResolvePlan.upcoming(episodes.first(), episodes))
-        assertEquals(listOf(17, 17, 7), batches.map { it.size })
-        assertEquals(41, batches.flatten().map { it.id }.distinct().size)
+        val firstWindow = PreResolvePlan.upcoming(episodes.first(), episodes)
+        assertEquals("Exactly 17 upcoming episodes are queued", 17, firstWindow.size)
+        val batches = PreResolvePlan.batches(firstWindow)
+        assertEquals(listOf(17), batches.map { it.size })
+        assertEquals(17, batches.flatten().map { it.id }.distinct().size)
         assertEquals("ep_2", batches.first().first().id)
-        assertEquals("ep_42", batches.last().last().id)
+        assertEquals("ep_18", batches.last().last().id)
+        val advancedWindow = PreResolvePlan.upcoming(episodes[1], episodes)
+        assertEquals((3..19).map { "ep_$it" }, advancedWindow.map { it.id })
     }
     // --- P1: Download Hierarchy (Anime -> Season -> Episode) ---
     @Test
