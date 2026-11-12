@@ -950,8 +950,15 @@ class PlayerViewModel(
                 }
             }
 
-            // Route D: Get sources for the selected episode
-            val sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode)
+            // Route D: Get sources for the selected episode. Retry a transient network failure
+            // once; an authoritative empty response remains an empty-source result.
+            var sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode)
+            if (sourcesRes.isFailure && isTransientNetworkFailure(sourcesRes.exceptionOrNull())) {
+                _isResolving.value = true
+                delay(2_500L)
+                if (requestGeneration != playbackGeneration) return@launch
+                sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true)
+            }
             if (requestGeneration != playbackGeneration) return@launch
             if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
                 _resolutionError.value = "No playable sources found for this episode."
@@ -1009,7 +1016,7 @@ class PlayerViewModel(
             .map { it.value }
     }
 
-    private fun isTransientDirectPlayFailure(error: Throwable?): Boolean =
+    private fun isTransientNetworkFailure(error: Throwable?): Boolean =
         generateSequence(error) { it.cause }.any { cause ->
             cause is java.io.IOException || cause is java.net.SocketTimeoutException ||
                 Regex("""HTTP (408|429|5\d\d)""").containsMatchIn(cause.message.orEmpty()) ||
@@ -1042,7 +1049,7 @@ class PlayerViewModel(
 
             // Route E: The ONE AND ONLY playback route: POST /api/v1/play/direct
             var playRes = repository.resolveDirectPlayback(source.id)
-            if (playRes.isFailure && isTransientDirectPlayFailure(playRes.exceptionOrNull())) {
+            if (playRes.isFailure && isTransientNetworkFailure(playRes.exceptionOrNull())) {
                 _isResolving.value = true
                 delay(2_500L)
                 if (requestGeneration != playbackGeneration) return
