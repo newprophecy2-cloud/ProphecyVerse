@@ -1600,18 +1600,18 @@ class AnimeRepository(
      * Body: { "source_id": "..." }
      * Kept in-memory only; never persisted or logged.
      */
-    suspend fun resolveDirectPlayback(sourceId: String): Result<DirectPlayData> = withContext(Dispatchers.IO) {
+    suspend fun resolveDirectPlayback(sourceId: String, forceRefresh: Boolean = false): Result<DirectPlayData> = withContext(Dispatchers.IO) {
         if (sourceId.isBlank()) return@withContext Result.failure(Exception("Source ID is blank"))
         resolveMutexes.computeIfAbsent(sourceId) { Mutex() }.withLock {
             val cached = resolvedPlaybackCache[sourceId]
-            if (cached != null && !isExpired(cached.data.expiresAt) &&
+            if (!forceRefresh && cached != null && !isExpired(cached.data.expiresAt) &&
                 System.currentTimeMillis() - cached.cachedAtMs <= 20 * 60 * 1000L) {
                 return@withContext Result.success(cached.data)
             }
             val retryRemaining = directRetryMutex.withLock {
                 ((directRetryStates[sourceId]?.retryAtMs ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
             }
-            if (retryRemaining > 0L) {
+            if (!forceRefresh && retryRemaining > 0L) {
                 return@withContext Result.failure(IllegalStateException(
                     "Direct-play retry is backed off for ${(retryRemaining + 999L) / 1000L} seconds."
                 ))

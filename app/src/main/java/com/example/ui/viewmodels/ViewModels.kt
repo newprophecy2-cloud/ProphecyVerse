@@ -1009,6 +1009,13 @@ class PlayerViewModel(
             .map { it.value }
     }
 
+    private fun isTransientDirectPlayFailure(error: Throwable?): Boolean =
+        generateSequence(error) { it.cause }.any { cause ->
+            cause is java.io.IOException || cause is java.net.SocketTimeoutException ||
+                Regex("""HTTP (408|429|5\d\d)""").containsMatchIn(cause.message.orEmpty()) ||
+                cause.message.orEmpty().contains("retry is backed off", ignoreCase = true)
+        }
+
     private suspend fun resolveWithFallback(
         backendId: String,
         episode: EpisodeEntry,
@@ -1034,7 +1041,13 @@ class PlayerViewModel(
             _activeSource.value = source
 
             // Route E: The ONE AND ONLY playback route: POST /api/v1/play/direct
-            val playRes = repository.resolveDirectPlayback(source.id)
+            var playRes = repository.resolveDirectPlayback(source.id)
+            if (playRes.isFailure && isTransientDirectPlayFailure(playRes.exceptionOrNull())) {
+                _isResolving.value = true
+                delay(2_500L)
+                if (requestGeneration != playbackGeneration) return
+                playRes = repository.resolveDirectPlayback(source.id, forceRefresh = true)
+            }
             if (requestGeneration != playbackGeneration) return
             if (playRes.isSuccess && playRes.getOrNull() != null) {
                 val directData = playRes.getOrNull()!!
