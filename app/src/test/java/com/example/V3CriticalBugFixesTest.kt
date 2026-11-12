@@ -6,6 +6,7 @@ import com.example.data.local.EpisodeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
+import com.example.player.PreResolvePlan
 import com.example.ui.screens.groupDownloads
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
@@ -173,12 +174,8 @@ class V3CriticalBugFixesTest {
 
     // --- P0: Bounded Resolution Sequence ---
     @Test
-    fun episodeSequence_boundsPreResolveWindowWithoutChangingEpisodeIdentity() = runTest {
-        val testDispatcher = UnconfinedTestDispatcher(testScheduler)
-        val scope = TestScope(testDispatcher)
-
-        // Generate 17 sequential episodes
-        val episodes = (1..17).map { epNum ->
+    fun episodeSequence_continuesPreResolveCoverageAcrossBatchesWithoutChangingEpisodeIdentity() = runTest {
+        val episodes = (1..42).map { epNum ->
             EpisodeEntry(
                 id = "ep_$epNum",
                 animeId = "anime_solo_leveling",
@@ -189,19 +186,13 @@ class V3CriticalBugFixesTest {
                 isAvailable = true
             )
         }
-        assertEquals("Episode list must have exactly 17 episodes", 17, episodes.size)
-
-        // Verify window sliding does not crash or restrict to 2 episodes
-        val window = episodes.take(PreResolveQueueManager.WINDOW_SIZE)
-        assertEquals("Pre-resolve window must be bounded to two episodes", 2, window.size)
-        assertEquals("ep_1", window.first().id)
-        assertEquals("ep_2", window.last().id)
-
-        // Verify individual episode identifiers are distinct
-        val ids = episodes.map { it.id }.toSet()
-        assertEquals("All 17 episode IDs must be unique", 17, ids.size)
+        assertEquals("Eligible queue continues after the first 17", 41, PreResolvePlan.upcoming(episodes.first(), episodes).size)
+        val batches = PreResolvePlan.batches(PreResolvePlan.upcoming(episodes.first(), episodes))
+        assertEquals(listOf(17, 17, 7), batches.map { it.size })
+        assertEquals(41, batches.flatten().map { it.id }.distinct().size)
+        assertEquals("ep_2", batches.first().first().id)
+        assertEquals("ep_42", batches.last().last().id)
     }
-
     // --- P1: Download Hierarchy (Anime -> Season -> Episode) ---
     @Test
     fun downloadGrouping_correctlyBuildsAnimeSeasonEpisodeHierarchy() {

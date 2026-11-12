@@ -271,6 +271,7 @@ class SourceCacheAndQuotaGuardTest {
         val prepared = PreResolveQueueManager.PreparedEpisode(
             backendAnimeId = "backend-title",
             episodeId = "episode-1",
+            seasonNumber = 1,
             source = ProphecySourceDto(id = "source-1", label = "Provider"),
             directData = com.example.data.remote.DirectPlayData(
                 sourceId = "source-1",
@@ -287,6 +288,7 @@ class SourceCacheAndQuotaGuardTest {
         val prepared = PreResolveQueueManager.PreparedEpisode(
             backendAnimeId = "backend-title",
             episodeId = "episode-1",
+            seasonNumber = 1,
             source = ProphecySourceDto(id = "source-1", label = "Provider"),
             directData = com.example.data.remote.DirectPlayData(
                 sourceId = "source-1",
