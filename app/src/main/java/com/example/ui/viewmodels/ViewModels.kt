@@ -898,6 +898,8 @@ class PlayerViewModel(
                 return@launch
             }
 
+            // Recalculate/cancel obsolete background work as soon as this episode is selected.
+            preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
             // 3. Fast-Path: Check the season-aware pre-resolve cache for instant start (< 25m TTL)
             if (preferredSourceId == null) {
                 val prepared = preResolveManager.getPreparedSource(backendId, episode)
@@ -944,8 +946,6 @@ class PlayerViewModel(
                         providerName = prepared.source.displayProviderName
                     )
 
-                    // Slide the serialized, batched pre-resolve queue forward.
-                    preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
                     return@launch
                 }
             }
@@ -1101,8 +1101,6 @@ class PlayerViewModel(
                     providerName = source.displayProviderName
                 )
 
-                // Queue all remaining canonical episodes in controlled background batches.
-                preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
                 return
             } else {
                 lastError = playRes.exceptionOrNull()?.message
