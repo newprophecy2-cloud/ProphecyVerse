@@ -18,7 +18,8 @@ enum class EpisodeCatalogState {
     PARTIAL,
     COMPLETE,
     CONFIRMED_EMPTY,
-    FAILED
+    FAILED,
+    NOT_APPLICABLE
 }
 
 internal fun resolveEpisodeCatalogState(
@@ -26,8 +27,10 @@ internal fun resolveEpisodeCatalogState(
     cachedEpisodeCount: Int,
     backendIdKnown: Boolean,
     detailsEndpointSucceeded: Boolean,
-    episodeListEndpointSucceeded: Boolean
+    episodeListEndpointSucceeded: Boolean,
+    isMovieCatalog: Boolean = false
 ): EpisodeCatalogState = when {
+    isMovieCatalog && cachedEpisodeCount == 0 -> EpisodeCatalogState.NOT_APPLICABLE
     snapshotComplete && cachedEpisodeCount == 0 -> EpisodeCatalogState.CONFIRMED_EMPTY
     snapshotComplete -> EpisodeCatalogState.COMPLETE
     backendIdKnown && !detailsEndpointSucceeded && !episodeListEndpointSucceeded -> EpisodeCatalogState.FAILED

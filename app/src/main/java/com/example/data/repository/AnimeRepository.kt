@@ -66,7 +66,7 @@ internal fun uniqueAniListMedia(items: List<AniListMedia>): List<AniListMedia> =
 /** Map only explicit backend media types; unknown values remain unclassified. */
 internal fun backendMediaCategory(mediaType: String?): String? = when (mediaType?.trim()?.lowercase()) {
     "anime" -> "ANIME"
-    "movie" -> "MOVIE"
+    "movie", "film", "feature_film", "anime_movie" -> "MOVIE"
     "kdrama", "k-drama", "korean_drama" -> "KDRAMA"
     "series", "web_series", "tv_series" -> "SERIES"
     else -> null
@@ -77,7 +77,7 @@ internal fun preserveMovieMediaCategory(
     existingFormat: String?,
     detailMediaType: String?
 ): String? {
-    if (existingCategory.equals("MOVIE", ignoreCase = true) || existingFormat.equals("MOVIE", ignoreCase = true)) {
+    if (existingCategory.equals("MOVIE", ignoreCase = true) || (existingFormat.equals("MOVIE", ignoreCase = true) || existingFormat.equals("FILM", ignoreCase = true))) {
         return "MOVIE"
     }
     return backendMediaCategory(detailMediaType) ?: existingCategory
@@ -137,6 +137,8 @@ class AnimeRepository(
     private val sourceCacheMutex = Mutex()
     private data class ResolvedCacheEntry(val data: DirectPlayData, val cachedAtMs: Long)
     private val resolvedPlaybackCache = ConcurrentHashMap<String, ResolvedCacheEntry>()
+    private val directRetryMutex = Mutex()
+    private val directRetryStates = ConcurrentHashMap<String, SourceRetryState>()
     private val resolveMutexes = ConcurrentHashMap<String, Mutex>()
     private val sourceCacheTtlMs = 2 * 60 * 1000L
     private val maxMemorySourceSnapshots = 120
@@ -858,6 +860,8 @@ class AnimeRepository(
             var detailHttpCode: Int? = null
             var episodeHttpCode: Int? = null
             var currentRefreshEpisodeIds: Set<String> = emptySet()
+            var isMovieCatalog = currentEntry?.mediaCategory.equals("MOVIE", ignoreCase = true) ||
+                currentEntry?.format.equals("MOVIE", ignoreCase = true) || currentEntry?.format.equals("FILM", ignoreCase = true)
             var firestoreDetailComplete = false
 
             // Check existing catalog mapping table first
@@ -982,6 +986,16 @@ class AnimeRepository(
                 }
                 detailHttpCode = detailResp?.code()
                 episodeHttpCode = epResp?.code()
+                if (detailResp != null && !detailResp.isSuccessful) {
+                    Log.w("AnimeRepository", httpFailureDiagnostic("anime_details", detailResp.code(),
+                        detailResp.headers()["X-Request-ID"] ?: detailResp.headers()["X-Correlation-ID"],
+                        runCatching { detailResp.errorBody()?.string() }.getOrNull()))
+                }
+                if (epResp != null && !epResp.isSuccessful) {
+                    Log.w("AnimeRepository", httpFailureDiagnostic("anime_episodes", epResp.code(),
+                        epResp.headers()["X-Request-ID"] ?: epResp.headers()["X-Correlation-ID"],
+                        runCatching { epResp.errorBody()?.string() }.getOrNull()))
+                }
 
                 val seasonsList = mutableListOf<SeasonEntry>()
                 val episodeCandidates = mutableListOf<EpisodeRecordCandidate>()
@@ -1013,6 +1027,8 @@ class AnimeRepository(
                         updatedAt = System.currentTimeMillis()
                     )
                     animeDao.upsertAnime(updatedEntry)
+                    isMovieCatalog = updatedEntry.mediaCategory.equals("MOVIE", ignoreCase = true) ||
+                        updatedEntry.format.equals("MOVIE", ignoreCase = true) || updatedEntry.format.equals("FILM", ignoreCase = true)
                     // Cache/queue only actual backend fields. Movies never produce season/episode rows.
                     SharedCatalogMetadata.fromDetail(body)?.let(sharedRecords::add)
                     if (body.mediaType.equals("anime", ignoreCase = true)) {
@@ -1147,7 +1163,8 @@ class AnimeRepository(
                 cachedEpisodeCount = cachedEpisodeCount,
                 backendIdKnown = backendId != null,
                 detailsEndpointSucceeded = detailsSucceeded,
-                episodeListEndpointSucceeded = episodeListSucceeded
+                episodeListEndpointSucceeded = episodeListSucceeded,
+                isMovieCatalog = isMovieCatalog
             )
             val endpointErrors = buildList {
                 if (backendId != null && !detailsSucceeded) {
@@ -1314,12 +1331,16 @@ class AnimeRepository(
                 val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
                 Log.i("AnimeRepository", "source_lookup_http_ms=${System.currentTimeMillis() - requestStartedAt}")
                 if (!response.isSuccessful || response.body() == null) {
-                    val retryable = response.code() == 408 || response.code() == 429 || response.code() >= 500 || response.body() == null
+                    val retryable = EpisodeSourceRetryBackoff.isRetryableHttpStatus(response.code()) || response.body() == null
                     val retryRemaining = if (retryable) recordSourceFailure(cacheKey) else 0L
+                    val requestId = response.headers()["X-Request-ID"] ?: response.headers()["X-Correlation-ID"]
+                    val errorBody = runCatching { response.errorBody()?.string() }.getOrNull()
                     val message = buildString {
                         append("Episode source request failed with HTTP ${response.code()}.")
+                        if (!requestId.isNullOrBlank()) append(" Request ID: $requestId.")
                         if (retryRemaining > 0L) append(" Retry after ${(retryRemaining + 999L) / 1000L} seconds.")
                     }
+                    Log.w("AnimeRepository", httpFailureDiagnostic("episode_full", response.code(), requestId, errorBody))
                     Log.i("AnimeRepository", "source_discovery_total_ms=${System.currentTimeMillis() - sourceDiscoveryStartedAt} outcome=failed")
                     return@withContext staleSourceFallback(cached, seasonNumber, episodeNumber, message)
                 }
@@ -1533,6 +1554,16 @@ class AnimeRepository(
         }
     }
 
+    private fun httpFailureDiagnostic(endpoint: String, status: Int, requestId: String?, errorBody: String?): String {
+        val redacted = errorBody.orEmpty()
+            .replace(Regex("""(?i)([\"']?(?:authorization|access[_-]?token|refresh[_-]?token|token|signature|cookie|credential|password|secret|api[_-]?key)[\"']?\s*[:=]\s*[\"']?)[^,}\s\"']+""")) { match ->
+                match.groupValues[1] + "[redacted]"
+            }
+            .replace(Regex("""https?://[^\s\"']+"""), "[redacted-url]")
+            .replace(Regex("""[\r\n\t]+"""), " ")
+            .take(500)
+        return "backend_http_failure endpoint=$endpoint status=$status request_id=${requestId ?: "none"} error_body_excerpt=$redacted"
+    }
     private suspend fun sourceRetryRemainingMs(cacheKey: String): Long = sourceRetryMutex.withLock {
         ((sourceRetryStates[cacheKey]?.retryAtMs ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
     }
@@ -1577,12 +1608,25 @@ class AnimeRepository(
                 System.currentTimeMillis() - cached.cachedAtMs <= 20 * 60 * 1000L) {
                 return@withContext Result.success(cached.data)
             }
+            val retryRemaining = directRetryMutex.withLock {
+                ((directRetryStates[sourceId]?.retryAtMs ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
+            }
+            if (retryRemaining > 0L) {
+                return@withContext Result.failure(IllegalStateException(
+                    "Direct-play retry is backed off for ${(retryRemaining + 999L) / 1000L} seconds."
+                ))
+            }
         try {
             val resolutionStartedAt = System.currentTimeMillis()
             val response = prophecyApi.resolveDirectPlay(DirectPlayRequest(sourceId = sourceId))
             Log.i("AnimeRepository", "direct_play_resolution_ms=${System.currentTimeMillis() - resolutionStartedAt} http_status=${response.code()}")
             if (!response.isSuccessful || response.body() == null) {
-                return@withContext Result.failure(Exception("Direct playback resolution failed: ${response.code()}"))
+                val requestId = response.headers()["X-Request-ID"] ?: response.headers()["X-Correlation-ID"]
+                val errorBody = runCatching { response.errorBody()?.string() }.getOrNull()
+                Log.w("AnimeRepository", httpFailureDiagnostic("direct_play", response.code(), requestId, errorBody))
+                if (EpisodeSourceRetryBackoff.isRetryableHttpStatus(response.code())) recordDirectPlayFailure(sourceId)
+                val requestSuffix = requestId?.takeIf { it.isNotBlank() }?.let { " (request ID: $it)" }.orEmpty()
+                return@withContext Result.failure(Exception("Direct playback resolution failed: HTTP ${response.code()}$requestSuffix"))
             }
 
             val body = response.body()!!
@@ -1595,12 +1639,28 @@ class AnimeRepository(
                 return@withContext Result.failure(Exception("Resolved playback data is invalid or expired"))
             }
             resolvedPlaybackCache[sourceId] = ResolvedCacheEntry(data, System.currentTimeMillis())
+            directRetryMutex.withLock { directRetryStates.remove(sourceId) }
             Result.success(data)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
+            if (generateSequence(e as Throwable?) { it.cause }.any {
+                    it is java.net.SocketTimeoutException || it is java.io.IOException
+                }) recordDirectPlayFailure(sourceId)
             Result.failure(e)
         }
+        }
+    }
+
+    private suspend fun recordDirectPlayFailure(sourceId: String) {
+        directRetryMutex.withLock {
+            val failures = (directRetryStates[sourceId]?.failures ?: 0) + 1
+            val jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(0L, 30_001L)
+            val delayMs = EpisodeSourceRetryBackoff.delayMs(failures, jitter)
+            directRetryStates[sourceId] = SourceRetryState(failures, System.currentTimeMillis() + delayMs)
+            while (directRetryStates.size > maxMemorySourceSnapshots) {
+                directRetryStates.remove(directRetryStates.keys.firstOrNull() ?: break)
+            }
         }
     }
 

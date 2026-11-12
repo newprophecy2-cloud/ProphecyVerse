@@ -608,6 +608,7 @@ fun DetailScreen(
                             } else {
                                 val emptyTitle = when {
                                     selectedSeasonEpisodeCount > 0 -> "No episodes in this page"
+                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE -> "Standalone movie — no episode catalog required"
                                     catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes in catalog"
                                     catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE -> "No episodes in this season"
                                     catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.FAILED -> "Episode catalog could not be refreshed"
@@ -644,7 +645,9 @@ fun DetailScreen(
                                                 textAlign = TextAlign.Center
                                             )
                                             Text(
-                                                text = if (item.backendAnimeId == null) {
+                                                text = if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE) {
+                                                    "This standalone movie has no episodic season catalog. Playback is offered only when the backend provides its real movie episode/source record; no synthetic episode is created."
+                                                } else if (item.backendAnimeId == null) {
                                                     "Playable episodes for \"${item.preferredTitle}\" are not currently available in the streaming provider catalog.\n(Live Action was strictly excluded to prevent incorrect playback)."
                                                 } else if (selectedSeasonEpisodeCount > 0) {
                                                     "No records are in the current page. ${if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE) "The selected season catalog is complete." else "More episodes may exist; catalog completeness is unknown."}"
@@ -659,7 +662,7 @@ fun DetailScreen(
                                                 lineHeight = 17.sp
                                             )
                                             Spacer(modifier = Modifier.height(4.dp))
-                                            Button(
+                                            if (catalogRefreshStatus.state != com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE) Button(
                                                 onClick = { viewModel.refreshDetails() },
                                                 colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
                                                 shape = RoundedCornerShape(8.dp)

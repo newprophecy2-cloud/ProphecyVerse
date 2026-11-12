@@ -57,4 +57,15 @@ class CatalogRefreshStateTest {
             resolveEpisodeCatalogState(false, 0, false, false, false)
         )
     }
+    @Test
+    fun `standalone movie without episodic records does not wait for episode catalog confirmation`() {
+        assertEquals(
+            EpisodeCatalogState.NOT_APPLICABLE,
+            resolveEpisodeCatalogState(false, 0, true, true, true, isMovieCatalog = true)
+        )
+        assertEquals(
+            EpisodeCatalogState.PARTIAL,
+            resolveEpisodeCatalogState(false, 3, true, true, false, isMovieCatalog = true)
+        )
+    }
 }

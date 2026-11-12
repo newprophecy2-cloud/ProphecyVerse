@@ -16,6 +16,7 @@ class BackendMediaCategoryTest {
     fun `explicit movie media type remains movie`() {
         assertEquals("MOVIE", backendMediaCategory("movie"))
         assertEquals("MOVIE", backendMediaCategory(" MOVIE "))
+        assertEquals("MOVIE", backendMediaCategory("film"))
     }
 
     @Test
@@ -34,6 +35,7 @@ class BackendMediaCategoryTest {
     fun `confirmed Movie classification survives conflicting detail response`() {
         assertEquals("MOVIE", preserveMovieMediaCategory("MOVIE", "movie", "series"))
         assertEquals("MOVIE", preserveMovieMediaCategory(null, "movie", "series"))
+        assertEquals("MOVIE", preserveMovieMediaCategory(null, "FILM", "series"))
         assertEquals("SERIES", preserveMovieMediaCategory(null, null, "series"))
     }
 

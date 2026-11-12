@@ -753,7 +753,7 @@ class PlayerViewModel(
                         val anime = AppDatabase.getInstance(application).animeDao().getAnimeById(animeId) ?: animeEntry.value
                         val bId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
                         if (current != null && bId != null) {
-                            preResolveManager.slideWindow(bId, current.id, epList)
+                            preResolveManager.slideWindow(bId, current, epList)
                         }
                     }
                 }
@@ -898,9 +898,9 @@ class PlayerViewModel(
                 return@launch
             }
 
-            // 3. Fast-Path: Check 17-episode pre-resolve cache for instant start (< 25m TTL)
+            // 3. Fast-Path: Check the season-aware pre-resolve cache for instant start (< 25m TTL)
             if (preferredSourceId == null) {
-                val prepared = preResolveManager.getPreparedSource(backendId, episode.id)
+                val prepared = preResolveManager.getPreparedSource(backendId, episode)
                 if (requestGeneration != playbackGeneration) return@launch
                 if (prepared != null) {
                     val lastSavedPos = try {
@@ -918,7 +918,7 @@ class PlayerViewModel(
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = {
                             if (requestGeneration == playbackGeneration) {
-                                preResolveManager.discardPreparedSource(backendId, episode.id)
+                                preResolveManager.discardPreparedSource(backendId, episode)
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
@@ -931,7 +931,7 @@ class PlayerViewModel(
                         },
                         onRetryNeeded = {
                             if (requestGeneration == playbackGeneration) {
-                                preResolveManager.discardPreparedSource(backendId, episode.id)
+                                preResolveManager.discardPreparedSource(backendId, episode)
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
                                     val refreshedSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
@@ -944,8 +944,8 @@ class PlayerViewModel(
                         providerName = prepared.source.displayProviderName
                     )
 
-                    // Slide the bounded pre-resolve queue forward.
-                    preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
+                    // Slide the serialized, batched pre-resolve queue forward.
+                    preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
                     return@launch
                 }
             }
@@ -1101,8 +1101,8 @@ class PlayerViewModel(
                     providerName = source.displayProviderName
                 )
 
-                // Trigger 17-episode sliding queue in background
-                preResolveManager.slideWindow(backendId, episode.id, allEpisodes.value)
+                // Queue all remaining canonical episodes in controlled background batches.
+                preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
                 return
             } else {
                 lastError = playRes.exceptionOrNull()?.message

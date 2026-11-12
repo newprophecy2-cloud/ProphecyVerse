@@ -982,7 +982,7 @@ fun PlayerScreen(
                             ) {
                                 items(seasonEpisodes, key = { it.id }) { ep ->
                                     val isCurrent = (currentEpisode?.id == ep.id)
-                                    val qStatus = preResolveStatus[ep.id]
+                                    val qStatus = preResolveStatus[PreResolveQueueManager.identity(anime?.backendAnimeId ?: viewModel.animeId, ep)]
                                     HorizontalEpisodeCard(
                                         episode = ep,
                                         isCurrent = isCurrent,
@@ -1127,13 +1127,13 @@ fun HorizontalEpisodeCard(
                         tint = PlayableGreen,
                         modifier = Modifier.size(16.dp)
                     )
-                } else if (qStatus == PreResolveQueueManager.ResolutionStatus.READY) {
+                } else if (qStatus == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE) {
                     Surface(
                         shape = RoundedCornerShape(4.dp),
                         color = PlayableGreen.copy(alpha = 0.2f)
                     ) {
                         Text(
-                            text = "⚡ Ready",
+                            text = "Ready",
                             color = PlayableGreen,
                             fontSize = 9.sp,
                             fontWeight = FontWeight.Bold,

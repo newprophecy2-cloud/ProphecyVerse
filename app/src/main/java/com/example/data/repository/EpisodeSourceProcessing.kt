@@ -65,6 +65,9 @@ object EpisodeSourceCacheIdentity {
 }
 
 object EpisodeSourceRetryBackoff {
+    fun isRetryableHttpStatus(statusCode: Int): Boolean =
+        statusCode == 408 || statusCode == 429 || statusCode in 500..599
+
     fun delayMs(consecutiveFailures: Int, jitterMs: Long = 0L): Long {
         val attempts = consecutiveFailures.coerceAtLeast(1)
         val base = (2_000L * (1L shl (attempts - 1).coerceAtMost(6))).coerceAtMost(120_000L)
@@ -175,8 +178,19 @@ private fun mergeBySourceIdentity(candidates: List<ProphecySourceDto>): List<Pro
             indexById[id] = result.size
             result += candidate
         } else {
-            // Later metadata for the same backend identity updates the same provider candidate.
-            result[index] = candidate
+            // New information updates the provider candidate; null/blank partial fields never
+            // erase usable metadata that was already obtained for this same source identity.
+            val previous = result[index]
+            result[index] = candidate.copy(
+                id = candidate.id.takeIf(String::isNotBlank) ?: previous.id,
+                label = candidate.label?.takeIf(String::isNotBlank) ?: previous.label,
+                quality = candidate.quality?.takeIf(String::isNotBlank) ?: previous.quality,
+                codec = candidate.codec?.takeIf(String::isNotBlank) ?: previous.codec,
+                language = candidate.language?.takeIf(String::isNotBlank) ?: previous.language,
+                sizeBytes = candidate.sizeBytes ?: previous.sizeBytes,
+                downloadable = candidate.downloadable ?: previous.downloadable,
+                expiresAt = candidate.expiresAt?.takeIf(String::isNotBlank) ?: previous.expiresAt
+            )
         }
     }
     return result

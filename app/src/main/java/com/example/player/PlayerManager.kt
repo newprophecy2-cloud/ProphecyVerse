@@ -15,6 +15,7 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -385,7 +386,13 @@ class PlayerManager(
                 if (generation != playbackGeneration || player !== exoPlayer) return
                 _isBuffering.value = false
                 val failureCategory = classifyPlaybackError(error)
-                Log.e(TAG, "ExoPlayer failure category=$failureCategory code=${error.errorCode} provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
+                val httpFailure = generateSequence(error as Throwable?) { it.cause }
+                    .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
+                    .firstOrNull()
+                val requestId = httpFailure?.headerFields?.entries
+                    ?.firstOrNull { it.key.equals("X-Request-ID", true) || it.key.equals("X-Correlation-ID", true) }
+                    ?.value?.firstOrNull()
+                Log.e(TAG, "ExoPlayer failure category=$failureCategory code=${error.errorCode} http_status=${httpFailure?.responseCode ?: "none"} request_id=${requestId ?: "none"} provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
                 // If track switching failed due to unsupported decoder on selected track, recover smoothly
                 if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||

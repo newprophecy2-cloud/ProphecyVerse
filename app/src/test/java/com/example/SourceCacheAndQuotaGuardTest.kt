@@ -192,6 +192,24 @@ class SourceCacheAndQuotaGuardTest {
     }
 
     @Test
+    fun partialSameIdWithNullMetadataPreservesExistingProviderCandidateFields() {
+        val old = ProphecySourceDto(
+            id = "same", label = "Provider", quality = "1080p", codec = "h264",
+            language = "Japanese", downloadable = true
+        )
+        val partial = ProphecySourceDto(id = "same")
+        val merged = EpisodeSourceCachePolicy.mergeRefreshCandidates(
+            existingCandidates = listOf(old), incomingCandidates = listOf(partial),
+            authoritativeComplete = false, nowMs = now
+        ).single()
+        assertEquals("Provider", merged.label)
+        assertEquals("1080p", merged.quality)
+        assertEquals("h264", merged.codec)
+        assertEquals("Japanese", merged.language)
+        assertEquals(true, merged.downloadable)
+    }
+
+    @Test
     fun partialRefreshMergesCandidatesButExplicitCompleteRefreshReplacesThem() {
         val oldCandidate = ProphecySourceDto(id = "old")
         val oldVariant = ProphecySourceDto(id = "same", label = "Old label", quality = "720p")
@@ -229,6 +247,14 @@ class SourceCacheAndQuotaGuardTest {
         )
     }
 
+    @Test
+    fun http502IsClassifiedAsTransientButClientNotFoundIsNot() {
+        assertTrue(EpisodeSourceRetryBackoff.isRetryableHttpStatus(502))
+        assertTrue(EpisodeSourceRetryBackoff.isRetryableHttpStatus(503))
+        assertTrue(EpisodeSourceRetryBackoff.isRetryableHttpStatus(429))
+        assertFalse(EpisodeSourceRetryBackoff.isRetryableHttpStatus(404))
+        assertFalse(EpisodeSourceRetryBackoff.isRetryableHttpStatus(401))
+    }
     @Test
     fun sourceRetryBackoffIsExponentialAndJitterIsBounded() {
         assertEquals(2_000L, EpisodeSourceRetryBackoff.delayMs(0))
