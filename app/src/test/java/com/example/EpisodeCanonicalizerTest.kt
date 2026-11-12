@@ -3,6 +3,7 @@ package com.example
 import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.local.EpisodeEntry
 import org.junit.Assert.assertEquals
+import com.example.data.identity.EpisodeSourceEpisodeIds
 import org.junit.Test
 
 class EpisodeCanonicalizerTest {
@@ -60,4 +61,32 @@ class EpisodeCanonicalizerTest {
 
         assertEquals(listOf("s1e1", "s1e2", "s1e3"), result.map { it.id })
     }
+    @Test
+    fun duplicatePlayableAndUnavailableRecordsPreserveBothLookupIdsInEitherOrder() {
+        val a = episode("playable-id", 1)
+        val b = episode("retry-id", 1)
+        val first = EpisodeCanonicalizer.canonicalize(listOf(a, b)).single()
+        val reversed = EpisodeCanonicalizer.canonicalize(listOf(b, a)).single()
+        assertEquals(1, listOf(first, reversed).distinctBy { it.id to EpisodeSourceEpisodeIds.read(it).toSet() }.size)
+        assertEquals(setOf("playable-id", "retry-id"), EpisodeSourceEpisodeIds.read(first).toSet())
+        assertEquals(setOf("playable-id", "retry-id"), EpisodeSourceEpisodeIds.read(reversed).toSet())
+    }
+    @Test
+    fun incomingRefreshAndNullMetadataDoNotErasePreviouslyKnownAliasIds() {
+        val old = episode("playable-id", 1)
+        val incoming = episode("retry-id", 1)
+        val merged = EpisodeCanonicalizer.canonicalize(listOf(old), listOf(incoming)).single()
+        assertEquals(setOf("playable-id", "retry-id"), EpisodeSourceEpisodeIds.read(merged).toSet())
+        val refreshOnlyOneRepresentation = EpisodeCanonicalizer.canonicalize(listOf(merged), listOf(episode("playable-id", 1))).single()
+        assertEquals(setOf("playable-id", "retry-id"), EpisodeSourceEpisodeIds.read(refreshOnlyOneRepresentation).toSet())
+    }
+    @Test
+    fun aliasIdsDoNotCrossAnimeOrSeasonBoundaries() {
+        val records = listOf(episode("s1", 1), episode("s2", 1).copy(seasonNumber = 2),
+            episode("other-anime", 1).copy(animeId = "other"))
+        val merged = EpisodeCanonicalizer.canonicalize(records)
+        assertEquals(3, merged.size)
+        merged.forEach { assertEquals(listOf(it.id), EpisodeSourceEpisodeIds.read(it)) }
+    }
+
 }

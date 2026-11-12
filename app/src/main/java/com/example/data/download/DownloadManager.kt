@@ -5,6 +5,7 @@ import android.os.Environment
 import android.os.StatFs
 import android.util.Log
 import com.example.data.local.AppDatabase
+import com.example.data.local.EpisodeEntry
 import com.example.data.local.DownloadDao
 import com.example.data.local.DownloadEntry
 import com.example.data.remote.NetworkModule
@@ -190,11 +191,10 @@ class DownloadManager private constructor(private val context: Context) {
                         return@launch
                     }
 
-                    val sourcesRes = repository.fetchEpisodeSources(
+                    val sourcesRes = repository.fetchEpisodeSourcesForCanonical(
                         backendId,
-                        episodeId,
-                        seasonNumber = seasonNumber,
-                        episodeNumber = episodeNumber
+                        database.episodeDao().getEpisodeById(episodeId)
+                            ?: EpisodeEntry(episodeId, animeId, seasonNumber, episodeNumber)
                     )
                     val sources = sourcesRes.getOrNull()
                     val playableSources = sources.orEmpty().filter { it.hasUsableSourceId }

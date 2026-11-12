@@ -131,7 +131,7 @@ class PreResolveQueueManager(
 
                 updateStatusFor(ep.id, ResolutionStatus.RESOLVING)
 
-                val success = preResolveEpisode(backendAnimeId, ep.id, ep.seasonNumber, ep.episodeNumber)
+                val success = preResolveEpisode(backendAnimeId, ep)
                 if (success) {
                     updateStatusFor(ep.id, ResolutionStatus.READY)
                 } else {
@@ -141,21 +141,12 @@ class PreResolveQueueManager(
         }
     }
 
-    private suspend fun preResolveEpisode(
-        backendAnimeId: String,
-        episodeId: String,
-        seasonNumber: Int,
-        episodeNumber: Int
-    ): Boolean {
+    private suspend fun preResolveEpisode(backendAnimeId: String, episode: EpisodeEntry): Boolean {
+        val episodeId = episode.id
         return try {
             kotlinx.coroutines.withTimeout(12000L) {
                 // 1. Fetch sources
-                val sourcesRes = repository.fetchEpisodeSources(
-                    backendAnimeId,
-                    episodeId,
-                    seasonNumber = seasonNumber,
-                    episodeNumber = episodeNumber
-                )
+                val sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendAnimeId, episode)
                 val sources = sourcesRes.getOrNull()
                 if (sources.isNullOrEmpty()) {
                     Log.d(TAG, "No sources found during pre-resolve for ep $episodeId")

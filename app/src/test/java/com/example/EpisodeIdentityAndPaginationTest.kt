@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.local.EpisodeEntry
 import com.example.data.repository.EpisodeCatalogIdentity
+import com.example.data.identity.EpisodeSourceEpisodeIds
 import com.example.data.repository.EpisodeRecordCandidate
 import com.example.data.repository.EpisodeRecordPagination
 import com.example.data.repository.EpisodeRecordSource
@@ -32,6 +33,7 @@ class EpisodeIdentityAndPaginationTest {
         assertEquals("list-id", merged.single().id)
         assertEquals("Episode title", merged.single().title)
         assertEquals("Synopsis", merged.single().overview)
+        assertEquals(setOf("nested-id", "list-id"), EpisodeSourceEpisodeIds.read(merged.single()).toSet())
     }
 
     @Test

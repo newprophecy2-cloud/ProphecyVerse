@@ -7,6 +7,7 @@ import com.example.data.local.AppDatabase
 import com.example.data.local.CatalogMapping
 import com.example.data.local.EpisodeDao
 import com.example.data.local.EpisodeEntry
+import com.example.data.identity.EpisodeSourceEpisodeIds
 import com.example.data.local.EpisodeSourceCandidateRecord
 import com.example.data.local.EpisodeSourceSnapshotRecord
 import com.example.data.local.PlaybackHistory
@@ -1237,6 +1238,45 @@ class AnimeRepository(
         episodeNumber = episodeNumber
     )
         .map { it.sources }
+
+    /** Query source metadata for each backend ID already confirmed as this same canonical episode.
+     * A failed/empty lookup for one representation cannot hide a usable alternate representation.
+     */
+    suspend fun fetchEpisodeSourceSnapshotForCanonical(
+        backendAnimeId: String, episode: EpisodeEntry, forceRefresh: Boolean = false
+    ): Result<EpisodeSourceSnapshot> {
+        val snapshots = mutableListOf<EpisodeSourceSnapshot>()
+        var lastError: Throwable? = null
+        for (lookupId in EpisodeSourceEpisodeIds.read(episode)) {
+            val result = fetchEpisodeSourceSnapshot(backendAnimeId, lookupId, forceRefresh,
+                episode.seasonNumber, episode.episodeNumber)
+            result.getOrNull()?.let(snapshots::add) ?: run { lastError = result.exceptionOrNull() }
+        }
+        if (snapshots.isEmpty()) return Result.failure(lastError ?: IllegalStateException("No source response for canonical episode"))
+        val candidates = snapshots.flatMap { it.sources }.distinctBy { it.stableIdentity }
+        val preferred = snapshots.firstOrNull { it.sources.isNotEmpty() } ?: snapshots.first()
+        return Result.success(preferred.copy(sources = candidates,
+            state = if (candidates.isNotEmpty()) EpisodeSourceResponseState.AVAILABLE else preferred.state,
+            errorMessage = if (candidates.isNotEmpty()) snapshots.mapNotNull { it.errorMessage }.firstOrNull() else preferred.errorMessage))
+    }
+
+    suspend fun fetchEpisodeSourcesForCanonical(
+        backendAnimeId: String, episode: EpisodeEntry, forceRefresh: Boolean = false
+    ): Result<List<ProphecySourceDto>> {
+        val all = mutableListOf<ProphecySourceDto>()
+        var lastError: Throwable? = null
+        for (lookupId in EpisodeSourceEpisodeIds.read(episode)) {
+            val result = fetchEpisodeSources(backendAnimeId, lookupId, episode.seasonNumber, episode.episodeNumber, forceRefresh)
+            val sources = result.getOrNull()
+            if (sources != null) all += sources else lastError = result.exceptionOrNull()
+        }
+        val unique = all.distinctBy { it.stableIdentity }
+        return when {
+            unique.isNotEmpty() -> Result.success(unique)
+            lastError != null -> Result.failure(lastError!!)
+            else -> Result.success(emptyList())
+        }
+    }
 
     /**
      * Returns both candidates and the server's response state so an empty, partial, or failed

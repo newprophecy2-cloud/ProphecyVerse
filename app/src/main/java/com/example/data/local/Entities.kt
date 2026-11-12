@@ -100,7 +100,9 @@ data class EpisodeEntry(
     val episodeNumber: Int,
     val title: String? = null,
     val overview: String? = null,
-    val isAvailable: Boolean = true
+    val isAvailable: Boolean = true,
+    /** Length-prefixed backend IDs confirmed to represent this same episode. */
+    val sourceEpisodeIds: String? = null
 )
 
 @Entity(tableName = "search_queries")

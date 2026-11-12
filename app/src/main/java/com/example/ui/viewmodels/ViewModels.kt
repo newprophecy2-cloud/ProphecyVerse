@@ -438,12 +438,7 @@ class DetailViewModel(
             automaticSourceJobs[episode.id] = viewModelScope.launch {
                 try {
                     automaticSourceSemaphore.withPermit {
-                        val result = repository.fetchEpisodeSourceSnapshot(
-                            backendId,
-                            episode.id,
-                            seasonNumber = episode.seasonNumber,
-                            episodeNumber = episode.episodeNumber
-                        )
+                        val result = repository.fetchEpisodeSourceSnapshotForCanonical(backendId, episode)
                         val state = result.getOrNull()?.state?.let {
                             when (it) {
                                 EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
@@ -530,13 +525,7 @@ class DetailViewModel(
                     if (cached.isStale) _sourceError.value = "Showing cached source candidates; they are stale and not verified current. Refreshing…"
                 }
                 val res = automaticSourceSemaphore.withPermit {
-                    repository.fetchEpisodeSourceSnapshot(
-                        backendId,
-                        episode.id,
-                        forceRefresh = forceRefresh,
-                        seasonNumber = episode.seasonNumber,
-                        episodeNumber = episode.episodeNumber
-                    )
+                    repository.fetchEpisodeSourceSnapshotForCanonical(backendId, episode, forceRefresh)
                 }
                 if (requestGeneration != sourceRequestGeneration) return@launch
                 val snapshot = res.getOrNull()
@@ -933,13 +922,7 @@ class PlayerViewModel(
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
-                                val freshSources = repository.fetchEpisodeSources(
-                                    backendId,
-                                    episode.id,
-                                    episode.seasonNumber,
-                                    episode.episodeNumber,
-                                    forceRefresh = true
-                                ).getOrNull() ?: emptyList()
+                                val freshSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
                                 if (requestGeneration == playbackGeneration) {
                                     resolveWithFallback(backendId, episode, freshSources, 0, requestGeneration = requestGeneration)
                                 }
@@ -951,13 +934,7 @@ class PlayerViewModel(
                                 preResolveManager.discardPreparedSource(backendId, episode.id)
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
-                                    val refreshedSources = repository.fetchEpisodeSources(
-                                        backendId,
-                                        episode.id,
-                                        episode.seasonNumber,
-                                        episode.episodeNumber,
-                                        forceRefresh = true
-                                    ).getOrNull() ?: emptyList()
+                                    val refreshedSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
                                     if (requestGeneration == playbackGeneration) {
                                         resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
                                     }
@@ -974,9 +951,7 @@ class PlayerViewModel(
             }
 
             // Route D: Get sources for the selected episode
-            val sourcesRes = repository.fetchEpisodeSources(
-                backendId, episode.id, episode.seasonNumber, episode.episodeNumber
-            )
+            val sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode)
             if (requestGeneration != playbackGeneration) return@launch
             if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
                 _resolutionError.value = "No playable sources found for this episode."
@@ -1112,13 +1087,7 @@ class PlayerViewModel(
                             playbackResolutionJob?.cancel()
                             playbackResolutionJob = viewModelScope.launch {
                                 // Refresh both source candidates and the source's resolved URL.
-                                val refreshedSources = repository.fetchEpisodeSources(
-                                    backendId,
-                                    episode.id,
-                                    episode.seasonNumber,
-                                    episode.episodeNumber,
-                                    forceRefresh = true
-                                ).getOrNull() ?: emptyList()
+                                val refreshedSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
                                 if (requestGeneration != playbackGeneration) return@launch
                                 val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
                                 resolveWithFallback(

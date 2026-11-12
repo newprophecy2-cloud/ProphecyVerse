@@ -18,10 +18,11 @@ object EpisodeCanonicalizer {
     ): List<EpisodeEntry> {
         val refreshedKeys = incoming.mapTo(mutableSetOf(), ::logicalKey)
         val candidates = existing.filter { logicalKey(it) !in refreshedKeys } + incoming
+        val priorByKey = existing.groupBy(::logicalKey)
         return candidates
             .groupBy(::logicalKey)
-            .values
-            .mapNotNull { group ->
+            .map { (key, group) -> key to group }
+            .mapNotNull { (key, group) ->
                 group.minWithOrNull(
                     compareBy<EpisodeEntry> { it.id.isBlank() }
                         .thenBy { it.id }
@@ -30,7 +31,8 @@ object EpisodeCanonicalizer {
                         title = preferred.title?.takeIf(String::isNotBlank)
                             ?: group.firstNotNullOfOrNull { it.title?.takeIf(String::isNotBlank) },
                         overview = preferred.overview?.takeIf(String::isNotBlank)
-                            ?: group.firstNotNullOfOrNull { it.overview?.takeIf(String::isNotBlank) }
+                            ?: group.firstNotNullOfOrNull { it.overview?.takeIf(String::isNotBlank) },
+                        sourceEpisodeIds = EpisodeSourceEpisodeIds.merge(*(priorByKey[key].orEmpty() + group).toTypedArray())
                     )
                 }
             }

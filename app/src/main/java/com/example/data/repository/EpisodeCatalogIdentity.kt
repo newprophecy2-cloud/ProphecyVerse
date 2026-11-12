@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import com.example.data.local.EpisodeEntry
+import com.example.data.identity.EpisodeSourceEpisodeIds
 
 /** Provenance exists only during refresh; it is deliberately not persisted in Room. */
 enum class EpisodeRecordSource {
@@ -54,7 +55,8 @@ object EpisodeCatalogIdentity {
                     title = preferred.episode.title?.takeIf(String::isNotBlank)
                         ?: other.episode.title?.takeIf(String::isNotBlank),
                     overview = preferred.episode.overview?.takeIf(String::isNotBlank)
-                        ?: other.episode.overview?.takeIf(String::isNotBlank)
+                        ?: other.episode.overview?.takeIf(String::isNotBlank),
+                    sourceEpisodeIds = EpisodeSourceEpisodeIds.merge(preferred.episode, other.episode)
                 )
             )
         }
