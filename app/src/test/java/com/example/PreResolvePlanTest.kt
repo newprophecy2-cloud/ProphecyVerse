@@ -3,6 +3,7 @@ package com.example
 import com.example.data.local.EpisodeEntry
 import com.example.player.PreResolvePlan
 import com.example.player.PreResolveQueueManager
+import com.example.player.PreResolveQueueManager.ResolutionStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -39,5 +40,10 @@ class PreResolvePlanTest {
         val upcoming = PreResolvePlan.upcoming(current, listOf(current, ep(1, 2), ep(1, 2, "alternate-backend-id"), ep(2, 1)))
         assertEquals(2, upcoming.size)
         assertTrue(upcoming.map { it.id }.distinct().size == upcoming.size)
+    }
+    @Test
+    fun queuedEpisodeCannotBecomeVerifiedPlayableWithoutRealSuccessfulResolution() {
+        assertEquals(ResolutionStatus.FAILED, PreResolveQueueManager.completionStatus(false))
+        assertEquals(ResolutionStatus.VERIFIED_PLAYABLE, PreResolveQueueManager.completionStatus(true))
     }
 }

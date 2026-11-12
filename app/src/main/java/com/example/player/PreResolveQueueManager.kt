@@ -29,6 +29,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         const val RETRY_DELAY_MS = 3_000L
         fun identity(backendAnimeId: String, episode: EpisodeEntry): String =
             EpisodeSourceCacheIdentity.key(backendAnimeId, episode.seasonNumber, episode.id)
+        fun completionStatus(verifiedPlayable: Boolean): ResolutionStatus =
+            if (verifiedPlayable) ResolutionStatus.VERIFIED_PLAYABLE else ResolutionStatus.FAILED
     }
 
     enum class ResolutionStatus { NOT_STARTED, QUEUED, RESOLVING, RESOLVED, VERIFIED_PLAYABLE, FAILED, RETRY_PENDING, EXPIRED }
@@ -99,7 +101,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                             resolved = preResolveEpisode(backendAnimeId, episode)
                             if (resolved) break
                         }
-                        updateStatusFor(key, if (resolved) ResolutionStatus.VERIFIED_PLAYABLE else ResolutionStatus.FAILED)
+                        updateStatusFor(key, completionStatus(resolved))
                     }
                 }
             } catch (cancelled: CancellationException) {

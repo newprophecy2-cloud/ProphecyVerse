@@ -30,10 +30,10 @@ internal fun resolveEpisodeCatalogState(
     episodeListEndpointSucceeded: Boolean,
     isMovieCatalog: Boolean = false
 ): EpisodeCatalogState = when {
-    isMovieCatalog && cachedEpisodeCount == 0 -> EpisodeCatalogState.NOT_APPLICABLE
+    backendIdKnown && !detailsEndpointSucceeded && !episodeListEndpointSucceeded -> EpisodeCatalogState.FAILED
+    isMovieCatalog && cachedEpisodeCount == 0 && detailsEndpointSucceeded -> EpisodeCatalogState.NOT_APPLICABLE
     snapshotComplete && cachedEpisodeCount == 0 -> EpisodeCatalogState.CONFIRMED_EMPTY
     snapshotComplete -> EpisodeCatalogState.COMPLETE
-    backendIdKnown && !detailsEndpointSucceeded && !episodeListEndpointSucceeded -> EpisodeCatalogState.FAILED
     cachedEpisodeCount > 0 -> EpisodeCatalogState.PARTIAL
     detailsEndpointSucceeded || episodeListEndpointSucceeded -> EpisodeCatalogState.UNKNOWN
     backendIdKnown -> EpisodeCatalogState.FAILED

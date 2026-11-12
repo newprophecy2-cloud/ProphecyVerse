@@ -67,5 +67,9 @@ class CatalogRefreshStateTest {
             EpisodeCatalogState.PARTIAL,
             resolveEpisodeCatalogState(false, 3, true, true, false, isMovieCatalog = true)
         )
+        assertEquals(
+            EpisodeCatalogState.FAILED,
+            resolveEpisodeCatalogState(false, 0, true, false, false, isMovieCatalog = true)
+        )
     }
 }
