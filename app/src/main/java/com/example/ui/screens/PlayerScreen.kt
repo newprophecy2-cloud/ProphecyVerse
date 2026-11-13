@@ -363,12 +363,8 @@ fun PlayerScreen(
                     }
                     viewModel.flushProgress()
                 }
-                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
-                    if (!inPip) {
-                        viewModel.playerManager.pause()
-                    }
-                    viewModel.flushProgress()
-                }
+                // ON_PAUSE precedes ON_STOP for the Activity; handling both caused
+                // duplicate pause calls and duplicate progress writes.
                 else -> {}
             }
         }

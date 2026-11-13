@@ -5,6 +5,7 @@ import com.example.data.local.EpisodeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.resolveVerifiedPlaybackForEpisode
 import com.example.data.repository.EpisodeSourceCacheIdentity
 import com.example.data.repository.SourceExpiryTime
 import kotlinx.coroutines.CancellationException
@@ -52,13 +53,22 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     val queueStatus: StateFlow<Map<String, ResolutionStatus>> = _queueStatus.asStateFlow()
     private var workerJob: Job? = null
     @Volatile private var queueGeneration: Long = 0L
+    @Volatile private var lastWindowSignature: String? = null
     private val queueDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     /** Queue the next 17 canonical episodes after the current episode in the same season. */
     fun slideWindow(backendAnimeId: String, currentEpisode: EpisodeEntry, allEpisodes: List<EpisodeEntry>) {
         val upcoming = PreResolvePlan.upcoming(currentEpisode, allEpisodes)
+        val previous = PreResolvePlan.previous(currentEpisode, allEpisodes)
+        val signature = buildString {
+            append(backendAnimeId).append('|').append(identity(backendAnimeId, currentEpisode)).append('|')
+            append(upcoming.joinToString(",") { identity(backendAnimeId, it) }).append('|')
+            append(previous.joinToString(",") { identity(backendAnimeId, it) })
+        }
+        if (signature == lastWindowSignature && workerJob?.isActive == true) return
+        lastWindowSignature = signature
         val generation = ++queueGeneration
-        if (upcoming.isEmpty()) {
+        if (upcoming.isEmpty() && previous.isEmpty()) {
             workerJob?.cancel()
             workerJob = null
             updateStatuses { statuses -> statuses.mapValues { (_, state) ->
@@ -67,7 +77,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
             return
         }
         workerJob?.cancel()
-        val targetKeys = upcoming.associateBy { identity(backendAnimeId, it) }
+        val priorityEpisodes = (upcoming + previous).distinctBy { identity(backendAnimeId, it) }
+        val targetKeys = priorityEpisodes.associateBy { identity(backendAnimeId, it) }
         updateStatuses { prior ->
             val next = prior.mapValues { (_, state) ->
                 if (state == ResolutionStatus.RESOLVING || state == ResolutionStatus.QUEUED) ResolutionStatus.RETRY_PENDING else state
@@ -86,9 +97,11 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
             try {
                 // Only the rolling next-17 window is scheduled. On episode advance, slideWindow
                 // cancels obsolete work and plans the next 17 from the canonical catalog order.
+                // Immediate next and the fast seven always run before background ten;
+                // previous episodes are deliberately appended at low priority.
                 val prioritizedUpcoming = upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE) +
-                    upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE)
-                for (episode in prioritizedUpcoming) {
+                    upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE) + previous
+                for (episode in prioritizedUpcoming.distinctBy { identity(backendAnimeId, it) }) {
                         if (!isActive) return@launch
                         val key = identity(backendAnimeId, episode)
                         val cached = preparedCache[key]
@@ -126,22 +139,18 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         val key = identity(backendAnimeId, episode)
         return try {
             withTimeout(12_000L) {
-                val sources = repository.fetchEpisodeSourcesForCanonical(backendAnimeId, episode).getOrNull().orEmpty()
-                for (source in sources) {
-                    if (!source.hasUsableSourceId) continue
-                    val direct = repository.resolveDirectPlayback(source.id).getOrNull() ?: continue
-                    if (direct.sourceId != source.id) continue
-                    updateStatusFor(key, ResolutionStatus.RESOLVED)
-                    val url = direct.playbackUrl
-                    if (direct.sourceId != source.id || url.isBlank() ||
-                        !(url.startsWith("https://") || url.startsWith("http://") || url.startsWith("file://")) ||
-                        SourceExpiryTime.isExpired(direct.expiresAt)) continue
-                    preparedCache[key] = PreparedEpisode(backendAnimeId, episode.id, episode.seasonNumber,
-                        source, direct, System.currentTimeMillis())
-                    Log.i(TAG, "Verified playback resolution for S${episode.seasonNumber} episode ${episode.id}")
-                    return@withTimeout true
-                }
-                false
+                val verified = repository.resolveVerifiedPlaybackForEpisode(backendAnimeId, episode).getOrNull()
+                    ?: return@withTimeout false
+                updateStatusFor(key, ResolutionStatus.RESOLVED)
+                val direct = verified.directData
+                val url = direct.playbackUrl
+                if (direct.sourceId != verified.source.id || url.isBlank() ||
+                    !(url.startsWith("https://") || url.startsWith("http://") || url.startsWith("file://")) ||
+                    SourceExpiryTime.isExpired(direct.expiresAt)) return@withTimeout false
+                preparedCache[key] = PreparedEpisode(backendAnimeId, episode.id, episode.seasonNumber,
+                    verified.source, direct, System.currentTimeMillis())
+                Log.i(TAG, "Verified playback resolution for S${episode.seasonNumber} episode ${episode.id}")
+                true
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -176,6 +185,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     }
 
     fun clear() {
+        lastWindowSignature = null
         workerJob?.cancel()
         workerJob = null
         preparedCache.clear()

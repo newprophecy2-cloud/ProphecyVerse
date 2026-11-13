@@ -11,6 +11,7 @@ import com.example.data.local.DownloadEntry
 import com.example.data.remote.NetworkModule
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.UserFacingErrorMapper
+import com.example.data.repository.resolveVerifiedPlaybackForEpisode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
@@ -193,48 +195,37 @@ class DownloadManager private constructor(private val context: Context) {
                         return@launch
                     }
 
-                    val sourcesRes = repository.fetchEpisodeSourcesForCanonical(
+                    val episode = database.episodeDao().getEpisodeById(episodeId)
+                        ?: EpisodeEntry(episodeId, animeId, seasonNumber, episodeNumber)
+                    var resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
                         backendId,
-                        database.episodeDao().getEpisodeById(episodeId)
-                            ?: EpisodeEntry(episodeId, animeId, seasonNumber, episodeNumber)
+                        episode,
+                        preferredSourceId = preferredSourceId
                     )
-                    val sources = sourcesRes.getOrNull()
-                    val playableSources = sources.orEmpty().filter { it.hasUsableSourceId }
-                    val source = if (!preferredSourceId.isNullOrBlank()) {
-                        playableSources.firstOrNull { it.id == preferredSourceId }
-                    } else if (!preferredQuality.isNullOrBlank() || !preferredLanguage.isNullOrBlank()) {
-                        playableSources.firstOrNull { s ->
-                            (preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true) &&
-                            (preferredLanguage.isNullOrBlank() || s.language?.contains(preferredLanguage, ignoreCase = true) == true)
-                        } ?: playableSources.firstOrNull { s ->
-                            preferredQuality.isNullOrBlank() || s.quality?.equals(preferredQuality, ignoreCase = true) == true
-                        } ?: playableSources.firstOrNull { it.downloadable == true } ?: playableSources.firstOrNull()
-                    } else {
-                        playableSources.firstOrNull { it.downloadable == true } ?: playableSources.firstOrNull()
+                    if (resolutionResult.isFailure && isTransientResolutionFailure(resolutionResult.exceptionOrNull())) {
+                        delay(1_500L)
+                        resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
+                            backendId,
+                            episode,
+                            preferredSourceId = preferredSourceId
+                        )
                     }
-
-                    if (source == null) {
+                    val verified = resolutionResult.getOrNull()
+                    if (verified == null) {
                         downloadDao.upsertDownload(
                             existing.copy(
                                 downloadStatus = "FAILED",
-                                errorMessage = "No downloadable source provided by backend"
+                                errorMessage = UserFacingErrorMapper.message(
+                                    resolutionResult.exceptionOrNull(),
+                                    "No verified downloadable source is ready yet. Please try again."
+                                )
                             )
                         )
                         return@launch
                     }
 
-                    val playRes = repository.resolveDirectPlayback(source.id)
-                    val playData = playRes.getOrNull()
-                    if (playData == null || playData.playbackUrl.isBlank()) {
-                        downloadDao.upsertDownload(
-                            existing.copy(
-                                downloadStatus = "FAILED",
-                                errorMessage = "Direct URL resolution failed"
-                            )
-                        )
-                        return@launch
-                    }
-
+                    val source = verified.source
+                    val playData = verified.directData
                     directUrl = playData.playbackUrl
                     headers = playData.headers
                     existing = existing.copy(
@@ -562,6 +553,13 @@ class DownloadManager private constructor(private val context: Context) {
         map.remove(episodeId)
         _liveProgressMap.value = map
     }
+
+    private fun isTransientResolutionFailure(error: Throwable?): Boolean =
+        generateSequence(error) { it.cause }.any { cause ->
+            cause is java.io.IOException || cause is java.net.SocketTimeoutException ||
+                Regex("HTTP (408|429|5\\d\\d)").containsMatchIn(cause.message.orEmpty()) ||
+                cause.message.orEmpty().contains("temporarily", ignoreCase = true)
+        }
 
     companion object {
         private const val TAG = "DownloadManager"

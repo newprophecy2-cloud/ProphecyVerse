@@ -54,6 +54,19 @@ class PreResolvePlanTest {
         assertEquals((11..16).toList(), PreResolvePlan.previous(current, records).map { it.episodeNumber })
     }
 
+
+    @Test
+    fun veryLargeCatalogOnlyBuildsBoundedSameSeasonWindows() {
+        val records = (1..1200).map { ep(1, it) } + (1..1200).map { ep(2, it, "s2e$it") }
+        val current = records[599]
+        val started = System.nanoTime()
+        val upcoming = PreResolvePlan.upcoming(current, records)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        assertEquals(17, upcoming.size)
+        assertEquals(setOf(1), upcoming.map { it.seasonNumber }.toSet())
+        assertTrue("Window planning should remain bounded; took ${elapsedMs}ms", elapsedMs < 1000)
+    }
+
     @Test
     fun queuedEpisodeCannotBecomeVerifiedPlayableWithoutRealSuccessfulResolution() {
         assertEquals(ResolutionStatus.FAILED, PreResolveQueueManager.completionStatus(false))

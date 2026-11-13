@@ -13,6 +13,7 @@ import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.resolveVerifiedPlaybackForEpisode
 import com.example.data.repository.UserFacingErrorMapper
 import com.example.data.repository.EpisodeCatalogRefreshStatus
 import com.example.data.repository.EpisodeCatalogState
@@ -20,6 +21,7 @@ import com.example.data.repository.EpisodeRecordPagination
 import com.example.data.repository.EpisodeSourceResponseState
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
+import com.example.player.PreResolvePlan
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
@@ -659,11 +661,7 @@ class PlayerViewModel(
 
     val nextEpisode: StateFlow<EpisodeEntry?> = combine(_currentEpisode, allEpisodes) { current, list ->
         if (current == null || list.isEmpty()) null
-        else {
-            val canonical = EpisodeCanonicalizer.canonicalize(emptyList(), list)
-            val currentIndex = canonical.indexOfFirst { it.id == current.id }
-            if (currentIndex in 0 until canonical.size - 1) canonical[currentIndex + 1] else null
-        }
+        else PreResolvePlan.upcoming(current, list).firstOrNull()
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     private val _isResolving = MutableStateFlow(true)
@@ -754,7 +752,10 @@ class PlayerViewModel(
                         val anime = AppDatabase.getInstance(application).animeDao().getAnimeById(animeId) ?: animeEntry.value
                         val bId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
                         if (current != null && bId != null) {
-                            preResolveManager.slideWindow(bId, current, epList)
+                            // Only the current season is needed by the rolling window; avoid
+                            // canonicalizing a large multi-season catalog on every Room emission.
+                            val currentSeasonEpisodes = epList.filter { it.seasonNumber == current.seasonNumber }
+                            preResolveManager.slideWindow(bId, current, currentSeasonEpisodes)
                         }
                     }
                 }
@@ -829,9 +830,15 @@ class PlayerViewModel(
         preferredSourceId: String? = null,
         startPositionOverrideMs: Long? = null
     ) {
-        if (_currentEpisode.value?.id == episode.id && _isResolving.value &&
-            playbackResolutionJob?.isActive == true &&
-            (preferredSourceId == null || preferredSourceId == activeSourceId)) return
+        if (_currentEpisode.value?.id == episode.id &&
+            (preferredSourceId == null || preferredSourceId == activeSourceId) &&
+            playbackResolutionJob?.isActive == true) return
+        if (_currentEpisode.value?.id == episode.id &&
+            preferredSourceId == null &&
+            !_isResolving.value &&
+            playerManager.errorMessage.value == null &&
+            !playerManager.isPlaybackEnded.value &&
+            playerManager.exoPlayerInstance.value != null) return
         val requestGeneration = ++playbackGeneration
         retriedSourceGeneration = requestGeneration
         retriedSourceIds.clear()
@@ -951,6 +958,25 @@ class PlayerViewModel(
                 }
             }
 
+            // Shared single-flight path: Player, pre-resolve, and downloads wait on the
+            // same verified operation instead of issuing competing source/direct requests.
+            val sharedResolution = repository.resolveVerifiedPlaybackForEpisode(
+                backendId, episode, preferredSourceId
+            ).getOrNull()
+            if (sharedResolution != null) {
+                resolveWithFallback(
+                    backendId,
+                    episode,
+                    sharedResolution.candidates,
+                    0,
+                    prioritize = false,
+                    startPositionOverrideMs = startPositionOverrideMs,
+                    requestGeneration = requestGeneration,
+                    preResolved = sharedResolution
+                )
+                return@launch
+            }
+
             // Route D: Get sources for the selected episode. Retry a transient network failure
             // once; an authoritative empty response remains an empty-source result.
             var sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode)
@@ -1031,7 +1057,8 @@ class PlayerViewModel(
         startIndex: Int = 0,
         prioritize: Boolean = false,
         startPositionOverrideMs: Long? = null,
-        requestGeneration: Long
+        requestGeneration: Long,
+        preResolved: com.example.data.repository.VerifiedEpisodePlayback? = null
     ) {
         if (requestGeneration != playbackGeneration) return
         val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
@@ -1049,7 +1076,11 @@ class PlayerViewModel(
             _activeSource.value = source
 
             // Route E: The ONE AND ONLY playback route: POST /api/v1/play/direct
-            var playRes = repository.resolveDirectPlayback(source.id)
+            var playRes = if (i == 0 && preResolved?.source?.id == source.id) {
+                Result.success(preResolved.directData)
+            } else {
+                repository.resolveDirectPlayback(source.id)
+            }
             if (playRes.isFailure && isTransientNetworkFailure(playRes.exceptionOrNull())) {
                 _isResolving.value = true
                 delay(2_500L)

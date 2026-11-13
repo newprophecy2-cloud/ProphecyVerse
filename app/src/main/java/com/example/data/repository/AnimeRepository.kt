@@ -1310,6 +1310,7 @@ class AnimeRepository(
         val generationAtStart = sourceFetchGenerations.computeIfAbsent(cacheKey) { java.util.concurrent.atomic.AtomicLong() }.get()
         val cachedAtStart = readBestCachedSourceSnapshot(cacheKey, seasonNumber, episodeNumber)
         if (!forceRefresh && cachedAtStart != null && !cachedAtStart.isStale) {
+            Log.i("AnimeRepository", "source_cache_hit=true")
             return@withContext Result.success(cachedAtStart)
         }
         sourceFetchMutexes.computeIfAbsent(cacheKey) { Mutex() }.withLock {
@@ -1606,6 +1607,7 @@ class AnimeRepository(
             val cached = resolvedPlaybackCache[sourceId]
             if (!forceRefresh && cached != null && !isExpired(cached.data.expiresAt) &&
                 System.currentTimeMillis() - cached.cachedAtMs <= 20 * 60 * 1000L) {
+                Log.i("AnimeRepository", "direct_cache_hit=true")
                 return@withContext Result.success(cached.data)
             }
             val retryRemaining = directRetryMutex.withLock {
