@@ -5,7 +5,7 @@
 - Repository: `https://github.com/newprophecy2-cloud/ProphecyVerse.git`
 - Branch: `repair/apk-v3-root-cause`
 - Initial commit: `b63c949fb1e022b5883939f1dca4a6fefaaab8e0`
-- Final commit: recorded after the final commit below
+- Final implementation commit: `5ee4fb951faeb697b6215a1a4714cb94104f50fc`
 
 ## B. Eight bug fixes
 
@@ -56,7 +56,7 @@ Foreground image handling is implemented with bounded asynchronous HTTP retrieva
 ## I. GitHub
 
 - Branch: `repair/apk-v3-root-cause`
-- Push result and final SHA: recorded after commit/push verification
+- Push result: confirmed by GitHub; implementation commit `5ee4fb951faeb697b6215a1a4714cb94104f50fc`
 - Repository: `https://github.com/newprophecy2-cloud/ProphecyVerse.git`
 
 ## J. Remaining limitations
