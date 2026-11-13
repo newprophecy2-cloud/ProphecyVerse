@@ -13,6 +13,7 @@ import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.UserFacingErrorMapper
 import com.example.data.repository.EpisodeCatalogRefreshStatus
 import com.example.data.repository.EpisodeCatalogState
 import com.example.data.repository.EpisodeRecordPagination
@@ -565,7 +566,7 @@ class DetailViewModel(
                     _episodeSourceStates.value = _episodeSourceStates.value + (
                         episode.id to if (timedOut) EpisodeSourceState.TIMEOUT else EpisodeSourceState.FAILED
                     )
-                    _sourceError.value = "Failed to load sources: ${res.exceptionOrNull()?.message}"
+                    _sourceError.value = UserFacingErrorMapper.message(res.exceptionOrNull())
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
@@ -574,7 +575,7 @@ class DetailViewModel(
                 _episodeSourceStates.value = _episodeSourceStates.value + (
                     episode.id to if (timedOut) EpisodeSourceState.TIMEOUT else EpisodeSourceState.FAILED
                 )
-                _sourceError.value = "Failed to load sources: ${error.message}"
+                _sourceError.value = UserFacingErrorMapper.message(error)
             } finally {
                 if (requestGeneration == sourceRequestGeneration) {
                     _isLoadingSources.value = false
@@ -1123,11 +1124,11 @@ class PlayerViewModel(
 
                 return
             } else {
-                lastError = playRes.exceptionOrNull()?.message
+                lastError = UserFacingErrorMapper.message(playRes.exceptionOrNull(), "No playable source available right now.")
             }
         }
 
-        _resolutionError.value = lastError ?: "Direct stream resolution rejected or unavailable."
+        _resolutionError.value = lastError ?: "No playable source available right now."
         _isResolving.value = false
     }
 

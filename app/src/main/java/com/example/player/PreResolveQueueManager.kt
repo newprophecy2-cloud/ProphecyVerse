@@ -54,7 +54,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     @Volatile private var queueGeneration: Long = 0L
     private val queueDispatcher = Dispatchers.IO.limitedParallelism(1)
 
-    /** Queue the next 17 canonical episodes after the current episode, including season boundaries. */
+    /** Queue the next 17 canonical episodes after the current episode in the same season. */
     fun slideWindow(backendAnimeId: String, currentEpisode: EpisodeEntry, allEpisodes: List<EpisodeEntry>) {
         val upcoming = PreResolvePlan.upcoming(currentEpisode, allEpisodes)
         val generation = ++queueGeneration
@@ -86,8 +86,9 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
             try {
                 // Only the rolling next-17 window is scheduled. On episode advance, slideWindow
                 // cancels obsolete work and plans the next 17 from the canonical catalog order.
-                for (batch in PreResolvePlan.batches(upcoming)) {
-                    for (episode in batch) {
+                val prioritizedUpcoming = upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE) +
+                    upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE)
+                for (episode in prioritizedUpcoming) {
                         if (!isActive) return@launch
                         val key = identity(backendAnimeId, episode)
                         val cached = preparedCache[key]
@@ -109,7 +110,6 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                             if (resolved) break
                         }
                         updateStatusFor(key, completionStatus(resolved))
-                    }
                 }
             } catch (cancelled: CancellationException) {
                 if (generation == queueGeneration) {

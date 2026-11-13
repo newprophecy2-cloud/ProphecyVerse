@@ -413,7 +413,7 @@ fun DownloadManagementBottomSheet(
             Spacer(modifier = Modifier.height(14.dp))
 
             // Navigation Tabs
-            val activeCount = animeDownloads.count { it.downloadStatus == "DOWNLOADING" || it.downloadStatus == "PAUSED" }
+            val activeCount = animeDownloads.count { it.downloadStatus == "DOWNLOADING" || it.downloadStatus == "PENDING_RESOLUTION" || it.downloadStatus == "WAITING_FOR_SOURCE" || it.downloadStatus == "PAUSED" }
             TabRow(
                 selectedTabIndex = selectedTab,
                 containerColor = SurfaceVariantDark,
@@ -694,7 +694,7 @@ private fun CurrentEpisodeDownloadContent(
                     }
                 }
 
-                download.downloadStatus == "DOWNLOADING" -> {
+                download.downloadStatus == "DOWNLOADING" || download.downloadStatus == "PENDING_RESOLUTION" || download.downloadStatus == "WAITING_FOR_SOURCE" -> {
                     val progressFloat = (download.progressPercent / 100f).coerceIn(0f, 1f)
                     LinearProgressIndicator(
                         progress = { progressFloat },
@@ -1000,7 +1000,7 @@ private fun BatchDownloadContent(
             items(seasonEpisodes, key = { it.id }) { ep ->
                 val dl = downloadsByEpisodeId[ep.id]
                 val isCompleted = dl?.downloadStatus == "COMPLETED"
-                val isDownloading = dl?.downloadStatus == "DOWNLOADING"
+                val isDownloading = dl?.downloadStatus == "DOWNLOADING" || dl?.downloadStatus == "PENDING_RESOLUTION" || dl?.downloadStatus == "WAITING_FOR_SOURCE"
                 val isChecked = selectedEpisodeIds.contains(ep.id)
 
                 Row(
@@ -1125,7 +1125,7 @@ private fun QueueDownloadsContent(
         return
     }
 
-    val activeCount = downloads.count { it.downloadStatus == "DOWNLOADING" }
+    val activeCount = downloads.count { it.downloadStatus == "DOWNLOADING" || it.downloadStatus == "PENDING_RESOLUTION" || it.downloadStatus == "WAITING_FOR_SOURCE" }
     val pausedCount = downloads.count { it.downloadStatus == "PAUSED" }
 
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -1262,7 +1262,7 @@ private fun QueueDownloadsContent(
                             }
                         }
 
-                        if (item.downloadStatus == "DOWNLOADING") {
+                        if (item.downloadStatus == "DOWNLOADING" || item.downloadStatus == "PENDING_RESOLUTION" || item.downloadStatus == "WAITING_FOR_SOURCE") {
                             Spacer(modifier = Modifier.height(6.dp))
                             LinearProgressIndicator(
                                 progress = { (currentPct / 100f).coerceIn(0f, 1f) },

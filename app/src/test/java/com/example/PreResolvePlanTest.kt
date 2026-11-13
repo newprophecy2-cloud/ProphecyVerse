@@ -29,8 +29,8 @@ class PreResolvePlanTest {
     fun sameEpisodeNumberInMultipleSeasonsRemainsASeparateOrderedIdentity() {
         val records = listOf(ep(1, 1), ep(1, 2), ep(2, 1), ep(3, 1))
         val upcoming = PreResolvePlan.upcoming(records[0], records)
-        assertEquals(listOf("s1e2", "s2e1", "s3e1"), upcoming.map { it.id })
-        assertEquals(setOf(1, 2, 3), (listOf(records[0]) + upcoming).filter { it.episodeNumber == 1 }.map { it.seasonNumber }.toSet())
+        assertEquals(listOf("s1e2"), upcoming.map { it.id })
+        assertEquals(setOf(1), (listOf(records[0]) + upcoming).filter { it.episodeNumber == 1 }.map { it.seasonNumber }.toSet())
         val sameNumberIds = records.filter { it.episodeNumber == 1 }.map {
             PreResolveQueueManager.identity("backend-anime", it)
         }
@@ -41,9 +41,19 @@ class PreResolvePlanTest {
     fun duplicateSameSeasonEpisodeIsNotQueuedTwice() {
         val current = ep(1, 1)
         val upcoming = PreResolvePlan.upcoming(current, listOf(current, ep(1, 2), ep(1, 2, "alternate-backend-id"), ep(2, 1)))
-        assertEquals(2, upcoming.size)
+        assertEquals(1, upcoming.size)
         assertTrue(upcoming.map { it.id }.distinct().size == upcoming.size)
     }
+    @Test
+    fun episodeSeventeen_hasFastSeven_backgroundTen_andPreviousSix() {
+        val records = (1..50).map { ep(1, it) }
+        val current = records[16]
+        assertEquals((18..34).toList(), PreResolvePlan.upcoming(current, records).map { it.episodeNumber })
+        assertEquals((18..24).toList(), PreResolvePlan.fastUpcoming(current, records).map { it.episodeNumber })
+        assertEquals((25..34).toList(), PreResolvePlan.backgroundUpcoming(current, records).map { it.episodeNumber })
+        assertEquals((11..16).toList(), PreResolvePlan.previous(current, records).map { it.episodeNumber })
+    }
+
     @Test
     fun queuedEpisodeCannotBecomeVerifiedPlayableWithoutRealSuccessfulResolution() {
         assertEquals(ResolutionStatus.FAILED, PreResolveQueueManager.completionStatus(false))

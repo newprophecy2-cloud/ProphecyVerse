@@ -10,6 +10,7 @@ import com.example.data.local.DownloadDao
 import com.example.data.local.DownloadEntry
 import com.example.data.remote.NetworkModule
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.UserFacingErrorMapper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,6 +44,7 @@ class DownloadManager private constructor(private val context: Context) {
         val downloadedBytes: Long,
         val totalBytes: Long,
         val speedBytesPerSec: Long = 0L,
+        val etaSeconds: Long? = null,
         val isPaused: Boolean = false
     )
 
@@ -139,7 +141,7 @@ class DownloadManager private constructor(private val context: Context) {
                         seasonNumber = seasonNumber,
                         episodeNumber = episodeNumber,
                         episodeTitle = episodeTitle,
-                        downloadStatus = "DOWNLOADING",
+                        downloadStatus = "PENDING_RESOLUTION",
                         downloadedBytes = 0L,
                         totalBytes = 0L,
                         mediaType = mediaType,
@@ -150,7 +152,7 @@ class DownloadManager private constructor(private val context: Context) {
                     downloadDao.upsertDownload(existing)
                 } else {
                     existing = existing.copy(
-                        downloadStatus = "DOWNLOADING",
+                        downloadStatus = "PENDING_RESOLUTION",
                         errorMessage = null,
                         quality = preferredQuality ?: existing.quality,
                         audioLanguage = preferredLanguage ?: existing.audioLanguage
@@ -236,6 +238,7 @@ class DownloadManager private constructor(private val context: Context) {
                     directUrl = playData.playbackUrl
                     headers = playData.headers
                     existing = existing.copy(
+                        downloadStatus = "DOWNLOADING",
                         downloadUrl = null,
                         quality = existing.quality ?: source.quality,
                         audioLanguage = existing.audioLanguage ?: source.language
@@ -274,7 +277,7 @@ class DownloadManager private constructor(private val context: Context) {
                     downloadDao.upsertDownload(
                         current.copy(
                             downloadStatus = "FAILED",
-                            errorMessage = e.message ?: "Download connection interrupted"
+                            errorMessage = UserFacingErrorMapper.message(e, "Download connection interrupted. Please try again.")
                         )
                     )
                 }
@@ -350,13 +353,13 @@ class DownloadManager private constructor(private val context: Context) {
                     }.build()
                 ).execute()
                 if (!restartResp.isSuccessful) {
-                    downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = "Server returned ${restartResp.code}"))
+                    downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = UserFacingErrorMapper.message(IllegalStateException("HTTP ${restartResp.code}"))))
                     return@withContext
                 }
                 streamResponseBody(episodeId, restartResp, tempFile, finalFile, 0L, entry)
                 return@withContext
             } else {
-                downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = "Server error ${response.code}"))
+                downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = UserFacingErrorMapper.message(IllegalStateException("HTTP ${response.code}"))))
                 return@withContext
             }
         }
@@ -432,6 +435,9 @@ class DownloadManager private constructor(private val context: Context) {
 
             output.close()
             inputStream.close()
+
+            downloadDao.updateProgress(episodeId, "DOWNLOADING", currentDownloaded, totalBytes)
+            updateLiveProgress(episodeId, currentDownloaded, totalBytes, currentSpeed)
 
             // Completion: only publish a non-empty file. A successful HTTP response alone is
             // not sufficient evidence that a playable media file was downloaded.
@@ -540,11 +546,13 @@ class DownloadManager private constructor(private val context: Context) {
 
     private fun updateLiveProgress(episodeId: String, downloaded: Long, total: Long, speed: Long) {
         val map = _liveProgressMap.value.toMutableMap()
+        val etaSeconds = if (total > 0L && speed > 0L) ((total - downloaded).coerceAtLeast(0L) / speed) else null
         map[episodeId] = LiveProgress(
             episodeId = episodeId,
             downloadedBytes = downloaded,
             totalBytes = total,
-            speedBytesPerSec = speed
+            speedBytesPerSec = speed,
+            etaSeconds = etaSeconds
         )
         _liveProgressMap.value = map
     }

@@ -30,8 +30,8 @@ class V3CriticalBugFixesTest {
     // --- P1: Version Verification ---
     @Test
     fun versionMetadata_matchesV3ReleaseSpecs() {
-        assertEquals("Installed version name must be 3.0.1", "3.0.1", BuildConfig.VERSION_NAME)
-        assertEquals("Installed version code must be 6", 6, BuildConfig.VERSION_CODE)
+        assertEquals("Installed version name must be 3.0.2", "3.0.2", BuildConfig.VERSION_NAME)
+        assertEquals("Installed version code must be 7", 7, BuildConfig.VERSION_CODE)
         assertEquals("Application ID must match project namespace", "com.aistudio.prophecyverse.vykqtb", BuildConfig.APPLICATION_ID)
     }
 
