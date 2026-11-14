@@ -768,8 +768,12 @@ class PlayerViewModel(
         val completedCloudSyncEpisodeIds = mutableSetOf<String>()
 
         // Save playback locally at the player cadence, but bound cloud writes to one/minute.
-        playerManager.onPositionUpdate = { posMs, durMs ->
-            val ep = _currentEpisode.value
+        playerManager.onPositionUpdate = { session, posMs, durMs ->
+            // The player owns an immutable session identity. Never attribute a release
+            // callback to mutable _currentEpisode, which may already be the next episode.
+            val ep = allEpisodes.value.firstOrNull {
+                it.id == session.episodeId && it.seasonNumber == session.seasonNumber
+            }
             if (ep != null && durMs > 0) {
                 val now = System.currentTimeMillis()
                 val deltaSec = (now - lastWatchTimeTrackMs) / 1000
@@ -889,7 +893,8 @@ class PlayerViewModel(
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = null,
                         onRetryNeeded = {},
-                        providerName = "Offline"
+                        providerName = "Offline",
+                        sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
                     )
                     return@launch
                 }
@@ -951,7 +956,8 @@ class PlayerViewModel(
                                 }
                             }
                         },
-                        providerName = prepared.source.displayProviderName
+                        providerName = prepared.source.displayProviderName,
+                        sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
                     )
 
                     return@launch
@@ -1062,7 +1068,6 @@ class PlayerViewModel(
     ) {
         if (requestGeneration != playbackGeneration) return
         val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
-        _availableSources.value = orderedCandidates
         var lastError: String? = null
 
         for (i in startIndex until orderedCandidates.size) {
@@ -1104,6 +1109,9 @@ class PlayerViewModel(
                         ?: 0L
                 } catch (e: Exception) { startPositionOverrideMs ?: 0L }
                 if (requestGeneration != playbackGeneration) return
+                // Publish source state only after this candidate has completed direct-play
+                // validation, so incomplete resolution is never presented as ready.
+                _availableSources.value = orderedCandidates
                 _isResolving.value = false
 
                 // Initialize Media3 ExoPlayer with direct URL and headers
@@ -1150,7 +1158,8 @@ class PlayerViewModel(
                             }
                         }
                     },
-                    providerName = source.displayProviderName
+                    providerName = source.displayProviderName,
+                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
                 )
 
                 return

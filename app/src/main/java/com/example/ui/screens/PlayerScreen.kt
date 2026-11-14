@@ -210,12 +210,14 @@ fun PlayerScreen(
 
     var brightnessLevel by remember { mutableStateOf<Float?>(null) }
     var showBrightnessHud by remember { mutableStateOf(false) }
+    var brightnessHudRevision by remember { mutableIntStateOf(0) }
 
     var volumeLevel by remember { mutableStateOf<Int?>(null) }
     var maxVolume by remember {
         mutableStateOf(audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15)
     }
     var showVolumeHud by remember { mutableStateOf(false) }
+    var volumeHudRevision by remember { mutableIntStateOf(0) }
 
     var seekFeedbackText by remember { mutableStateOf<String?>(null) }
     var isSeekForward by remember { mutableStateOf(true) }
@@ -233,14 +235,14 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(showBrightnessHud) {
+    LaunchedEffect(brightnessHudRevision) {
         if (showBrightnessHud) {
             delay(1500)
             showBrightnessHud = false
         }
     }
 
-    LaunchedEffect(showVolumeHud) {
+    LaunchedEffect(volumeHudRevision) {
         if (showVolumeHud) {
             delay(1500)
             showVolumeHud = false
@@ -263,6 +265,7 @@ fun PlayerScreen(
             w.attributes = lp
             brightnessLevel = next
             showBrightnessHud = true
+            brightnessHudRevision++
         }
     }
 
@@ -286,6 +289,7 @@ fun PlayerScreen(
             }
             volumeLevel = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             showVolumeHud = true
+            volumeHudRevision++
         }
     }
 

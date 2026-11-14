@@ -181,6 +181,7 @@ class DownloadManager private constructor(private val context: Context) {
                 // previous attempt or persisted database row.
                 var directUrl: String? = null
                 var headers: List<List<String>> = emptyList()
+                var protocolHint: String? = null
 
                 if (directUrl.isNullOrBlank()) {
                     val anime = database.animeDao().getAnimeById(animeId)
@@ -228,6 +229,7 @@ class DownloadManager private constructor(private val context: Context) {
                     val playData = verified.directData
                     directUrl = playData.playbackUrl
                     headers = playData.headers
+                    protocolHint = playData.urlType
                     existing = existing.copy(
                         downloadStatus = "DOWNLOADING",
                         downloadUrl = null,
@@ -259,7 +261,8 @@ class DownloadManager private constructor(private val context: Context) {
                     headers = headers,
                     tempFile = tempFile,
                     finalFile = finalFile,
-                    entry = existing
+                    entry = existing,
+                    protocolHint = protocolHint
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Download error for $episodeId", e)
@@ -288,7 +291,8 @@ class DownloadManager private constructor(private val context: Context) {
         headers: List<List<String>>,
         tempFile: File,
         finalFile: File,
-        entry: DownloadEntry
+        entry: DownloadEntry,
+        protocolHint: String?
     ) = withContext(Dispatchers.IO) {
         var downloadedBytes = if (tempFile.exists()) tempFile.length() else 0L
 
@@ -347,6 +351,11 @@ class DownloadManager private constructor(private val context: Context) {
                     downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = UserFacingErrorMapper.message(IllegalStateException("HTTP ${restartResp.code}"))))
                     return@withContext
                 }
+                if (isManifestResponse(restartResp, url, protocolHint)) {
+                    restartResp.close()
+                    downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = "HLS/DASH streams are not supported for complete downloads"))
+                    return@withContext
+                }
                 streamResponseBody(episodeId, restartResp, tempFile, finalFile, 0L, entry)
                 return@withContext
             } else {
@@ -355,7 +364,22 @@ class DownloadManager private constructor(private val context: Context) {
             }
         }
 
+        if (isManifestResponse(response, url, protocolHint)) {
+            response.close()
+            downloadDao.upsertDownload(entry.copy(downloadStatus = "FAILED", errorMessage = "HLS/DASH streams are not supported for complete downloads"))
+            return@withContext
+        }
         streamResponseBody(episodeId, response, tempFile, finalFile, downloadedBytes, entry)
+    }
+
+    private fun isManifestResponse(response: okhttp3.Response, url: String, protocolHint: String?): Boolean {
+        val hint = protocolHint.orEmpty().lowercase()
+        val path = url.substringBefore('?').lowercase()
+        val contentType = response.header("Content-Type").orEmpty().lowercase()
+        return hint in setOf("hls", "dash", "m3u8", "mpd") ||
+            path.endsWith(".m3u8") || path.endsWith(".mpd") ||
+            contentType.contains("mpegurl") || contentType.contains("m3u8") ||
+            contentType.contains("dash+xml") || contentType.contains("application/mpd")
     }
 
     private suspend fun streamResponseBody(

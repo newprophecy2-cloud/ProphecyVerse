@@ -13,6 +13,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -54,7 +56,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     private var workerJob: Job? = null
     @Volatile private var queueGeneration: Long = 0L
     @Volatile private var lastWindowSignature: String? = null
-    private val queueDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val queueDispatcher = Dispatchers.IO.limitedParallelism(3)
 
     /** Queue the next 17 canonical episodes after the current episode in the same season. */
     fun slideWindow(backendAnimeId: String, currentEpisode: EpisodeEntry, allEpisodes: List<EpisodeEntry>) {
@@ -95,34 +97,40 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
         workerJob = scope.launch(queueDispatcher) {
             try {
-                // Only the rolling next-17 window is scheduled. On episode advance, slideWindow
-                // cancels obsolete work and plans the next 17 from the canonical catalog order.
-                // Immediate next and the fast seven always run before background ten;
-                // previous episodes are deliberately appended at low priority.
-                val prioritizedUpcoming = upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE) +
-                    upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE) + previous
-                for (episode in prioritizedUpcoming.distinctBy { identity(backendAnimeId, it) }) {
-                        if (!isActive) return@launch
-                        val key = identity(backendAnimeId, episode)
-                        val cached = preparedCache[key]
-                        if (cached != null && !cached.isExpired()) {
-                            updateStatusFor(key, ResolutionStatus.VERIFIED_PLAYABLE)
-                            continue
-                        }
-                        if (cached != null) {
-                            preparedCache.remove(key)
-                            updateStatusFor(key, ResolutionStatus.EXPIRED)
-                        }
-                        var resolved = false
-                        for (attempt in 1..MAX_ATTEMPTS) {
-                            if (!isActive) return@launch
-                            updateStatusFor(key, if (attempt == 1) ResolutionStatus.RESOLVING else ResolutionStatus.RETRY_PENDING)
-                            if (attempt > 1) delay(RETRY_DELAY_MS)
-                            if (!isActive) return@launch
-                            resolved = preResolveEpisode(backendAnimeId, episode)
-                            if (resolved) break
-                        }
-                        updateStatusFor(key, completionStatus(resolved))
+                // Process priority tiers in order, while resolving at most three episodes at once.
+                // This keeps the immediate next-seven responsive without creating an unbounded burst.
+                val tiers = listOf(
+                    upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE),
+                    upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE),
+                    previous
+                )
+                for (tier in tiers) {
+                    if (!isActive) return@launch
+                    tier.distinctBy { identity(backendAnimeId, it) }
+                        .map { episode ->
+                            async {
+                                val key = identity(backendAnimeId, episode)
+                                val cached = preparedCache[key]
+                                if (cached != null && !cached.isExpired()) {
+                                    updateStatusFor(key, ResolutionStatus.VERIFIED_PLAYABLE)
+                                    return@async
+                                }
+                                if (cached != null) {
+                                    preparedCache.remove(key)
+                                    updateStatusFor(key, ResolutionStatus.EXPIRED)
+                                }
+                                var resolved = false
+                                for (attempt in 1..MAX_ATTEMPTS) {
+                                    if (!isActive) return@async
+                                    updateStatusFor(key, if (attempt == 1) ResolutionStatus.RESOLVING else ResolutionStatus.RETRY_PENDING)
+                                    if (attempt > 1) delay(RETRY_DELAY_MS)
+                                    if (!isActive) return@async
+                                    resolved = preResolveEpisode(backendAnimeId, episode)
+                                    if (resolved) break
+                                }
+                                updateStatusFor(key, completionStatus(resolved))
+                            }
+                        }.awaitAll()
                 }
             } catch (cancelled: CancellationException) {
                 if (generation == queueGeneration) {

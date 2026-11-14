@@ -52,6 +52,7 @@ class PlayerManager(
     private var exoPlayer: ExoPlayer? = null
     private var tickerJob: Job? = null
     private var playbackGeneration: Long = 0L
+    private var activeSession: PlaybackSessionIdentity? = null
 
     private val _exoPlayerInstance = MutableStateFlow<ExoPlayer?>(null)
     val exoPlayerInstance: StateFlow<ExoPlayer?> = _exoPlayerInstance.asStateFlow()
@@ -105,7 +106,14 @@ class PlayerManager(
     private var onPlaybackFailedCallback: (() -> Unit)? = null
     private var lastWorkingTrackSelectionParams: androidx.media3.common.TrackSelectionParameters? = null
     var onPlaybackEndedCallback: (() -> Unit)? = null
-    var onPositionUpdate: ((positionMs: Long, durationMs: Long) -> Unit)? = null
+    data class PlaybackSessionIdentity(
+        val animeId: String,
+        val seasonNumber: Int,
+        val episodeId: String,
+        val generation: Long
+    )
+
+    var onPositionUpdate: ((session: PlaybackSessionIdentity, positionMs: Long, durationMs: Long) -> Unit)? = null
 
     data class TrackOption(
         val id: String,
@@ -128,10 +136,12 @@ class PlayerManager(
         startPositionMs: Long = 0L,
         onPlaybackFailed: (() -> Unit)? = null,
         onRetryNeeded: () -> Unit,
-        providerName: String? = null
+        providerName: String? = null,
+        sessionIdentity: PlaybackSessionIdentity? = null
     ): ExoPlayer {
         release()
         val generation = playbackGeneration
+        activeSession = sessionIdentity?.copy(generation = generation)
         onRetryRequested = onRetryNeeded
         onPlaybackFailedCallback = onPlaybackFailed
         _errorMessage.value = null
@@ -699,7 +709,7 @@ class PlayerManager(
 
                     if (player.isPlaying) {
                         bufferingSeconds = 0
-                        onPositionUpdate?.invoke(pos, _duration.value)
+                        activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
                     } else if (player.playbackState == Player.STATE_BUFFERING) {
                         bufferingSeconds++
                         // If buffering persists for 15s without playing, auto fallback to next source
@@ -729,11 +739,12 @@ class PlayerManager(
         tickerJob?.cancel()
         tickerJob = null
         exoPlayer?.let { player ->
-            onPositionUpdate?.invoke(player.currentPosition, player.duration)
+            activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
             player.stop()
             player.release()
         }
         exoPlayer = null
+        activeSession = null
         _exoPlayerInstance.value = null
         _isPlaying.value = false
         _isBuffering.value = false
