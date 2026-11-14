@@ -8,6 +8,13 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
+enum class ExpiryState {
+    VALID,
+    EXPIRED,
+    MISSING,
+    INVALID
+}
+
 /** Parses API ISO-8601 expiry values without requiring API-26 java.time on minSdk 24. */
 object SourceExpiryTime {
     private val fractionalZonePattern = Regex("^(.+T\\d{2}:\\d{2}:\\d{2})\\.(\\d+)(Z|[+-]\\d{2}:?\\d{2})$")
@@ -36,6 +43,19 @@ object SourceExpiryTime {
         }
         return null
     }
+
+    fun evaluateExpiry(value: String?, nowMs: Long = System.currentTimeMillis()): ExpiryState {
+        val source = value?.trim()
+        if (source.isNullOrEmpty()) return ExpiryState.MISSING
+        val epoch = parseEpochMillis(source) ?: return ExpiryState.INVALID
+        return if (epoch <= nowMs) ExpiryState.EXPIRED else ExpiryState.VALID
+    }
+
+    fun isExpiredOrInvalid(value: String?, nowMs: Long = System.currentTimeMillis()): Boolean =
+        when (evaluateExpiry(value, nowMs)) {
+            ExpiryState.EXPIRED, ExpiryState.INVALID -> true
+            ExpiryState.VALID, ExpiryState.MISSING -> false
+        }
 
     fun isExpired(value: String?, nowMs: Long = System.currentTimeMillis()): Boolean =
         parseEpochMillis(value)?.let { it <= nowMs } ?: false

@@ -229,6 +229,27 @@ object SafePlaybackHeaders {
         return dedup.entries.map { listOf(it.key, it.value) }
     }
 
+    /**
+     * Sanitizes headers for the in-memory playback/download request only.
+     * Unlike [sanitize], this intentionally preserves provider-required Cookie and
+     * Authorization headers. These values must never be sent to shared Firestore.
+     */
+    fun sanitizeRequestHeaders(headers: List<List<String>>): List<List<String>> {
+        if (headers.isEmpty()) return emptyList()
+        val dedup = LinkedHashMap<String, String>()
+        for (pair in headers) {
+            if (pair.size < 2) continue
+            val key = pair[0].trim()
+            val value = pair[1].replace("\r", "").replace("\n", "").trim()
+            if (key.isEmpty() || value.isEmpty()) continue
+            // Prevent request smuggling and malformed header names while retaining
+            // provider authentication/cookie headers for the actual request.
+            if (!key.matches(Regex("^[A-Za-z0-9!#$%&'*+.^_`|~-]+$"))) continue
+            dedup[key] = value
+        }
+        return dedup.entries.map { listOf(it.key, it.value) }
+    }
+
     fun toSafeMap(headers: List<List<String>>): Map<String, String> =
         sanitize(headers).associate { it[0] to it[1] }
 
@@ -286,7 +307,8 @@ data class ResolvedStreamPlayback(
     val directData: DirectPlayData,
     val candidates: List<ProphecySourceDto>,
     val fromCache: Boolean,
-    val cacheTier: String // "ROOM", "FIRESTORE", "BACKEND_RESOLVE"
+    val cacheTier: String, // "ROOM", "FIRESTORE", "BACKEND_RESOLVE"
+    val resolveDurationMs: Long = 0L
 )
 
 data class TimingSummary(

@@ -141,11 +141,10 @@ class MainActivity : ComponentActivity() {
         val animeId = intent.getStringExtra("animeId") ?: intent.getStringExtra("anime_id")
         val episodeId = intent.getStringExtra("episodeId") ?: intent.getStringExtra("episode_id")
         if (animeId.isNullOrBlank()) return null
-        val safeAnimeId = android.net.Uri.encode(animeId)
         return if (!episodeId.isNullOrBlank()) {
-            Screen.Player.createRoute(safeAnimeId, android.net.Uri.encode(episodeId))
+            Screen.Player.createRoute(animeId, episodeId)
         } else {
-            Screen.Detail.createRoute(safeAnimeId)
+            Screen.Detail.createRoute(animeId)
         }
     }
 
@@ -236,7 +235,7 @@ fun MainAppNav(
         navigationScope.launch {
             val route = canonicalRepository.resolveCanonicalRoute(animeId)
             navController.navigate(
-                Screen.Detail.createRoute(android.net.Uri.encode(route.animeId), route.seasonNumber)
+                Screen.Detail.createRoute(route.animeId, route.seasonNumber)
             ) { launchSingleTop = true }
         }
     }
@@ -403,22 +402,22 @@ fun MainAppNav(
                 route = Screen.Detail.route,
                 arguments = listOf(
                     navArgument("animeId") { type = NavType.StringType },
-                    navArgument("seasonNumber") { type = NavType.IntType; nullable = true; defaultValue = null }
+                    navArgument("seasonNumber") { type = NavType.IntType; defaultValue = -1 }
                 )
             ) { backStackEntry ->
                 val animeId = backStackEntry.arguments?.getString("animeId") ?: return@composable
-                val requestedSeason = backStackEntry.arguments?.getInt("seasonNumber")
-                androidx.compose.runtime.LaunchedEffect(animeId) {
+                val requestedSeason = backStackEntry.arguments?.getInt("seasonNumber")?.takeIf { it > 0 }
+                androidx.compose.runtime.LaunchedEffect(animeId, requestedSeason) {
                     val route = canonicalRepository.resolveCanonicalRoute(animeId, requestedSeason)
                     if (route.animeId != animeId) {
-                        navController.navigate(Screen.Detail.createRoute(android.net.Uri.encode(route.animeId), route.seasonNumber)) {
-                            popUpTo("detail/$animeId") { inclusive = true }
+                        navController.navigate(Screen.Detail.createRoute(route.animeId, route.seasonNumber)) {
+                            popUpTo(Screen.Detail.route) { inclusive = true }
                             launchSingleTop = true
                         }
                     }
                 }
                 val detailViewModel = viewModel<DetailViewModel>(
-                    key = "detail_$animeId",
+                    key = "detail_${animeId}_${requestedSeason ?: 0}",
                     factory = object : androidx.lifecycle.ViewModelProvider.Factory {
                         @Suppress("UNCHECKED_CAST")
                         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {

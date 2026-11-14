@@ -64,6 +64,106 @@ class FirestoreStreamingRepository(
         const val SUB_SOURCES = "sources"
         const val DEFAULT_LEASE_TTL_MS = 20_000L
         private const val DISCOVERY_FRESHNESS_MS = 10 * 60 * 1000L
+        private val sharedProductionOutbox = ConcurrentHashMap<String, PendingOutboxWrite>()
+    }
+
+    enum class ScopeReadStatus {
+        HIT,
+        NOT_FOUND,
+        CACHE_MISS,
+        PERMISSION_DENIED,
+        UNAUTHENTICATED,
+        QUOTA_EXCEEDED,
+        TIMEOUT,
+        NETWORK_ERROR,
+        UNAVAILABLE,
+        FAILED
+    }
+
+    data class ScopeReadOutcome(
+        val data: ScopeStreamingData?,
+        val status: ScopeReadStatus,
+        val message: String? = null,
+        val isHardError: Boolean = false
+    )
+
+    enum class WriteOutcomeState {
+        SUCCEEDED,
+        DEFERRED_UNAUTHENTICATED,
+        DEFERRED_OFFLINE_OR_TRANSIENT,
+        REJECTED_PERMISSION,
+        QUOTA_COOLDOWN,
+        FAILED
+    }
+
+    data class WriteOutcome(
+        val state: WriteOutcomeState,
+        val message: String? = null,
+        val errorCode: String? = null,
+        val timestampMs: Long = System.currentTimeMillis()
+    )
+
+    private sealed class PendingOutboxWrite {
+        abstract val key: String
+
+        data class Discovery(
+            override val key: String,
+            val contentKey: String,
+            val anilistId: Int?,
+            val isMovie: Boolean,
+            val backendId: String?,
+            val seasonNumber: Int,
+            val episodeNumber: Int,
+            val catalogEpisodeId: String?,
+            val backendEpisodeId: String?,
+            val seasonCount: Int?,
+            val totalEpisodeCount: Int?,
+            val seasonEpisodeCount: Int,
+            val providers: List<StreamProviderEntity>,
+            val sources: List<StreamSourceEntity>,
+            val discoveryStatus: DiscoveryStatus,
+            val canonicalTitle: String?
+        ) : PendingOutboxWrite()
+
+        data class ResolvedUrl(
+            override val key: String,
+            val sourceEntity: StreamSourceEntity,
+            val contentKey: String,
+            val isMovie: Boolean,
+            val seasonNumber: Int,
+            val episodeNumber: Int,
+            val streamUrl: String,
+            val urlType: String,
+            val contentType: String?,
+            val safeHeaders: List<List<String>>,
+            val expiresAt: String?,
+            val verifiedAt: Long,
+            val canonicalTitle: String?,
+            val backendId: String?,
+            val anilistId: Int?
+        ) : PendingOutboxWrite()
+
+        data class PlaybackSuccess(
+            override val key: String,
+            val sourceEntity: StreamSourceEntity,
+            val contentKey: String,
+            val isMovie: Boolean,
+            val seasonNumber: Int,
+            val episodeNumber: Int,
+            val canonicalTitle: String?,
+            val backendId: String?
+        ) : PendingOutboxWrite()
+
+        data class SoftDelete(
+            override val key: String,
+            val sourceEntity: StreamSourceEntity,
+            val contentKey: String,
+            val isMovie: Boolean,
+            val seasonNumber: Int,
+            val episodeNumber: Int,
+            val canonicalTitle: String?,
+            val backendId: String?
+        ) : PendingOutboxWrite()
     }
 
     data class ScopeStreamingData(
@@ -88,9 +188,19 @@ class FirestoreStreamingRepository(
     private val auditHistory = CopyOnWriteArrayList<FirestoreWriteAuditEntry>()
     private val _writeAuditLogs = MutableStateFlow<List<FirestoreWriteAuditEntry>>(emptyList())
     val writeAuditLogs: StateFlow<List<FirestoreWriteAuditEntry>> = _writeAuditLogs.asStateFlow()
+    private val instanceOutbox = ConcurrentHashMap<String, PendingOutboxWrite>()
+
+    private fun outboxMap(): ConcurrentHashMap<String, PendingOutboxWrite> =
+        if (cloudStoreProvider == null) sharedProductionOutbox else instanceOutbox
+
+    fun pendingOutboxCount(): Int = outboxMap().size
 
     @Volatile
     var lastWriteRejectionReason: String? = null
+        private set
+
+    @Volatile
+    var lastWriteOutcome: WriteOutcome? = null
         private set
 
     fun recentWriteLogs(): List<FirestoreWriteAuditEntry> = auditHistory.toList()
@@ -143,8 +253,30 @@ class FirestoreStreamingRepository(
         episodeNumber: Int = 1,
         catalogEpisodeId: String? = null,
         preferServer: Boolean = false
-    ): ScopeStreamingData? {
-        val store = resolveCloudStore() ?: return null
+    ): ScopeStreamingData? = fetchAndSyncScopeWithOutcome(
+        contentKey = contentKey,
+        isMovie = isMovie,
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber,
+        catalogEpisodeId = catalogEpisodeId,
+        preferServer = preferServer
+    ).data
+
+    suspend fun fetchAndSyncScopeWithOutcome(
+        contentKey: String,
+        isMovie: Boolean,
+        seasonNumber: Int = 1,
+        episodeNumber: Int = 1,
+        catalogEpisodeId: String? = null,
+        preferServer: Boolean = false,
+        requirePlayableUrl: Boolean = false
+    ): ScopeReadOutcome {
+        val store = resolveCloudStore() ?: return ScopeReadOutcome(
+            data = null,
+            status = ScopeReadStatus.UNAVAILABLE,
+            message = "Firestore instance unavailable.",
+            isHardError = true
+        )
         val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
         val scopeDocPath = scopePath(contentKey, isMovie, seasonNumber, episodeNumber)
 
@@ -155,12 +287,24 @@ class FirestoreStreamingRepository(
                 readScopeSnapshot(store, scopeDocPath, scopeKey, contentKey, isMovie, seasonNumber, episodeNumber, catalogEpisodeId, preferCache = true)
             }.getOrNull()
             MonotonicMetrics.recordDuration("firestore_cache_read_ms", cacheStarted, "hit=${cacheResult != null}")
-            if (cacheResult != null && cacheResult.sources.any {
-                    it.status != "REMOVED" && SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
-                        !SourceExpiryTime.isExpired(it.expiresAt)
-                }) {
-                return cacheResult
+            val cacheHasValidUrl = cacheResult != null && cacheResult.sources.any {
+                it.status != "REMOVED" && it.deletedAt == null &&
+                    SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
+                    !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
             }
+            if (cacheHasValidUrl) {
+                return ScopeReadOutcome(data = cacheResult, status = ScopeReadStatus.HIT)
+            }
+        }
+
+        val cooldownRemaining = FirestoreRequestGuard.cooldownRemainingMs()
+        if (cooldownRemaining > 0L) {
+            return ScopeReadOutcome(
+                data = null,
+                status = ScopeReadStatus.QUOTA_EXCEEDED,
+                message = "Firestore quota cooldown active (${(cooldownRemaining + 999L) / 1000L}s remaining).",
+                isHardError = true
+            )
         }
 
         // 2. Firestore server fetch (bounded timeout so unresponsive Firestore never stalls source discovery)
@@ -172,21 +316,41 @@ class FirestoreStreamingRepository(
                 )
             }
             MonotonicMetrics.recordDuration("firestore_server_fetch_ms", serverStarted, "found=${data != null}")
-            data
+            if (data == null) {
+                ScopeReadOutcome(data = null, status = ScopeReadStatus.NOT_FOUND)
+            } else if (requirePlayableUrl && data.sources.none {
+                    it.status != "REMOVED" && it.deletedAt == null &&
+                        SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
+                        !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
+                }
+            ) {
+                ScopeReadOutcome(data = data, status = ScopeReadStatus.CACHE_MISS)
+            } else {
+                ScopeReadOutcome(data = data, status = ScopeReadStatus.HIT)
+            }
         } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
             MonotonicMetrics.recordDuration("firestore_server_fetch_ms", serverStarted, "error=TIMEOUT")
             Log.w(TAG, "Firestore read timed out after 4000ms; falling back to Room/Backend")
-            null
+            ScopeReadOutcome(data = null, status = ScopeReadStatus.TIMEOUT, message = "Firestore read timed out", isHardError = true)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: FirestoreOperationException) {
             MonotonicMetrics.recordDuration("firestore_server_fetch_ms", serverStarted, "error=${error.category.name}")
             Log.w(TAG, "Firestore read skipped (${error.category.name}): ${error.message}")
-            null
+            val status = when (error.category) {
+                FirestoreFailureCategory.RESOURCE_EXHAUSTED -> ScopeReadStatus.QUOTA_EXCEEDED
+                FirestoreFailureCategory.PERMISSION_DENIED -> ScopeReadStatus.PERMISSION_DENIED
+                FirestoreFailureCategory.UNAUTHENTICATED -> ScopeReadStatus.UNAUTHENTICATED
+                FirestoreFailureCategory.DEADLINE_EXCEEDED -> ScopeReadStatus.TIMEOUT
+                FirestoreFailureCategory.NETWORK_ERROR -> ScopeReadStatus.NETWORK_ERROR
+                FirestoreFailureCategory.UNAVAILABLE -> ScopeReadStatus.UNAVAILABLE
+                FirestoreFailureCategory.UNKNOWN_ERROR -> ScopeReadStatus.FAILED
+            }
+            ScopeReadOutcome(data = null, status = status, message = error.message, isHardError = true)
         } catch (error: Exception) {
             MonotonicMetrics.recordDuration("firestore_server_fetch_ms", serverStarted, "error=UNKNOWN")
             Log.w(TAG, "Firestore read failed cleanly: ${error.message}")
-            null
+            ScopeReadOutcome(data = null, status = ScopeReadStatus.FAILED, message = error.message, isHardError = true)
         }
     }
 
@@ -439,9 +603,21 @@ class FirestoreStreamingRepository(
             if (isMovie) movieProviderPath(contentKey, it.providerId) else animeProviderPath(contentKey, seasonNumber, episodeNumber, it.providerId)
         } ?: scopePath(contentKey, isMovie, seasonNumber, episodeNumber)
 
+        val discoveryOutboxKey = "discovery:${ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)}"
         val startedAt = System.currentTimeMillis()
         val store = resolveCloudStore()
         if (store == null) {
+            val reason = "Firestore instance unavailable."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            outboxMap()[discoveryOutboxKey] = PendingOutboxWrite.Discovery(
+                key = discoveryOutboxKey, contentKey = contentKey, anilistId = anilistId, isMovie = isMovie,
+                backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
+                catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
+                seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
+                seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
+            )
             recordWriteAudit(
                 operation = op,
                 contentType = contentType,
@@ -455,7 +631,7 @@ class FirestoreStreamingRepository(
                 targetPath = primaryTargetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = "Firestore instance unavailable.",
+                failureReason = reason,
                 firebaseErrorCode = null
             )
             return false
@@ -463,6 +639,15 @@ class FirestoreStreamingRepository(
         if (!isClientWriteAuthorized()) {
             val reason = "Firestore write deferred: client is unauthenticated (zero-trust rules require signed-in account)."
             lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_UNAUTHENTICATED, reason, "UNAUTHENTICATED")
+            outboxMap()[discoveryOutboxKey] = PendingOutboxWrite.Discovery(
+                key = discoveryOutboxKey, contentKey = contentKey, anilistId = anilistId, isMovie = isMovie,
+                backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
+                catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
+                seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
+                seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
+            )
             recordWriteAudit(
                 operation = op,
                 contentType = contentType,
@@ -506,6 +691,8 @@ class FirestoreStreamingRepository(
         return try {
             store.commitBatch("publish_stream_discovery", writes)
             lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            outboxMap().remove(discoveryOutboxKey)
             if (sources.isEmpty()) {
                 recordWriteAudit(
                     operation = op,
@@ -545,6 +732,18 @@ class FirestoreStreamingRepository(
         } catch (error: FirestoreOperationException) {
             val code = extractFirebaseErrorCode(error) ?: error.category.name
             val msg = handleWriteFailure("publish_stream_discovery", error)
+            if (shouldQueueForRetry(error.category)) {
+                outboxMap()[discoveryOutboxKey] = PendingOutboxWrite.Discovery(
+                    key = discoveryOutboxKey, contentKey = contentKey, anilistId = anilistId, isMovie = isMovie,
+                    backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
+                    catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
+                    seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
+                    seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                    discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
+                )
+            } else {
+                outboxMap().remove(discoveryOutboxKey)
+            }
             recordWriteAudit(
                 operation = op,
                 contentType = contentType,
@@ -566,6 +765,15 @@ class FirestoreStreamingRepository(
             val code = extractFirebaseErrorCode(error)
             val msg = "Firestore publish skipped cleanly: ${error.message}"
             lastWriteRejectionReason = msg
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_OFFLINE_OR_TRANSIENT, msg, code)
+            outboxMap()[discoveryOutboxKey] = PendingOutboxWrite.Discovery(
+                key = discoveryOutboxKey, contentKey = contentKey, anilistId = anilistId, isMovie = isMovie,
+                backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
+                catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
+                seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
+                seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
+            )
             recordWriteAudit(
                 operation = op,
                 contentType = contentType,
@@ -607,13 +815,34 @@ class FirestoreStreamingRepository(
         backendId: String? = null,
         anilistId: Int? = contentKey.toIntOrNull()
     ): Boolean {
-        if (!SafePlaybackHeaders.isValidStreamUrl(streamUrl)) return false
+        val normalizedStreamUrl = streamUrl.trim()
+        if (sourceEntity.providerId.isBlank() || sourceEntity.sourceId.isBlank()) {
+            val reason = "Resolved stream publication rejected: provider/source identity is blank."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            Log.e(TAG, "$reason sourceDocKey=${sourceEntity.sourceDocKey}")
+            return false
+        }
+        if (!SafePlaybackHeaders.isValidStreamUrl(normalizedStreamUrl)) {
+            val reason = "Resolved stream publication rejected: playback URL is invalid."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            Log.w(TAG, "$reason provider=${sourceEntity.providerId} source=${sourceEntity.sourceId}")
+            return false
+        }
+        if (SourceExpiryTime.isExpiredOrInvalid(expiresAt)) {
+            val reason = "Resolved stream publication rejected: playback URL expiry is invalid or expired."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            Log.w(TAG, "$reason provider=${sourceEntity.providerId} source=${sourceEntity.sourceId}")
+            return false
+        }
         val existing = streamCacheDao.getAllSources(sourceEntity.scopeKey)
             .firstOrNull { it.sourceDocKey == sourceEntity.sourceDocKey }
         val nextVersion = maxOf(sourceEntity.version, existing?.version ?: 0L) + 1L
         val sanitizedJson = SafePlaybackHeaders.toJson(safeHeaders)
         val updatedEntity = sourceEntity.copy(
-            streamUrl = streamUrl,
+            streamUrl = normalizedStreamUrl,
             urlType = urlType,
             contentType = contentType ?: sourceEntity.contentType,
             safeHeadersJson = sanitizedJson,
@@ -632,10 +861,32 @@ class FirestoreStreamingRepository(
         val contentTypeLabel = if (isMovie) "MOVIE" else "ANIME"
         val seasonIdStr = if (isMovie) null else ContentIdentityHelper.seasonId(seasonNumber)
         val episodeIdStr = if (isMovie) null else ContentIdentityHelper.episodeId(episodeNumber)
+        val urlOutboxKey = "resolved:${updatedEntity.sourceDocKey}"
         val startedAt = System.currentTimeMillis()
+        val pendingResolved = PendingOutboxWrite.ResolvedUrl(
+            key = urlOutboxKey,
+            sourceEntity = updatedEntity,
+            contentKey = contentKey,
+            isMovie = isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            streamUrl = normalizedStreamUrl,
+            urlType = urlType,
+            contentType = contentType,
+            safeHeaders = safeHeaders,
+            expiresAt = expiresAt,
+            verifiedAt = verifiedAt,
+            canonicalTitle = resolvedTitle,
+            backendId = resolvedBackendId,
+            anilistId = anilistId
+        )
 
         val store = resolveCloudStore()
         if (store == null) {
+            val reason = "Firestore instance unavailable."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            outboxMap()[urlOutboxKey] = pendingResolved
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -649,7 +900,7 @@ class FirestoreStreamingRepository(
                 targetPath = targetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = "Firestore instance unavailable.",
+                failureReason = reason,
                 firebaseErrorCode = null
             )
             return false
@@ -657,6 +908,8 @@ class FirestoreStreamingRepository(
         if (!isClientWriteAuthorized()) {
             val reason = "Stream URL shared write deferred: unauthenticated session."
             lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_UNAUTHENTICATED, reason, "UNAUTHENTICATED")
+            outboxMap()[urlOutboxKey] = pendingResolved
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -708,6 +961,14 @@ class FirestoreStreamingRepository(
                 Unit to (parentWrites + sourceWrite)
             }
             lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            outboxMap().remove(urlOutboxKey)
+            Log.i(
+                TAG,
+                "Firestore UPDATE succeeded operation=publish_resolved_url " +
+                    "path=$targetPath provider=${updatedEntity.providerId} source=${updatedEntity.sourceId} " +
+                    "status=${StreamRecordStatus.AVAILABLE.name}"
+            )
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -727,6 +988,12 @@ class FirestoreStreamingRepository(
             throw cancelled
         } catch (error: FirestoreOperationException) {
             val msg = handleWriteFailure("publish_resolved_url", error)
+            Log.e(TAG, "Firestore UPDATE failed operation=publish_resolved_url path=$targetPath: $msg", error)
+            if (shouldQueueForRetry(error.category)) {
+                outboxMap()[urlOutboxKey] = pendingResolved
+            } else {
+                outboxMap().remove(urlOutboxKey)
+            }
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -745,8 +1012,12 @@ class FirestoreStreamingRepository(
             )
             false
         } catch (error: Exception) {
+            val code = extractFirebaseErrorCode(error)
             val msg = "Failed to share resolved URL to Firestore (Room preserved): ${error.message}"
+            Log.e(TAG, "Firestore UPDATE failed operation=publish_resolved_url path=$targetPath: $msg", error)
             lastWriteRejectionReason = msg
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_OFFLINE_OR_TRANSIENT, msg, code)
+            outboxMap()[urlOutboxKey] = pendingResolved
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -761,7 +1032,7 @@ class FirestoreStreamingRepository(
                 startedAtMs = startedAt,
                 success = false,
                 failureReason = msg,
-                firebaseErrorCode = extractFirebaseErrorCode(error)
+                firebaseErrorCode = code
             )
             false
         }
@@ -776,6 +1047,15 @@ class FirestoreStreamingRepository(
         canonicalTitle: String? = null,
         backendId: String? = null
     ): Boolean {
+        if (!SafePlaybackHeaders.isValidStreamUrl(sourceEntity.streamUrl) ||
+            SourceExpiryTime.isExpiredOrInvalid(sourceEntity.expiresAt)
+        ) {
+            val reason = "Playback success ignored: source has no valid, unexpired stream URL."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            Log.w(TAG, "$reason provider=${sourceEntity.providerId} source=${sourceEntity.sourceId}")
+            return false
+        }
         val now = System.currentTimeMillis()
         streamCacheDao.upsertSource(
             sourceEntity.copy(
@@ -790,9 +1070,31 @@ class FirestoreStreamingRepository(
         val seasonIdStr = if (isMovie) null else ContentIdentityHelper.seasonId(seasonNumber)
         val episodeIdStr = if (isMovie) null else ContentIdentityHelper.episodeId(episodeNumber)
         val startedAt = System.currentTimeMillis()
+        val outboxKey = "playback_success:${sourceEntity.sourceDocKey}"
+        val pendingSuccess = PendingOutboxWrite.PlaybackSuccess(
+            key = outboxKey,
+            sourceEntity = sourceEntity,
+            contentKey = contentKey,
+            isMovie = isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            canonicalTitle = canonicalTitle,
+            backendId = backendId
+        )
 
-        val store = resolveCloudStore() ?: return false
+        val store = resolveCloudStore()
+        if (store == null) {
+            val reason = "Firestore instance unavailable."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            outboxMap()[outboxKey] = pendingSuccess
+            return false
+        }
         if (!isClientWriteAuthorized()) {
+            val reason = "Playback success sync deferred: unauthenticated session."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_UNAUTHENTICATED, reason, "UNAUTHENTICATED")
+            outboxMap()[outboxKey] = pendingSuccess
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -806,7 +1108,7 @@ class FirestoreStreamingRepository(
                 targetPath = targetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = "Playback success sync deferred: unauthenticated session.",
+                failureReason = reason,
                 firebaseErrorCode = "UNAUTHENTICATED"
             )
             return false
@@ -825,6 +1127,9 @@ class FirestoreStreamingRepository(
                     "updated_at" to now
                 )
             )
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            outboxMap().remove(outboxKey)
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -844,6 +1149,11 @@ class FirestoreStreamingRepository(
             throw cancelled
         } catch (error: FirestoreOperationException) {
             val msg = handleWriteFailure("record_playback_success", error)
+            if (shouldQueueForRetry(error.category)) {
+                outboxMap()[outboxKey] = pendingSuccess
+            } else {
+                outboxMap().remove(outboxKey)
+            }
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -862,6 +1172,11 @@ class FirestoreStreamingRepository(
             )
             false
         } catch (error: Exception) {
+            val code = extractFirebaseErrorCode(error)
+            val msg = error.message ?: "Unknown write error"
+            lastWriteRejectionReason = msg
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_OFFLINE_OR_TRANSIENT, msg, code)
+            outboxMap()[outboxKey] = pendingSuccess
             recordWriteAudit(
                 operation = FirestoreWriteOperation.UPDATE,
                 contentType = contentTypeLabel,
@@ -875,8 +1190,8 @@ class FirestoreStreamingRepository(
                 targetPath = targetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = error.message ?: "Unknown write error",
-                firebaseErrorCode = extractFirebaseErrorCode(error)
+                failureReason = msg,
+                firebaseErrorCode = code
             )
             false
         }
@@ -903,9 +1218,31 @@ class FirestoreStreamingRepository(
         val seasonIdStr = if (isMovie) null else ContentIdentityHelper.seasonId(seasonNumber)
         val episodeIdStr = if (isMovie) null else ContentIdentityHelper.episodeId(episodeNumber)
         val startedAt = System.currentTimeMillis()
+        val outboxKey = "soft_delete:${sourceEntity.sourceDocKey}"
+        val pendingDelete = PendingOutboxWrite.SoftDelete(
+            key = outboxKey,
+            sourceEntity = sourceEntity,
+            contentKey = contentKey,
+            isMovie = isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            canonicalTitle = canonicalTitle,
+            backendId = backendId
+        )
 
-        val store = resolveCloudStore() ?: return false
+        val store = resolveCloudStore()
+        if (store == null) {
+            val reason = "Firestore instance unavailable."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
+            outboxMap()[outboxKey] = pendingDelete
+            return false
+        }
         if (!isClientWriteAuthorized()) {
+            val reason = "Soft delete write deferred: unauthenticated session."
+            lastWriteRejectionReason = reason
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_UNAUTHENTICATED, reason, "UNAUTHENTICATED")
+            outboxMap()[outboxKey] = pendingDelete
             recordWriteAudit(
                 operation = FirestoreWriteOperation.REMOVE,
                 contentType = contentTypeLabel,
@@ -919,7 +1256,7 @@ class FirestoreStreamingRepository(
                 targetPath = targetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = "Soft delete write deferred: unauthenticated session.",
+                failureReason = reason,
                 firebaseErrorCode = "UNAUTHENTICATED"
             )
             return false
@@ -938,6 +1275,9 @@ class FirestoreStreamingRepository(
                     "version" to nextVersion
                 )
             )
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            outboxMap().remove(outboxKey)
             recordWriteAudit(
                 operation = FirestoreWriteOperation.REMOVE,
                 contentType = contentTypeLabel,
@@ -957,6 +1297,11 @@ class FirestoreStreamingRepository(
             throw cancelled
         } catch (error: FirestoreOperationException) {
             val msg = handleWriteFailure("soft_delete_source", error)
+            if (shouldQueueForRetry(error.category)) {
+                outboxMap()[outboxKey] = pendingDelete
+            } else {
+                outboxMap().remove(outboxKey)
+            }
             recordWriteAudit(
                 operation = FirestoreWriteOperation.REMOVE,
                 contentType = contentTypeLabel,
@@ -975,6 +1320,11 @@ class FirestoreStreamingRepository(
             )
             false
         } catch (error: Exception) {
+            val code = extractFirebaseErrorCode(error)
+            val msg = error.message ?: "Unknown write error"
+            lastWriteRejectionReason = msg
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.DEFERRED_OFFLINE_OR_TRANSIENT, msg, code)
+            outboxMap()[outboxKey] = pendingDelete
             recordWriteAudit(
                 operation = FirestoreWriteOperation.REMOVE,
                 contentType = contentTypeLabel,
@@ -988,8 +1338,8 @@ class FirestoreStreamingRepository(
                 targetPath = targetPath,
                 startedAtMs = startedAt,
                 success = false,
-                failureReason = error.message ?: "Unknown write error",
-                firebaseErrorCode = extractFirebaseErrorCode(error)
+                failureReason = msg,
+                firebaseErrorCode = code
             )
             false
         }
@@ -1549,6 +1899,87 @@ class FirestoreStreamingRepository(
         }
     }
 
+    private fun shouldQueueForRetry(category: FirestoreFailureCategory): Boolean = when (category) {
+        FirestoreFailureCategory.UNAUTHENTICATED,
+        FirestoreFailureCategory.UNAVAILABLE,
+        FirestoreFailureCategory.DEADLINE_EXCEEDED,
+        FirestoreFailureCategory.NETWORK_ERROR,
+        FirestoreFailureCategory.RESOURCE_EXHAUSTED -> true
+        FirestoreFailureCategory.PERMISSION_DENIED,
+        FirestoreFailureCategory.UNKNOWN_ERROR -> false
+    }
+
+    suspend fun flushPendingOutbox(): Int {
+        val outbox = outboxMap()
+        if (outbox.isEmpty()) return 0
+        if (!isClientWriteAuthorized() || resolveCloudStore() == null) return 0
+        if (FirestoreRequestGuard.cooldownRemainingMs() > 0L) return 0
+
+        var flushed = 0
+        val snapshot = outbox.entries.toList()
+        for ((key, item) in snapshot) {
+            if (FirestoreRequestGuard.cooldownRemainingMs() > 0L) break
+            val succeeded = when (item) {
+                is PendingOutboxWrite.Discovery -> publishDiscoveryAndSyncRoom(
+                    contentKey = item.contentKey,
+                    anilistId = item.anilistId,
+                    isMovie = item.isMovie,
+                    backendId = item.backendId,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    catalogEpisodeId = item.catalogEpisodeId,
+                    backendEpisodeId = item.backendEpisodeId,
+                    seasonCount = item.seasonCount,
+                    totalEpisodeCount = item.totalEpisodeCount,
+                    seasonEpisodeCount = item.seasonEpisodeCount,
+                    providers = item.providers,
+                    sources = item.sources,
+                    discoveryStatus = item.discoveryStatus,
+                    canonicalTitle = item.canonicalTitle
+                )
+                is PendingOutboxWrite.ResolvedUrl -> publishResolvedStreamUrl(
+                    sourceEntity = item.sourceEntity,
+                    contentKey = item.contentKey,
+                    isMovie = item.isMovie,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    streamUrl = item.streamUrl,
+                    urlType = item.urlType,
+                    contentType = item.contentType,
+                    safeHeaders = item.safeHeaders,
+                    expiresAt = item.expiresAt,
+                    verifiedAt = item.verifiedAt,
+                    canonicalTitle = item.canonicalTitle,
+                    backendId = item.backendId,
+                    anilistId = item.anilistId
+                )
+                is PendingOutboxWrite.PlaybackSuccess -> recordPlaybackSuccess(
+                    sourceEntity = item.sourceEntity,
+                    contentKey = item.contentKey,
+                    isMovie = item.isMovie,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    canonicalTitle = item.canonicalTitle,
+                    backendId = item.backendId
+                )
+                is PendingOutboxWrite.SoftDelete -> softDeleteSource(
+                    sourceEntity = item.sourceEntity,
+                    contentKey = item.contentKey,
+                    isMovie = item.isMovie,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    canonicalTitle = item.canonicalTitle,
+                    backendId = item.backendId
+                )
+            }
+            if (succeeded) {
+                outbox.remove(key)
+                flushed++
+            }
+        }
+        return flushed
+    }
+
     private fun handleWriteFailure(operation: String, error: FirestoreOperationException): String {
         val code = extractFirebaseErrorCode(error) ?: error.category.name
         val msg = when (error.category) {
@@ -1557,7 +1988,17 @@ class FirestoreStreamingRepository(
                 "Firestore $operation rejected by security rules ($code): ${error.cause?.message ?: "missing rule or authorized role on backend."}"
             else -> "Firestore $operation failed ($code): ${error.cause?.message ?: error.message}"
         }
+        val state = when (error.category) {
+            FirestoreFailureCategory.PERMISSION_DENIED -> WriteOutcomeState.REJECTED_PERMISSION
+            FirestoreFailureCategory.UNAUTHENTICATED -> WriteOutcomeState.DEFERRED_UNAUTHENTICATED
+            FirestoreFailureCategory.RESOURCE_EXHAUSTED -> WriteOutcomeState.QUOTA_COOLDOWN
+            FirestoreFailureCategory.UNAVAILABLE,
+            FirestoreFailureCategory.DEADLINE_EXCEEDED,
+            FirestoreFailureCategory.NETWORK_ERROR -> WriteOutcomeState.DEFERRED_OFFLINE_OR_TRANSIENT
+            FirestoreFailureCategory.UNKNOWN_ERROR -> WriteOutcomeState.FAILED
+        }
         lastWriteRejectionReason = msg
+        lastWriteOutcome = WriteOutcome(state, msg, code)
         runCatching { Log.w(TAG, msg) }
         return msg
     }

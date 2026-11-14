@@ -33,6 +33,7 @@ class AppAnalytics private constructor(private val context: Context) {
 
                 val user = AuthManager.getInstance(context).currentUser ?: return@launch
                 val installation = InstallationManager.getInstance(context)
+                if (!installation.ensureInstallationSynced()) return@launch
                 val eventDoc = hashMapOf<String, Any>(
                     "event_name" to eventName,
                     "installation_id" to installation.installationId,

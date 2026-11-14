@@ -36,7 +36,8 @@ data class VerifiedEpisodePlayback(
     val source: ProphecySourceDto,
     val directData: DirectPlayData,
     val candidates: List<ProphecySourceDto>,
-    val cacheTier: String = "BACKEND_RESOLVE"
+    val cacheTier: String = "BACKEND_RESOLVE",
+    val resolveDurationMs: Long = 0L
 )
 
 suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
@@ -80,7 +81,8 @@ suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
                         source = resolved.source,
                         directData = resolved.directData,
                         candidates = resolved.candidates,
-                        cacheTier = resolved.cacheTier
+                        cacheTier = resolved.cacheTier,
+                        resolveDurationMs = resolved.resolveDurationMs
                     )
                 )
             }

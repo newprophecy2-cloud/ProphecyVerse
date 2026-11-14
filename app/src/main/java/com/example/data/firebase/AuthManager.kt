@@ -120,9 +120,13 @@ class AuthManager private constructor(private val context: Context) {
             if (error != null) {
                 val category = FirestoreRequestGuard.recordListenerFailure(error)
                 Log.w(TAG, "User profile listener failed ($category): ${error.message}")
-                userDocListener?.remove()
-                userDocListener = null
-                _authState.value = AuthState.Error("Unable to verify account profile ($category). Retry when the service is available.")
+                if (category == FirestoreFailureCategory.RESOURCE_EXHAUSTED || category == FirestoreFailureCategory.PERMISSION_DENIED) {
+                    userDocListener?.remove()
+                    userDocListener = null
+                }
+                if (_authState.value !is AuthState.Authenticated && _authState.value !is AuthState.Suspended) {
+                    _authState.value = AuthState.Error("Unable to verify account profile ($category). Retry when the service is available.")
+                }
                 return@addSnapshotListener
             }
 
@@ -177,7 +181,7 @@ class AuthManager private constructor(private val context: Context) {
             val user = auth.currentUser ?: auth.signInAnonymously().await().user
                 ?: throw IllegalStateException("Anonymous sign-in returned no user")
             updateAuthState(user)
-            InstallationManager.getInstance(context).initializeAndSync()
+            InstallationManager.getInstance(context).initializeAndSyncSuspend()
             Result.success(Unit)
         } catch (e: Exception) {
             _authState.value = AuthState.Guest(currentUid)
@@ -197,7 +201,7 @@ class AuthManager private constructor(private val context: Context) {
             }
             val user = result.user ?: throw IllegalStateException("Registration returned null user")
             updateAuthState(user)
-            InstallationManager.getInstance(context).initializeAndSync()
+            InstallationManager.getInstance(context).initializeAndSyncSuspend()
             AppAnalytics.getInstance(context).logEvent("register_success")
             Result.success(user)
         } catch (e: Exception) {
@@ -212,7 +216,7 @@ class AuthManager private constructor(private val context: Context) {
             val result = auth.signInWithEmailAndPassword(normalizedEmail, pass).await()
             val user = result.user ?: throw IllegalStateException("Login returned null user")
             updateAuthState(user)
-            InstallationManager.getInstance(context).initializeAndSync()
+            InstallationManager.getInstance(context).initializeAndSyncSuspend()
             AppAnalytics.getInstance(context).logEvent("login_success")
             Result.success(user)
         } catch (e: Exception) {
@@ -244,7 +248,7 @@ class AuthManager private constructor(private val context: Context) {
                     null
                 }
                 updateAuthState(guest)
-                InstallationManager.getInstance(context).initializeAndSync()
+                InstallationManager.getInstance(context).initializeAndSyncSuspend()
             } catch (e: Exception) {
                 Log.e(TAG, "Sign out error", e)
                 _authState.value = AuthState.Guest(currentUid)

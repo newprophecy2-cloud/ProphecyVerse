@@ -105,9 +105,9 @@ abstract class AppDatabase : RoomDatabase() {
                         `positionMs` INTEGER NOT NULL,
                         `durationMs` INTEGER NOT NULL,
                         `completed` INTEGER NOT NULL,
-                        `animeTitle` TEXT,
-                        `posterUrl` TEXT,
-                        `mediaType` TEXT,
+                        `animeTitle` TEXT DEFAULT NULL,
+                        `posterUrl` TEXT DEFAULT NULL,
+                        `mediaType` TEXT DEFAULT NULL,
                         `lastPlayedAt` INTEGER NOT NULL,
                         PRIMARY KEY(`id`)
                     )

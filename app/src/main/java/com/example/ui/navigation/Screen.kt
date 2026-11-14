@@ -11,12 +11,12 @@ sealed class Screen(val route: String, val title: String) {
 
     data object Detail : Screen("detail/{animeId}?seasonNumber={seasonNumber}", "Detail") {
         fun createRoute(animeId: String, seasonNumber: Int? = null): String =
-            "detail/$animeId" + (seasonNumber?.let { "?seasonNumber=$it" } ?: "")
+            "detail/${android.net.Uri.encode(animeId)}" + (seasonNumber?.let { "?seasonNumber=$it" } ?: "")
     }
 
     data object Player : Screen("player/{animeId}/{episodeId}?preferredSourceId={preferredSourceId}", "Player") {
         fun createRoute(animeId: String, episodeId: String, preferredSourceId: String? = null): String {
-            val route = "player/$animeId/$episodeId"
+            val route = "player/${android.net.Uri.encode(animeId)}/${android.net.Uri.encode(episodeId)}"
             return if (preferredSourceId.isNullOrBlank()) route
             else "$route?preferredSourceId=${android.net.Uri.encode(preferredSourceId)}"
         }

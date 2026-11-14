@@ -26,6 +26,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 
@@ -39,6 +40,7 @@ class DownloadManager private constructor(private val context: Context) {
 
     // Track active jobs in memory
     private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val activeDownloadIds = ConcurrentHashMap.newKeySet<String>()
 
     // Ephemeral download progress state for live UI observation
     data class LiveProgress(
@@ -89,7 +91,7 @@ class DownloadManager private constructor(private val context: Context) {
         preferredLanguage: String? = null,
         preferredSourceId: String? = null
     ) {
-        if (activeJobs.containsKey(episodeId)) {
+        if (!activeDownloadIds.add(episodeId)) {
             Log.d(TAG, "Download already active for episode: $episodeId")
             return
         }
@@ -192,7 +194,19 @@ class DownloadManager private constructor(private val context: Context) {
                         preferredSourceId = preferredSourceId
                     )
                 }
-                val verified = resolutionResult.getOrNull()
+                var verified = resolutionResult.getOrNull()
+                if (verified != null &&
+                    (!com.example.data.streaming.SafePlaybackHeaders.isValidStreamUrl(verified.directData.playbackUrl) ||
+                        com.example.data.repository.SourceExpiryTime.isExpiredOrInvalid(verified.directData.expiresAt))
+                ) {
+                    Log.w(TAG, "Resolved download URL was invalid or expired; forcing a fresh resolution for $episodeId")
+                    verified = repository.resolveVerifiedPlaybackForEpisode(
+                        animeId,
+                        episode,
+                        preferredSourceId = preferredSourceId,
+                        forceResolveFresh = true
+                    ).getOrNull()
+                }
                 if (verified == null) {
                     downloadDao.upsertDownload(
                         existing.copy(
@@ -219,7 +233,9 @@ class DownloadManager private constructor(private val context: Context) {
                 )
                 downloadDao.upsertDownload(existing)
 
-                if (targetUrl.isBlank()) {
+                if (!com.example.data.streaming.SafePlaybackHeaders.isValidStreamUrl(targetUrl) ||
+                    com.example.data.repository.SourceExpiryTime.isExpiredOrInvalid(playData.expiresAt)
+                ) {
                     downloadDao.upsertDownload(
                         existing.copy(
                             downloadStatus = "FAILED",
@@ -257,9 +273,10 @@ class DownloadManager private constructor(private val context: Context) {
                         )
                     )
                 }
-            } finally {
-                activeJobs.remove(episodeId)
-                removeLiveProgress(episodeId)
+        } finally {
+            activeJobs.remove(episodeId)
+            activeDownloadIds.remove(episodeId)
+            removeLiveProgress(episodeId)
                 refreshStorageStats()
             }
         }
@@ -268,6 +285,36 @@ class DownloadManager private constructor(private val context: Context) {
     }
 
     private suspend fun executeDownloadLoop(
+        episodeId: String,
+        url: String,
+        headers: List<List<String>>,
+        tempFile: File,
+        finalFile: File,
+        entry: DownloadEntry,
+        protocolHint: String?
+    ) {
+        var attempt = 0
+        while (true) {
+            try {
+                executeDownloadAttempt(episodeId, url, headers, tempFile, finalFile, entry, protocolHint)
+                return
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (interrupted: IOException) {
+                if (attempt >= MAX_INTERRUPTED_RETRIES) throw interrupted
+                attempt++
+                Log.w(
+                    TAG,
+                    "Download interrupted for $episodeId; resuming from temp file " +
+                        "(attempt $attempt/$MAX_INTERRUPTED_RETRIES)",
+                    interrupted
+                )
+                delay(RETRY_DELAY_MS * attempt)
+            }
+        }
+    }
+
+    private suspend fun executeDownloadAttempt(
         episodeId: String,
         url: String,
         headers: List<List<String>>,
@@ -572,6 +619,8 @@ class DownloadManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "DownloadManager"
+        private const val MAX_INTERRUPTED_RETRIES = 2
+        private const val RETRY_DELAY_MS = 1_000L
 
         @Volatile
         private var INSTANCE: DownloadManager? = null

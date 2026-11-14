@@ -401,9 +401,13 @@ fun ProfileScreen(
                                 onClick = {
                                     isSyncingCloud = true
                                     scope.launch {
-                                        CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist()
+                                        val synced = CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist(force = true)
                                         isSyncingCloud = false
-                                        Toast.makeText(context, "Watch history & library synced with cloud!", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(
+                                            context,
+                                            if (synced) "Watch history & library synced with cloud!" else "Cloud sync failed. Local progress preserved.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
                                     }
                                 },
                                 enabled = !isSyncingCloud,

@@ -313,9 +313,13 @@ fun AccountDialog(
                             onClick = {
                                 isSyncing = true
                                 scope.launch {
-                                    CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist()
+                                    val synced = CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist(force = true)
                                     isSyncing = false
-                                    Toast.makeText(context, "Cloud history & watchlist synchronized!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(
+                                        context,
+                                        if (synced) "Cloud history & watchlist synchronized!" else "Cloud sync failed. Local data preserved.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
                                 }
                             },
                             enabled = !isSyncing,
@@ -573,9 +577,9 @@ fun AccountDialog(
                                     } else {
                                         authManager.registerWithEmail(email, password)
                                     }
-                                    isLoading = false
                                     if (res.isSuccess) {
-                                        CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist()
+                                        CloudHistoryRepository.getInstance(context).pullCloudHistoryAndWatchlist(force = true)
+                                        isLoading = false
 
                                         val pending = authManager.pendingDownload.value
                                         if (pending != null) {
@@ -599,6 +603,7 @@ fun AccountDialog(
                                         }
                                         onDismissRequest()
                                     } else {
+                                        isLoading = false
                                         val exMsg = res.exceptionOrNull()?.localizedMessage ?: "Authentication failed."
                                         errorMessage = when {
                                             exMsg.contains("email address is already in use", ignoreCase = true) ->

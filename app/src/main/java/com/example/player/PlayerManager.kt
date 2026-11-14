@@ -87,12 +87,19 @@ class PlayerManager(
     private val _activeAudioDecoder = MutableStateFlow<String?>(null)
     val activeAudioDecoder: StateFlow<String?> = _activeAudioDecoder.asStateFlow()
 
+    private val _playbackDiagnostics = MutableStateFlow(PlaybackDiagnostics())
+    val playbackDiagnostics: StateFlow<PlaybackDiagnostics> = _playbackDiagnostics.asStateFlow()
+
     fun clearTrackSelections() {
         _availableAudioTracks.value = emptyList()
         _availableSubtitles.value = emptyList()
         _availableQualities.value = emptyList()
         _activeAudioDecoder.value = null
         _videoResolution.value = null
+        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+            videoResolution = null,
+            activeAudioDecoder = null
+        )
     }
 
     private val _videoResolution = MutableStateFlow<String?>(null)
@@ -131,13 +138,27 @@ class PlayerManager(
         HTTP, NETWORK_TIMEOUT, NETWORK, CONTENT_TYPE, CONTAINER, AUDIO_DECODER, DECODER, MANIFEST, OTHER
     }
 
+    data class PlaybackDiagnostics(
+        val providerName: String? = null,
+        val sourceQuality: String? = null,
+        val urlType: String? = null,
+        val contentType: String? = null,
+        val resolveDurationMs: Long = 0L,
+        val videoResolution: String? = null,
+        val activeAudioDecoder: String? = null,
+        val failureCategory: PlaybackFailureCategory? = null,
+        val lastErrorMessage: String? = null
+    )
+
     fun initializePlayer(
         directData: DirectPlayData,
         startPositionMs: Long = 0L,
         onPlaybackFailed: (() -> Unit)? = null,
         onRetryNeeded: () -> Unit,
         providerName: String? = null,
-        sessionIdentity: PlaybackSessionIdentity? = null
+        sessionIdentity: PlaybackSessionIdentity? = null,
+        sourceQuality: String? = null,
+        resolveDurationMs: Long = 0L
     ): ExoPlayer {
         release()
         val generation = playbackGeneration
@@ -151,6 +172,13 @@ class PlayerManager(
         _duration.value = 0L
         _currentPosition.value = startPositionMs
         val providerDiagnostic = providerName?.replace(Regex("[\\r\\n\\t]"), " ")?.take(64) ?: "unknown"
+        _playbackDiagnostics.value = PlaybackDiagnostics(
+            providerName = providerDiagnostic,
+            sourceQuality = sourceQuality,
+            urlType = directData.urlType,
+            contentType = directData.contentType,
+            resolveDurationMs = resolveDurationMs.coerceAtLeast(0L)
+        )
         Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
         // Build safe HTTP DataSource with response-authorized headers
@@ -312,6 +340,7 @@ class PlayerManager(
             ) {
                 Log.i(TAG, "Audio decoder initialized: $decoderName init_ms=${initializationDurationMs} provider=$providerDiagnostic")
                 _activeAudioDecoder.value = decoderName
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderName)
             }
         })
 
@@ -387,7 +416,9 @@ class PlayerManager(
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 if (generation != playbackGeneration || player !== exoPlayer) return
                 if (videoSize.height > 0) {
-                    _videoResolution.value = "${videoSize.height}p"
+                    val resolution = "${videoSize.height}p"
+                    _videoResolution.value = resolution
+                    _playbackDiagnostics.value = _playbackDiagnostics.value.copy(videoResolution = resolution)
                     Log.i(TAG, "media3_video_resolution=${videoSize.height}p provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"}")
                 }
             }
@@ -402,6 +433,10 @@ class PlayerManager(
                 val requestId = httpFailure?.headerFields?.entries
                     ?.firstOrNull { it.key.equals("X-Request-ID", true) || it.key.equals("X-Correlation-ID", true) }
                     ?.value?.firstOrNull()
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                    failureCategory = failureCategory,
+                    lastErrorMessage = error.localizedMessage ?: error.errorCodeName
+                )
                 Log.e(TAG, "ExoPlayer failure category=$failureCategory code=${error.errorCode} http_status=${httpFailure?.responseCode ?: "none"} request_id=${requestId ?: "none"} provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
                 // If track switching failed due to unsupported decoder on selected track, recover smoothly
@@ -524,7 +559,9 @@ class PlayerManager(
                         val uniqueId = "audio_${groupIndex}_${i}"
                         if (isSelected && isSupported) {
                             anyAudioSelected = true
-                            _activeAudioDecoder.value = if (decoderType == "FFmpeg") "FFmpeg Audio Renderer (Software)" else "MediaCodec Hardware Audio Renderer"
+                            val decoderLabel = if (decoderType == "FFmpeg") "FFmpeg Audio Renderer (Software)" else "MediaCodec Hardware Audio Renderer"
+                            _activeAudioDecoder.value = decoderLabel
+                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderLabel)
                         }
                         audioList.add(
                             TrackOption(

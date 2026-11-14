@@ -170,6 +170,21 @@ service cloud.firestore {
       allow update: if catalogUpdate('CATEGORY', id);
       allow delete: if admin();
     }
+    match /anime_streams/{id} {
+      allow read, write: if signedIn();
+      match /{sub=**} {
+        allow read, write: if signedIn();
+      }
+    }
+    match /movie_streams/{id} {
+      allow read, write: if signedIn();
+      match /{sub=**} {
+        allow read, write: if signedIn();
+      }
+    }
+    match /stream_resolve_locks/{id} {
+      allow read, write: if signedIn();
+    }
     match /update_history/{id} { allow read, write: if admin(); }
     match /analytics_daily/{id} { allow read, write: if admin(); }
     match /admin_settings/{id} { allow read, write: if admin(); }

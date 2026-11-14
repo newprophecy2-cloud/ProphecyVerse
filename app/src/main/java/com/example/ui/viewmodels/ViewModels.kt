@@ -653,26 +653,28 @@ class DetailViewModel(
 
     fun toggleWatchlist(status: String = "WATCHING") {
         viewModelScope.launch {
-            repository.toggleWatchlist(animeId, status)
-            val entry = watchlistEntry.value
-            com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
-                .syncWatchlistStatus(
-                    animeId = animeId,
-                    status = status,
-                    isFavorite = entry?.isFavorite ?: false
+            val updated = repository.toggleWatchlist(animeId, status)
+            val cloud = com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
+            if (updated == null) {
+                cloud.deleteWatchlistStatus(animeId)
+            } else {
+                cloud.syncWatchlistStatus(
+                    animeId = updated.animeId,
+                    status = updated.status,
+                    isFavorite = updated.isFavorite
                 )
+            }
         }
     }
 
     fun toggleFavorite() {
         viewModelScope.launch {
-            repository.toggleFavorite(animeId)
-            val entry = watchlistEntry.value
+            val updated = repository.toggleFavorite(animeId)
             com.example.data.firebase.CloudHistoryRepository.getInstance(getApplication())
                 .syncWatchlistStatus(
-                    animeId = animeId,
-                    status = entry?.status ?: "WATCHING",
-                    isFavorite = !(entry?.isFavorite ?: false)
+                    animeId = updated.animeId,
+                    status = updated.status,
+                    isFavorite = updated.isFavorite
                 )
         }
     }
@@ -899,7 +901,10 @@ class PlayerViewModel(
                                 episodeTitle = ep.title,
                                 positionMs = posMs,
                                 durationMs = durMs,
-                                completed = isCompleted
+                                completed = isCompleted,
+                                animeTitle = anime?.preferredTitle ?: anime?.titleEnglish,
+                                posterUrl = anime?.posterUrl,
+                                mediaType = resolvedType
                             )
                     }
                 }

@@ -235,13 +235,12 @@ interface EpisodeDao {
     @Transaction
     suspend fun rekeyAnime(fromAnimeId: String, toAnimeId: String) {
         if (fromAnimeId == toAnimeId) return
-        val seasons = getSeasonsForAnime(fromAnimeId)
+        val incomingSeasons = getSeasonsForAnime(fromAnimeId)
             .map { it.copy(animeId = toAnimeId, id = "${toAnimeId}_s${it.seasonNumber}") }
-        val episodes = getEpisodesForAnime(fromAnimeId).map { it.copy(animeId = toAnimeId) }
-        if (seasons.isNotEmpty()) upsertSeasons(seasons)
-        if (episodes.isNotEmpty()) upsertEpisodes(episodes)
+        val incomingEpisodes = getEpisodesForAnime(fromAnimeId).map { it.copy(animeId = toAnimeId) }
         deleteEpisodesForAnime(fromAnimeId)
         deleteSeasonsForAnime(fromAnimeId)
+        mergeEpisodeSnapshot(toAnimeId, incomingSeasons, incomingEpisodes)
     }
 }
 
@@ -287,6 +286,9 @@ interface WatchlistDao {
 
     @Query("SELECT * FROM watchlist_entries WHERE animeId = :animeId LIMIT 1")
     fun observeWatchlistEntry(animeId: String): Flow<WatchlistEntry?>
+
+    @Query("SELECT * FROM watchlist_entries ORDER BY updatedAt DESC")
+    suspend fun getAllWatchlistOnce(): List<WatchlistEntry>
 
     @Query("SELECT * FROM watchlist_entries WHERE animeId = :animeId LIMIT 1")
     suspend fun getWatchlistEntry(animeId: String): WatchlistEntry?
@@ -334,6 +336,12 @@ interface PlaybackHistoryDao {
 
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId LIMIT 1")
     suspend fun getHistoryForAnime(animeId: String): PlaybackHistory?
+
+    @Query("SELECT * FROM playback_history WHERE animeId = :animeId ORDER BY lastPlayedAt DESC")
+    suspend fun getAllHistoryForAnime(animeId: String): List<PlaybackHistory>
+
+    @Query("SELECT * FROM playback_history ORDER BY lastPlayedAt DESC")
+    suspend fun getAllHistoryOnce(): List<PlaybackHistory>
 
     @Query("SELECT * FROM playback_history WHERE animeId = :animeId ORDER BY lastPlayedAt DESC LIMIT 1")
     fun observeLastPlayedForAnime(animeId: String): Flow<PlaybackHistory?>
@@ -391,6 +399,9 @@ interface DownloadDao {
 
     @Query("UPDATE download_entries SET downloadStatus = :status, downloadedBytes = :downloaded, totalBytes = :total WHERE id = :id")
     suspend fun updateProgress(id: String, status: String, downloaded: Long, total: Long)
+
+    @Query("UPDATE download_entries SET animeId = :toAnimeId WHERE animeId = :fromAnimeId")
+    suspend fun rekeyAnime(fromAnimeId: String, toAnimeId: String)
 
     @Query("DELETE FROM download_entries WHERE id = :id")
     suspend fun deleteDownload(id: String)

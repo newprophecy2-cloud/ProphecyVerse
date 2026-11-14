@@ -1200,7 +1200,15 @@ fun SourceCandidateCard(
                 val langStr = source.displayAudioLanguage
                 val sizeStr = source.sizeBytes?.let { "${it / 1_000_000} MB" }
                 Text(
-                    text = listOf(codecStr, langStr, sizeStr, source.downloadable?.let { if (it) "Downloadable" else "Stream only" })
+                    text = listOf(
+                        codecStr,
+                        langStr,
+                        sizeStr,
+                        source.downloadable?.let {
+                            if (it) "Provider: downloadable"
+                            else "Provider: stream-only; actual URL is checked when downloading"
+                        }
+                    )
                         .filterNotNull().filter { it.isNotBlank() }.joinToString(" • "),
                     color = TextMuted,
                     fontSize = 11.sp
