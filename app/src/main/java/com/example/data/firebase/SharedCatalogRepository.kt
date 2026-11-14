@@ -33,6 +33,7 @@ class SharedCatalogRepository(
         private const val MAX_BATCH = 20
         private const val MAX_RETRIES = 6
         private const val MAX_QUEUE = 500
+        private const val TAG = "SharedCatalogRepository"
         private const val CACHE_READ_TTL = 6L * 60 * 60 * 1000
         private val allowedMetadataFields = setOf(
             "documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
@@ -274,9 +275,6 @@ class SharedCatalogRepository(
         return completed
     }
 
-    private companion object {
-        const val TAG = "SharedCatalogRepository"
-    }
     private fun JSONObject.toMap(): Map<String, Any> {
         val result = HashMap<String, Any>()
         keys().forEach { key ->
