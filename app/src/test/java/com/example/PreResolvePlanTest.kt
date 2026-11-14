@@ -13,25 +13,25 @@ class PreResolvePlanTest {
         EpisodeEntry(id, "anime", season, number)
 
     @Test
-    fun queueContainsExactlyEp1To12AndSlidesTo13And14() {
+    fun queueContainsNext17AndSlidesTo18And19() {
         val records = (1..42).map { ep(1, it) }
         val ep1Upcoming = PreResolvePlan.upcoming(records.first(), records)
         val batches = PreResolvePlan.batches(ep1Upcoming)
-        assertEquals(11, ep1Upcoming.size)
-        assertEquals(listOf(11), batches.map { it.size })
-        // Episode 1 + next 11 = Episodes 1..12 prepared
-        assertEquals((2..12).map { "s1e$it" }, ep1Upcoming.map { it.id })
+        assertEquals(17, ep1Upcoming.size)
+        assertEquals(listOf(17), batches.map { it.size })
+        // Episode 1 + next 17 = Episodes 1..18 prepared
+        assertEquals((2..18).map { "s1e$it" }, ep1Upcoming.map { it.id })
         assertEquals(ep1Upcoming, batches.flatten())
 
-        // Advancing to Ep 2 brings Ep 13 into window
+        // Advancing to Ep 2 brings Ep 19 into window
         val ep2Upcoming = PreResolvePlan.upcoming(records[1], records)
-        assertEquals((3..13).map { "s1e$it" }, ep2Upcoming.map { it.id })
-        assertEquals("s1e13", ep2Upcoming.last().id)
+        assertEquals((3..19).map { "s1e$it" }, ep2Upcoming.map { it.id })
+        assertEquals("s1e19", ep2Upcoming.last().id)
 
-        // Advancing to Ep 3 brings Ep 14 into window
+        // Advancing to Ep 3 brings Ep 20 into window
         val ep3Upcoming = PreResolvePlan.upcoming(records[2], records)
-        assertEquals((4..14).map { "s1e$it" }, ep3Upcoming.map { it.id })
-        assertEquals("s1e14", ep3Upcoming.last().id)
+        assertEquals((4..20).map { "s1e$it" }, ep3Upcoming.map { it.id })
+        assertEquals("s1e20", ep3Upcoming.last().id)
     }
 
     @Test
@@ -55,12 +55,12 @@ class PreResolvePlanTest {
     }
 
     @Test
-    fun episodeSeventeen_hasFastFive_backgroundSix_andPreviousSix() {
+    fun episodeSeventeen_hasFastSeven_backgroundTen_andPreviousSix() {
         val records = (1..50).map { ep(1, it) }
         val current = records[16]
-        assertEquals((18..28).toList(), PreResolvePlan.upcoming(current, records).map { it.episodeNumber })
-        assertEquals((18..22).toList(), PreResolvePlan.fastUpcoming(current, records).map { it.episodeNumber })
-        assertEquals((23..28).toList(), PreResolvePlan.backgroundUpcoming(current, records).map { it.episodeNumber })
+        assertEquals((18..34).toList(), PreResolvePlan.upcoming(current, records).map { it.episodeNumber })
+        assertEquals((18..24).toList(), PreResolvePlan.fastUpcoming(current, records).map { it.episodeNumber })
+        assertEquals((25..34).toList(), PreResolvePlan.backgroundUpcoming(current, records).map { it.episodeNumber })
         assertEquals((11..16).toList(), PreResolvePlan.previous(current, records).map { it.episodeNumber })
     }
 
@@ -71,7 +71,7 @@ class PreResolvePlanTest {
         val started = System.nanoTime()
         val upcoming = PreResolvePlan.upcoming(current, records)
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
-        assertEquals(11, upcoming.size)
+        assertEquals(17, upcoming.size)
         assertEquals(setOf(1), upcoming.map { it.seasonNumber }.toSet())
         assertTrue("Window planning should remain bounded; took ${elapsedMs}ms", elapsedMs < 1000)
     }

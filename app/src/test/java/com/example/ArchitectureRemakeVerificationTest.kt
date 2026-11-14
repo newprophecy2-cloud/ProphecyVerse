@@ -506,13 +506,14 @@ class ArchitectureRemakeVerificationTest {
         assertEquals(1, backend.resolveCalls.get())
         assertEquals("https://cdn.example.com/streams/direct_1080p.m3u8", first.directData.playbackUrl)
 
-        // Verify sensitive headers were stripped while safe playback headers were preserved
+        // Verify required transient playback headers are preserved; only shared Firestore
+        // publication applies the stricter redaction policy.
         val headerKeys = first.directData.headers.map { it[0].lowercase() }.toSet()
         assertTrue(headerKeys.contains("referer"))
         assertTrue(headerKeys.contains("user-agent"))
-        assertFalse(headerKeys.contains("authorization"))
-        assertFalse(headerKeys.contains("cookie"))
-        assertFalse(headerKeys.contains("x-api-key"))
+        assertTrue(headerKeys.contains("authorization"))
+        assertTrue(headerKeys.contains("cookie"))
+        assertTrue(headerKeys.contains("x-api-key"))
 
         // Second play hits Room cache with ZERO Discovery and ZERO Resolve calls!
         val second = repo.resolvePlayableStream(
@@ -656,22 +657,22 @@ class ArchitectureRemakeVerificationTest {
         )
         assertTrue(manager.queueStatus.value.isEmpty())
 
-        // Series Ep 1 -> queues 2..12 sequentially (11 upcoming episodes; Ep 1 is already active)
+        // Series Ep 1 -> queues 2..14 sequentially (13 available upcoming episodes; Ep 1 is already active)
         manager.slideWindow("anilist_201", episodes.first(), episodes, isMovie = false)
         // Wait briefly for worker coroutine using IO dispatcher to settle
         val deadline = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline) {
             val statuses = manager.queueStatus.value
-            if (statuses.size == 11 && statuses.values.all { it == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
+            if (statuses.size == 13 && statuses.values.all { it == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
                 break
             }
             Thread.sleep(25L)
         }
         val afterEp1 = manager.queueStatus.value
-        assertEquals(11, afterEp1.size)
-        assertEquals(11, backend.resolveCalls.get())
+        assertEquals(13, afterEp1.size)
+        assertEquals(13, backend.resolveCalls.get())
 
-        // Sliding to Ep 2 reuses 3..12 from cache and resolves only uncached Ep 13 (upcoming) + Ep 1 (previous)!
+        // Sliding to Ep 2 reuses the overlapping next-17 window and resolves only uncached Ep 1 (previous)!
         manager.slideWindow("anilist_201", episodes[1], episodes, isMovie = false)
         val ep13Key = PreResolveQueueManager.identity("anilist_201", episodes[12])
         val ep1Key = PreResolveQueueManager.identity("anilist_201", episodes[0])
@@ -685,8 +686,8 @@ class ArchitectureRemakeVerificationTest {
             }
             Thread.sleep(25L)
         }
-        // 11 initial (Eps 2..12) + 1 (Ep 13) + 1 (previous Ep 1) = 13 total (Eps 3..12 reused with 0 resolves)
-        assertEquals(13, backend.resolveCalls.get())
+        // Ep 1 was active rather than pre-resolved, so the previous-6 window resolves it once.
+        assertEquals(14, backend.resolveCalls.get())
         manager.clear()
     }
 

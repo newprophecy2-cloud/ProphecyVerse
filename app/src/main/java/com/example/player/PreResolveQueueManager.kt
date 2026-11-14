@@ -60,9 +60,10 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     private val queueDispatcher = Dispatchers.IO.limitedParallelism(3)
 
     /**
-     * Queue the next 11 canonical episodes after the current episode in the same season
-     * (Ep 1 -> Eps 1..12, Ep 2 -> Ep 13, Ep 3 -> Ep 14).
-     * Movies are excluded. Checks Room/Firestore caches before calling Backend Resolve.
+     * Queue the next 17 canonical episodes and previous 6 episodes in the same season.
+     * The next 7 are resolved first; the remaining 10 next episodes and previous episodes
+     * are resolved in bounded background batches. Movies are excluded. Checks Room/Firestore
+     * caches before calling Backend Resolve.
      */
     fun slideWindow(
         animeId: String,

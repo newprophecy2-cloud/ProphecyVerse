@@ -1184,15 +1184,15 @@ class AnimeRepository(
 
             fetchCandidatesFromBackend(backendId, backendEpisodeIds)
 
-            // If a duplicate/addon-only backend entry yielded zero usable candidates, try canonical re-match
-            if (aggregatedCandidates.none { it.second.hasUsableSourceId } && !hadHttpOrNetworkError && canSelfHealBackend) {
-                val alternateId = resolveBackendIdForDiscovery(animeId, anime, excludeBackendIds = setOf(backendId))
-                if (alternateId != null && alternateId != backendId) {
-                    val alternateEpIds = resolveBackendEpisodeIdsForDiscovery(
-                        animeId = animeId,
-                        backendId = alternateId,
-                        isMovie = false,
-                        seasonNumber = effectiveSeason,
+                // If a duplicate/addon-only backend entry yielded zero usable candidates, try canonical re-match
+                if (aggregatedCandidates.none { it.second.hasUsableSourceId } && !hadHttpOrNetworkError && canSelfHealBackend) {
+                    val alternateId = resolveBackendIdForDiscovery(animeId, anime, excludeBackendIds = setOf(backendId))
+                    if (alternateId != null && alternateId != backendId) {
+                        val alternateEpIds = resolveBackendEpisodeIdsForDiscovery(
+                            animeId = animeId,
+                            backendId = alternateId,
+                            isMovie = isMovie,
+                            seasonNumber = effectiveSeason,
                         episodeNumber = effectiveEpisode,
                         catalogEpisodeId = catalogEpisodeId,
                         cumulativeOffset = identity.cumulativeEpisodeOffset,

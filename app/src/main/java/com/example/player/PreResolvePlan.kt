@@ -5,8 +5,8 @@ import com.example.data.identity.EpisodeCanonicalizer
 
 /** Pure queue planning. Windows never cross an unrelated season boundary. */
 object PreResolvePlan {
-    const val UPCOMING_WINDOW_SIZE = 11
-    const val FAST_WINDOW_SIZE = 5
+    const val UPCOMING_WINDOW_SIZE = 17
+    const val FAST_WINDOW_SIZE = 7
     const val PREVIOUS_WINDOW_SIZE = 6
 
     fun sameSeasonEpisodes(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> =
