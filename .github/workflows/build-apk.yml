@@ -84,7 +84,7 @@ jobs:
           fi
 
           package_line="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk_path" | sed -n '1p')"
-          expected="package: name='com.aistudio.prophecyverse.vykqtb' versionCode='6' versionName='3.0.1'"
+          expected="package: name='com.aistudio.prophecyverse.vykqtb' versionCode='7' versionName='3.0.2'"
           if [[ "$package_line" != "$expected"* ]]; then
             echo "Generated APK metadata did not match the required package/version." >&2
             echo "Observed: $package_line" >&2
@@ -99,7 +99,7 @@ jobs:
           {
             echo "### Release APK build"
             echo "- Package: \`com.aistudio.prophecyverse.vykqtb\`"
-            echo "- Version: \`3.0.1 (6)\`"
+            echo "- Version: \`3.0.2 (7)\`"
             echo "- Signing: $signing_status"
             echo "- APK: \`$apk_path\`"
           } >> "$GITHUB_STEP_SUMMARY"
