@@ -1,0 +1,1226 @@
+PROPHECY VERSE — FULL APK ARCHITECTURE REMAKE
+
+MASTER IMPLEMENTATION PROMPT
+
+You are working as a Senior Android Architect, Kotlin Engineer, Firebase Engineer, AniList GraphQL Engineer, and Streaming Playback Engineer.
+
+Your task is to audit and remake the existing Prophecy Verse Android APK data architecture according to the exact requirements below.
+
+This is an APK architecture-level implementation, not a redesign of unrelated features.
+
+The objective is to establish three clearly separated responsibilities:
+
+1. AniList = All available Anime/Movie metadata.
+2. Firestore = Shared Provider Discovery, Source Discovery, Stream URL Cache, and synchronization.
+3. Existing Backend = Provider/Source Discovery when Firestore has no valid discovery data, and direct Stream URL resolution when necessary.
+
+Room remains the local database and cache.
+
+ExoPlayer/Media3 plays the actual stream URL directly.
+
+---
+
+PART 1 — REPOSITORY INFORMATION
+
+Target repository:
+
+- GitHub Owner: "newprophecy2-cloud"
+- Repository: "ProphecyVerse"
+- Repository URL: https://github.com/newprophecy2-cloud/ProphecyVerse
+
+Target branch:
+
+"repair/apk-v3-root-cause"
+
+Branch URL:
+
+https://github.com/newprophecy2-cloud/ProphecyVerse/tree/repair/apk-v3-root-cause
+
+Last audited commit:
+
+"b64c1ba6e30dbb2df2c0f28d2cc76e2438cd0dc4"
+
+Package:
+
+"com.aistudio.prophecyverse.vykqtb"
+
+Last audited version:
+
+- Version Name: 3.0.2
+- Version Code: 7
+
+IMPORTANT:
+
+Before changing anything:
+
+1. Inspect the current Git repository.
+2. Confirm the current branch.
+3. Confirm the current HEAD commit.
+4. Inspect git status and all uncommitted changes.
+5. Verify that the repository is the correct APK repository.
+6. Inspect the complete existing architecture.
+7. Identify existing AniList, Firestore, Room, Backend, Repository, ViewModel, Player, and synchronization implementations.
+8. Identify actual API contracts and existing Firebase configuration.
+9. Never assume an old audit accurately describes the current code.
+
+Do not overwrite, discard, reset, or remove existing user changes.
+
+If the branch is different from the target branch, do not silently switch branches or overwrite work. Report the discrepancy and preserve the existing working state.
+
+---
+
+PART 2 — STRICT SCOPE
+
+This task is exclusively for the existing Prophecy Verse APK repository.
+
+Do not modify:
+
+- Backend repository.
+- Backend API implementation.
+- Backend API configuration.
+- Backend deployment.
+- Admin Panel repository.
+- Firebase project configuration.
+- Firebase Authentication configuration.
+- Existing unrelated Firebase services.
+- Unrelated application features.
+
+Do not:
+
+- Change application package name.
+- Change Version Name.
+- Change Version Code.
+- Change Android application identity.
+- Replace Media3/ExoPlayer.
+- Redesign unrelated UI.
+- Remove existing authentication.
+- Remove Watch History.
+- Remove Watchlist.
+- Remove Download Manager.
+- Remove existing player controls.
+- Remove unrelated Room entities or migrations.
+- Change existing API contracts.
+- Introduce "/stream", "/remux", or "/watch" playback dependencies.
+- Commit, push, deploy, or publish without explicit authorization.
+
+Do not perform broad refactoring merely to make the code look cleaner.
+
+Only remove or replace old logic that directly conflicts with the new architecture described here.
+
+---
+
+PART 3 — FINAL DATA OWNERSHIP
+
+Every data type must have one clear authoritative source.
+
+A. AniList
+
+AniList is the authoritative source for available:
+
+- Anime metadata.
+- Movie metadata supported by AniList.
+- Anime titles.
+- Movie titles.
+- Descriptions.
+- Posters.
+- Cover images.
+- Banner images.
+- Genres.
+- Release information.
+- Status.
+- Season information.
+- Episode counts when available.
+- Search results.
+- Media details.
+- Other available catalog metadata.
+
+Do not obtain catalog metadata from streaming providers.
+
+Do not use the Backend as a fallback metadata provider.
+
+Do not store Anime/Movie metadata, descriptions, posters, banners, or catalog search results in Firestore.
+
+If AniList does not provide an individual episode title or description, use a clearly identified fallback such as "Episode 1", "Episode 2", etc. Never invent episode titles.
+
+AniList does not guarantee complete per-episode metadata for every title. Handle missing information safely.
+
+B. Firestore
+
+Firestore stores shared streaming information:
+
+- Provider discovery.
+- Source discovery.
+- Provider status.
+- Source status.
+- Stream URLs.
+- URL expiry information.
+- Quality.
+- Codec.
+- Audio language.
+- Safe playback headers, where appropriate.
+- Provider/source counts.
+- Discovery status.
+- Version information.
+- Update timestamps.
+- Validation information.
+
+Season/Episode count summary fields may be stored as lightweight counters when required by the agreed schema, but do not store complete catalog metadata in Firestore.
+
+C. Room
+
+Room stores local data:
+
+- AniList metadata cache.
+- Poster/image references.
+- Local search cache.
+- Local Anime/Movie details.
+- Local Season/Episode metadata.
+- Shared streaming data cache.
+- Cached Provider/Source records.
+- Cached Stream URLs.
+- Watch History.
+- Watchlist.
+- Preferences.
+- Local synchronization versions.
+
+Room must remain the primary local source for fast UI rendering.
+
+D. Backend
+
+The existing Backend is used only for:
+
+1. Provider discovery when required Firestore discovery data is missing.
+2. Source discovery when required Firestore source data is missing.
+3. Direct Stream URL resolution when no playable cached URL is available.
+4. Controlled re-resolution after cached playback failures.
+
+Do not use Backend endpoints to retrieve catalog metadata, search results, posters, descriptions, or ordinary Anime/Movie details.
+
+Preserve existing Backend API contracts.
+
+---
+
+PART 4 — ANILIST LOGIC
+
+Implement AniList as the catalog and metadata provider.
+
+Use the existing AniList GraphQL service where possible.
+
+Do not create duplicate AniList services if an existing service can be safely extended.
+
+4.1 Home
+
+Home content must be loaded from AniList.
+
+Required data:
+
+- Anime.
+- Anime Movies.
+- Available catalog categories.
+- Posters.
+- Cover images.
+- Titles.
+- Descriptions when available.
+- Genres.
+- Release information.
+
+Show Room-cached data immediately.
+
+Refresh data from AniList in the background.
+
+Do not block Home rendering while waiting for the network.
+
+4.2 Search
+
+Search must use AniList.
+
+Requirements:
+
+- Search Anime.
+- Search Movie media supported by AniList.
+- Support title variations and available synonyms.
+- Support pagination.
+- Avoid duplicate results.
+- Cache recent search results locally in Room.
+- Do not call Backend search endpoints.
+
+4.3 Details
+
+When a user opens an Anime or Movie:
+
+1. Read cached metadata from Room.
+2. Render available data immediately.
+3. Refresh stale metadata from AniList.
+4. Update Room after successful response.
+5. Notify the UI through Kotlin Flow.
+
+Never use Firestore to load posters, descriptions, or catalog metadata.
+
+4.4 Season and Episode Metadata
+
+Use AniList's available media information.
+
+Store:
+
+- Season information when available.
+- Total episode count when available.
+- Episode metadata when actually provided.
+- Metadata completeness status.
+
+Do not fabricate unavailable Season or Episode information.
+
+Keep streaming Episode identity separate from AniList catalog metadata identity.
+
+---
+
+PART 5 — FIRESTORE DATABASE STRUCTURE
+
+Anime and Movie must have separate database structures.
+
+A Movie must never be stored as a Season/Episode hierarchy.
+
+Use stable IDs and deterministic document paths.
+
+Do not use display titles as document IDs.
+
+5.1 ANIME DATABASE
+
+Root collection:
+
+"anime_streams"
+
+Document structure:
+
+"anime_streams/{anilistAnimeId}"
+
+Subcollections:
+
+"seasons/{seasonId}"
+
+"seasons/{seasonId}/episodes/{episodeId}"
+
+"episodes/{episodeId}/providers/{providerId}"
+
+"episodes/{episodeId}/providers/{providerId}/sources/{sourceId}"
+
+Conceptual structure:
+
+anime_streams/
+  {anilistAnimeId}/
+    season_count
+    total_episode_count
+    provider_discovery_status
+    version
+    updated_at
+
+    seasons/
+      {seasonId}/
+        season_number
+        episode_count
+        discovery_status
+
+        episodes/
+          {episodeId}/
+            episode_number
+            provider_count
+            source_count
+            discovery_status
+            version
+            updated_at
+
+            providers/
+              {providerId}/
+                provider_id
+                provider_name
+                status
+                source_count
+                updated_at
+
+                sources/
+                  {sourceId}/
+                    source_id
+                    source_name
+                    stream_url
+                    url_type
+                    quality
+                    codec
+                    audio_language
+                    safe_headers
+                    expires_at
+                    status
+                    version
+                    last_verified_at
+                    last_playback_success_at
+                    updated_at
+
+The season and episode IDs must be stable and consistent.
+
+Do not assume that a season number alone is a globally unique ID.
+
+5.2 MOVIE DATABASE
+
+Root collection:
+
+"movie_streams"
+
+Document structure:
+
+"movie_streams/{anilistMovieId}"
+
+Movie structure must be flat.
+
+movie_streams/
+  {anilistMovieId}/
+    movie_id
+    content_type
+    provider_count
+    source_count
+    discovery_status
+    version
+    updated_at
+
+    providers/
+      {providerId}/
+        provider_id
+        provider_name
+        status
+        source_count
+        updated_at
+
+        sources/
+          {sourceId}/
+            source_id
+            source_name
+            stream_url
+            url_type
+            quality
+            codec
+            audio_language
+            safe_headers
+            expires_at
+            status
+            version
+            last_verified_at
+            last_playback_success_at
+            updated_at
+
+Movie rules:
+
+- "content_type" must be "MOVIE".
+- No Season subcollection.
+- No Episode subcollection.
+- No "season_count".
+- No "episode_count".
+- No "S1E1" document.
+- No "S1E1" document path.
+- No Anime-style Episode identity.
+
+IMPORTANT MOVIE RESPONSE RULE:
+
+The existing Backend may return a Movie discovery response using:
+
+"S1 & E1"
+
+or an equivalent internal identifier such as:
+
+"S1E1"
+
+This is only an internal Backend request/response compatibility detail.
+
+The APK must translate that response into the Movie's own identity.
+
+Save the result under:
+
+"movie_streams/{anilistMovieId}/providers/{providerId}/sources/{sourceId}"
+
+Never save the Movie as:
+
+"seasons/1/episodes/1"
+
+Never show Season 1 or Episode 1 in the Movie UI.
+
+Never create a Movie Season/Episode database hierarchy.
+
+The internal Backend identifier must not become the Movie's Firestore identity.
+
+Do not invent new Backend routes. Inspect and reuse the existing Movie discovery and Resolve API contracts.
+
+5.3 DOCUMENT DESIGN RULES
+
+Use Firestore subcollections for Provider and Source records instead of embedding unlimited sources inside a single document.
+
+Avoid Firestore document-size problems.
+
+Use deterministic IDs.
+
+Prevent duplicate Provider and Source records.
+
+Use Firestore transactions or batched writes when multiple related records must be updated atomically.
+
+Do not store personal authentication tokens, private cookies, or user-specific credentials inside globally shared Stream URL records.
+
+Only store playback headers that are safe and valid for shared use.
+
+---
+
+PART 6 — PROVIDER DISCOVERY LOGIC
+
+Provider discovery and catalog metadata are completely different operations.
+
+Provider discovery identifies which streaming providers can supply content.
+
+When a user opens an Anime or Movie:
+
+1. Determine its stable content identity.
+2. Check the corresponding Firestore streaming document.
+3. Check discovery status and freshness.
+4. If complete and valid, reuse the existing Provider records.
+5. Do not call Backend discovery again.
+6. If required discovery data is missing, call the existing Backend discovery API.
+7. Save newly discovered Provider records to Firestore through an authorized write path.
+8. Update provider_count and discovery status.
+9. Synchronize the changed data to Room.
+
+A temporary network error must not mark a Provider permanently unavailable.
+
+Discovery status must distinguish:
+
+- NOT_DISCOVERED
+- IN_PROGRESS
+- COMPLETED
+- PARTIAL
+- TEMPORARY_FAILURE
+- PERMANENTLY_UNAVAILABLE
+
+If discovery is complete but one Source URL is missing, resolve the missing URL without repeating complete Provider discovery.
+
+Do not confuse Provider discovery with URL resolution.
+
+---
+
+PART 7 — SOURCE DISCOVERY LOGIC
+
+For each Provider:
+
+1. Check whether Source records exist in Firestore.
+2. If valid Source discovery data exists, reuse it.
+3. Do not call Backend source discovery again unnecessarily.
+4. If Source discovery data is missing or explicitly stale, call the existing Backend discovery endpoint.
+5. Save new Source records.
+6. Update source_count.
+7. Synchronize the changes to Room.
+
+A Source record and a Stream URL are separate pieces of information.
+
+A Source may exist while its URL is missing, expired, or unusable.
+
+Never repeat full Source discovery just because one Stream URL expired.
+
+---
+
+PART 8 — STREAM URL CACHE AND DIRECT PLAYBACK
+
+This is one of the most important requirements.
+
+The APK must play using the actual resolved "stream_url".
+
+The direct playback flow:
+
+User selects content
+        |
+        v
+Check Room Stream URL cache
+        |
+        v
+Check Firestore shared cache
+        |
+        v
+Is cached URL playable and valid?
+        |
+    YES | NO
+        | 
+        v
+ExoPlayer     Try other cached Sources
+Direct Play        |
+                   v
+             Any playable URL?
+                YES | NO
+                    |
+                    v
+               Direct Play
+                    |
+                    v
+             Backend Resolve
+                    |
+                    v
+             Validate URL
+                    |
+                    v
+             Authorized Firestore update
+                    |
+                    v
+                Room update
+                    |
+                    v
+              ExoPlayer play
+
+8.1 Cache-first playback
+
+Before resolving:
+
+1. Check Room.
+2. Check the relevant Firestore cached Source records.
+3. Verify expiry and known validity information.
+4. Attempt a usable cached URL.
+5. Reuse it without another Resolve request.
+
+If a cached URL is playable:
+
+- Do not call Resolve again.
+- Do not replace it unnecessarily.
+- Do not repeat Provider discovery.
+- Do not repeat Source discovery.
+
+8.2 Multiple Source fallback
+
+If the selected Source fails:
+
+1. Record the failure against the exact playback session and Source.
+2. Try other cached Sources.
+3. Prefer compatible and available Sources.
+4. Only if no cached Source is playable, request fresh Resolve.
+5. Save the newly validated successful URL.
+6. Preserve the previous valid URL if fresh Resolve fails.
+
+Do not mark all Sources unavailable after one playback failure.
+
+8.3 Direct ExoPlayer playback
+
+Pass the actual "stream_url" directly to the existing Media3/ExoPlayer playback implementation.
+
+Preserve existing:
+
+- Codec compatibility policy.
+- Audio handling.
+- Playback headers.
+- Buffering behavior.
+- Player lifecycle.
+- Existing playback controls.
+
+Do not introduce a new proxy streaming architecture.
+
+Do not make "/stream", "/remux", or "/watch" requests.
+
+Support the actual URL type returned by the existing Backend:
+
+- MP4.
+- HLS.
+- DASH.
+- Other formats only if already supported by the existing player architecture.
+
+Do not treat a manifest URL as a complete single-file download.
+
+Preserve existing download behavior and format support.
+
+---
+
+PART 9 — FIRESTORE SHARED CACHE AND MULTI-USER SYNCHRONIZATION
+
+Firestore is shared between users.
+
+If User A discovers a Provider or successfully resolves a Stream URL, other users should be able to reuse that shared information when it is valid and compatible.
+
+Required behavior:
+
+1. User A discovers missing Provider data.
+2. Authorized system saves it to Firestore.
+3. User B receives the updated discovery data.
+4. User B reuses the saved Provider and Source records.
+5. User B does not repeat discovery unnecessarily.
+6. User B reuses a valid shared Stream URL.
+7. If the URL is not playable for User B, try other cached Sources before controlled re-resolution.
+
+9.1 Real-time listeners
+
+Use Firestore snapshot listeners only for relevant streaming data.
+
+Examples:
+
+- Currently opened Anime Episode.
+- Currently opened Movie.
+- Active playback Source.
+- Relevant discovery status.
+
+Do not listen to the entire Anime catalog.
+
+Do not listen to every Episode of every Anime.
+
+Do not keep unnecessary listeners active after leaving a screen.
+
+Remove listeners when the corresponding ViewModel or screen is no longer active.
+
+9.2 Atomic distributed locking
+
+Prevent multiple devices from resolving the same missing Source simultaneously.
+
+Use an atomic distributed lease/lock with:
+
+- Stable content ID.
+- Provider ID.
+- Source ID.
+- Lock owner.
+- Lock expiration.
+- Resolve status.
+- Recovery after process termination.
+
+Use Firestore transactions where appropriate.
+
+A lock must not remain permanently stuck if a device crashes.
+
+Do not rely only on an in-memory Mutex because it cannot coordinate different users or devices.
+
+9.3 Secure Firestore writes
+
+Inspect existing Firestore rules and trusted write infrastructure.
+
+Do not weaken security rules.
+
+Do not allow arbitrary unauthenticated clients to publish globally shared URLs.
+
+Use the existing authorized publishing path if one exists.
+
+If the APK cannot securely publish shared URL updates with the existing infrastructure, report the exact limitation and required integration. Do not silently change Backend code, Cloud Functions, or security rules.
+
+---
+
+PART 10 — ADD / UPDATE / REMOVE LOGIC
+
+Implement controlled data lifecycle operations.
+
+ADD
+
+Add when a required record does not exist:
+
+- New Anime streaming record.
+- New Season.
+- New Episode.
+- New Provider.
+- New Source.
+- First successfully resolved Stream URL.
+- Missing discovery information.
+- Required count summary.
+
+Prevent duplicate records.
+
+UPDATE
+
+Update when existing data changes:
+
+- Provider status.
+- Source status.
+- Quality.
+- Codec.
+- Audio language.
+- Stream URL.
+- URL expiry.
+- Discovery status.
+- Provider count.
+- Source count.
+- Season count.
+- Total Episode count.
+- Per-season Episode count.
+- Version.
+- Validation timestamps.
+
+A failed Resolve must never overwrite a working URL.
+
+An Admin refresh must not interrupt active playback.
+
+New versions should be used for future playback and recovery.
+
+REMOVE
+
+Remove only when records are confirmed invalid or permanently obsolete:
+
+- Confirmed duplicate Source.
+- Permanently unavailable Provider.
+- Permanently removed Source.
+- Confirmed obsolete URL.
+- Confirmed removed streaming Episode.
+- Confirmed removed streaming Season.
+
+Use soft deletion first where practical.
+
+Use a status such as "REMOVED" or a "deleted_at" timestamp.
+
+Do not remove a record because of:
+
+- Timeout.
+- Temporary HTTP failure.
+- Temporary provider outage.
+- Device network interruption.
+- One user's playback failure.
+
+Never delete the last known working URL simply because a refresh attempt failed.
+
+A removal event must synchronize to Room so deleted records do not reappear from local cache.
+
+---
+
+PART 11 — DATA LOADING AND SYNCHRONIZATION SPEED
+
+The goal is fast, non-blocking UI rendering and prompt synchronization.
+
+Do not claim that Firestore guarantees an exact number of milliseconds. Measure actual performance.
+
+Implement these engineering targets:
+
+Operation| Target
+Room cached metadata read| Within 100 ms target
+Cached UI first rendering| Within 100 ms target
+Room Flow propagation after transaction| Within 100 ms target
+Local cached Source lookup| Within 100 ms target
+Firestore online update propagation| Aim for 0.5–2 seconds under normal network conditions
+UI update after received Firestore snapshot| Within 100 ms target
+AniList refresh| Background, network-dependent
+Backend discovery/Resolve| Network-dependent; never block unrelated UI
+
+These are performance targets, not guaranteed network SLAs.
+
+11.1 Metadata synchronization
+
+Metadata flow:
+
+AniList
+   |
+   v
+Repository
+   |
+   v
+Room Database
+   |
+   v
+Kotlin Flow
+   |
+   v
+UI
+
+Show cached Room data immediately.
+
+Refresh AniList data in the background.
+
+Update Room transactionally.
+
+Kotlin Flow must update the UI automatically.
+
+No Firestore metadata listener.
+
+No Firestore metadata write.
+
+No Backend metadata request.
+
+Use appropriate cache freshness policies.
+
+Use HTTP conditional caching only when the AniList service actually supports it. Otherwise use a safe TTL and background refresh policy.
+
+11.2 Streaming data synchronization
+
+Streaming flow:
+
+Firestore Snapshot
+       |
+       v
+Streaming Repository
+       |
+       v
+Room Transaction
+       |
+       v
+Kotlin Flow
+       |
+       v
+UI / Playback
+
+Use version comparison to avoid unnecessary writes.
+
+Avoid duplicate Room updates.
+
+Do not interrupt current playback when a new URL arrives.
+
+Use the new URL for subsequent playback or controlled recovery.
+
+11.3 Performance instrumentation
+
+Measure and log:
+
+- Room read duration.
+- AniList request duration.
+- Firestore initial cache read duration.
+- Firestore server fetch duration.
+- Firestore snapshot propagation duration.
+- Room transaction duration.
+- Kotlin Flow-to-UI update duration.
+- Provider discovery duration.
+- Source discovery duration.
+- Resolve duration.
+- URL validation duration.
+- Playback startup duration.
+- Source fallback duration.
+
+Use monotonic timing for elapsed duration.
+
+Log actual milliseconds, not fabricated values.
+
+Avoid logging private Stream URLs, cookies, tokens, or sensitive headers.
+
+---
+
+PART 12 — EPISODE PRE-RESOLUTION AND CACHE REUSE
+
+Preserve the latest requested sequential pre-resolution behavior:
+
+1. On the first Anime playback, prepare/cache Stream URLs for Episodes 1–12.
+2. When Episode 2 plays, prepare Episode 13.
+3. When Episode 3 plays, prepare Episode 14.
+4. When Episode 4 plays, prepare Episode 15.
+5. Continue sequentially.
+
+Before any discovery or Resolve request:
+
+- Check Room.
+- Check Firestore.
+- Reuse existing valid Provider/Source records.
+- Reuse playable cached URLs.
+- Do not repeat Resolve for a playable cached URL.
+
+Use bounded concurrency.
+
+Do not block active playback.
+
+Do not create duplicate pre-resolution jobs.
+
+Do not change Movie pre-resolution behavior unless it is already part of the existing implementation and compatible with this architecture.
+
+---
+
+PART 13 — MOVIE-SPECIFIC LOGIC
+
+Movie must remain a Movie throughout the complete application.
+
+AniList provides Movie metadata when available.
+
+Firestore stores Movie streaming information in:
+
+"movie_streams/{anilistMovieId}"
+
+The Backend may internally return:
+
+"S1 & E1"
+
+The APK must treat that as a Backend compatibility identifier only.
+
+The Movie must be saved as:
+
+movie_streams/{anilistMovieId}/providers/{providerId}/sources/{sourceId}
+
+Movie must not have:
+
+- Season documents.
+- Episode documents.
+- Season count.
+- Episode count.
+- Episode selector.
+- Season selector.
+
+Movie UI must show:
+
+- Movie poster.
+- Movie title.
+- Movie description.
+- Movie information.
+- Play action.
+- Provider/Source selection where appropriate.
+
+Never display "Season 1, Episode 1" for a Movie.
+
+Never create duplicate Anime and Movie records for the same catalog item.
+
+Maintain an explicit mapping between AniList Movie ID and the existing Backend Movie ID. Never rely solely on matching titles.
+
+---
+
+PART 14 — OLD / UNUSED APK LOGIC REMOVAL
+
+Audit the existing APK codebase and identify all old logic that conflicts with the new architecture.
+
+Remove or replace only these obsolete responsibilities:
+
+1. Backend-based catalog Home metadata loading.
+2. Backend-based Movie metadata loading.
+3. Backend-based Anime search.
+4. Backend-based Movie search.
+5. Backend-based Anime details metadata.
+6. Backend-based Movie details metadata.
+7. Backend-based Season metadata loading.
+8. Backend-based Episode metadata loading.
+9. Duplicate metadata merging between AniList and Backend.
+10. Firestore catalog metadata reads.
+11. Firestore catalog metadata writes.
+12. Firestore catalog metadata synchronization.
+13. Firestore catalog metadata snapshot listeners.
+14. Duplicate metadata caching pipelines.
+15. Unused mapping and DTO logic that exists only for the removed metadata pipeline.
+16. Dead repository methods and unused call paths that become unreachable after migration.
+
+IMPORTANT:
+
+Do not delete a file simply because its name looks old or unused.
+
+First inspect every reference, caller, dependency, and test.
+
+A class may contain both obsolete metadata logic and still-required streaming logic. Remove only the obsolete methods or responsibilities.
+
+Do not remove:
+
+- AniList service.
+- Room Database.
+- Room metadata cache.
+- Room Watch History.
+- Room Watchlist.
+- Firebase Authentication.
+- Firebase SDK.
+- Firestore streaming cache.
+- Player.
+- Media3/ExoPlayer.
+- Download Manager.
+- Existing playback controls.
+- Existing preferences.
+- Existing unrelated UI features.
+- Existing required Backend discovery and Resolve integrations.
+
+Do not delete old remote Firestore collections or user data as part of this APK-only task.
+
+---
+
+PART 15 — IMPLEMENTATION REQUIREMENTS
+
+Before coding:
+
+1. Map the existing architecture.
+2. Identify current repositories and data sources.
+3. Trace every metadata request.
+4. Trace Provider discovery.
+5. Trace Source discovery.
+6. Trace Stream URL resolution.
+7. Trace Firestore reads and writes.
+8. Trace Room entities, DAOs, migrations, and repositories.
+9. Trace playback URL delivery to ExoPlayer.
+10. Trace Anime and Movie ID mapping.
+11. Identify obsolete logic and required logic.
+
+Then create a controlled implementation plan.
+
+Implement in small, logically separated changes.
+
+Use:
+
+- Kotlin Coroutines.
+- Kotlin Flow.
+- Existing dependency injection.
+- Room transactions.
+- Firestore transactions where necessary.
+- Existing Media3/ExoPlayer.
+- Stable content identities.
+- Version-aware cache synchronization.
+- Bounded concurrency.
+- Structured error handling.
+
+Preserve existing architecture conventions where practical.
+
+Do not introduce unnecessary dependencies.
+
+Do not introduce a second competing repository or cache system.
+
+Do not leave the old and new metadata pipelines running simultaneously.
+
+---
+
+PART 16 — DATABASE MIGRATION AND COMPATIBILITY
+
+Inspect existing Room schemas and migrations.
+
+Do not destroy user data.
+
+Do not delete Watch History or Watchlist.
+
+Do not clear Room simply to force a refresh.
+
+Migrate only the entities and fields required by this architecture.
+
+Ensure that:
+
+- Old metadata cache entries can be refreshed safely.
+- Existing user data survives.
+- Existing playback history survives.
+- Existing watchlist survives.
+- Existing preferences survive.
+- Old obsolete Firestore metadata is no longer read by the APK.
+- Shared streaming records remain compatible with existing content IDs where possible.
+
+If a migration is needed, implement and test a proper Room migration.
+
+Do not use destructive migration.
+
+---
+
+PART 17 — TESTING AND ACCEPTANCE CRITERIA
+
+Do not report completion based only on code compilation.
+
+Test the actual APK data flow.
+
+AniList tests
+
+- Home loads from AniList.
+- Search loads from AniList.
+- Anime details load from AniList.
+- Movie details load from AniList.
+- Cached Room data renders before background refresh.
+- Missing episode metadata is handled safely.
+- No catalog metadata is loaded from Backend.
+- No catalog metadata is loaded from Firestore.
+
+Firestore tests
+
+- Anime streaming structure is correct.
+- Movie streaming structure is flat.
+- Movie never creates S1/E1 Firestore documents.
+- Provider records are reused.
+- Source records are reused.
+- Stream URLs are shared.
+- ADD works.
+- UPDATE works.
+- REMOVE works.
+- Version synchronization works.
+- Temporary failures do not delete valid records.
+- Duplicate discovery and Resolve operations are prevented.
+
+Backend tests
+
+- Backend discovery is called only when necessary.
+- Complete Firestore discovery data prevents duplicate discovery calls.
+- Missing Source URL triggers only the necessary Resolve operation.
+- Cached playable URL causes zero Resolve requests.
+- Cached Source fallback is attempted before fresh Resolve.
+- Failed fresh Resolve does not overwrite an existing valid URL.
+- Existing API contracts remain unchanged.
+
+Playback tests
+
+- Actual "stream_url" reaches ExoPlayer.
+- Movie playback works.
+- Anime playback works.
+- Multiple Sources work.
+- Source fallback works.
+- Expired URLs are handled.
+- Playback headers are preserved.
+- Episode switching does not corrupt another Episode's playback position.
+- Existing download functionality remains operational.
+
+Synchronization tests
+
+Use at least two independent APK installations/devices:
+
+1. Device A discovers a missing Provider.
+2. Firestore receives the authorized update.
+3. Device B receives the update.
+4. Device B reuses the existing discovery data.
+5. Device A resolves a Stream URL.
+6. Device B receives the shared update.
+7. Device B reuses the URL if it is compatible and playable.
+8. Neither device makes unnecessary duplicate discovery/Resolve calls.
+
+Performance tests
+
+Record real timings in milliseconds.
+
+Provide p50 and p95 where enough samples are available.
+
+Never invent performance measurements.
+
+---
+
+PART 18 — FINAL REPORT
+
+After implementation, provide:
+
+1. Repository and branch used.
+2. Starting and final commit IDs.
+3. Files inspected.
+4. Files modified.
+5. Files removed or obsolete methods removed.
+6. New architecture explanation.
+7. AniList data flow.
+8. Firestore schema and data flow.
+9. Backend discovery/Resolve flow.
+10. Room synchronization flow.
+11. Direct playback flow.
+12. Movie S1E1 compatibility explanation.
+13. ADD / UPDATE / REMOVE implementation.
+14. Room migrations.
+15. Security and write-path findings.
+16. Build results.
+17. Actual test results.
+18. Real measured loading/synchronization timings.
+19. Remaining blockers.
+20. Confirmation that unrelated features were preserved.
+
+Clearly separate:
+
+- Implemented.
+- Build-tested.
+- Unit-tested.
+- Integration-tested.
+- Real-device-tested.
+- Not tested.
+
+Do not claim a test passed unless it was actually executed.
+
+Do not claim real-time synchronization works unless it was tested across independent devices.
+
+Do not claim Movie playback works unless it was actually tested.
+
+---
+
+FINAL NON-NEGOTIABLE RULE
+
+Remake the APK data architecture according to this exact ownership model:
+
+ANIList:
+All available Anime/Movie metadata and catalog search.
+
+FIRESTORE:
+Shared Provider discovery, Source discovery, Stream URL cache, discovery counts, and real-time streaming-data synchronization.
+
+BACKEND:
+Only missing Provider/Source discovery and necessary fresh Stream URL resolution.
+
+ROOM:
+Local metadata cache, local streaming cache, user history, watchlist, and preferences.
+
+EXOPLAYER:
+Direct playback using the actual cached or newly resolved "stream_url".
+
+ANIME:
+Hierarchical Season → Episode → Provider → Source.
+
+MOVIE:
+Flat Movie → Provider → Source.
+
+Movie Backend response "S1 & E1" must never turn the Movie into a Season/Episode record.
+
+Remove obsolete APK metadata logic, but preserve every unrelated feature and existing user data.
+
+No unrelated changes. No backend changes. No deployment. No version change. No commit or push without authorization.
+
+The final result must be a functioning, tested APK architecture—not merely a written plan.

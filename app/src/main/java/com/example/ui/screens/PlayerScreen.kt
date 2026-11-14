@@ -757,6 +757,7 @@ fun PlayerScreen(
                         CompactDownloadActionRow(
                             download = currentDownload,
                             activeDownloadsCount = animeDownloads.count { it.downloadStatus == "DOWNLOADING" || it.downloadStatus == "PAUSED" },
+                            isMovie = isMovie,
                             onOpenDownloadSheet = {
                                 val eligibility = authManager.checkDownloadEligibility()
                                 when (eligibility) {
@@ -832,8 +833,8 @@ fun PlayerScreen(
                     }
                 }
 
-                // Feature 03: Manual Next Episode action card (clickable anytime)
-                if (nextEpisode != null) {
+                // Feature 03: Manual Next Episode action card (Series only)
+                if (!isMovie && nextEpisode != null) {
                     item {
                         val nextEp = nextEpisode!!
                         Card(
@@ -909,90 +910,92 @@ fun PlayerScreen(
                     }
                 }
 
-                // Feature 02: Season Selector
-                if (seasons.isNotEmpty()) {
-                    item {
-                        Column {
-                            Text(
-                                text = "Select Season",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = TextPrimary
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                items(seasons, key = { it.id }) { s ->
-                                    val isSelected = (s.seasonNumber == selectedSeason)
-                                    FilterChip(
-                                        selected = isSelected,
-                                        onClick = { viewModel.selectSeason(s.seasonNumber) },
-                                        label = { Text("Season ${s.seasonNumber}") },
-                                        colors = FilterChipDefaults.filterChipColors(
-                                            containerColor = SurfaceVariantDark,
-                                            labelColor = TextSecondary,
-                                            selectedContainerColor = AccentIndigo,
-                                            selectedLabelColor = Color.White
-                                        ),
-                                        border = null,
-                                        modifier = Modifier.testTag("season_chip_${s.seasonNumber}")
-                                    )
+                // Feature 02: Season Selector & Horizontal Episode List (Series only)
+                if (!isMovie) {
+                    if (seasons.isNotEmpty()) {
+                        item {
+                            Column {
+                                Text(
+                                    text = "Select Season",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    items(seasons, key = { it.id }) { s ->
+                                        val isSelected = (s.seasonNumber == selectedSeason)
+                                        FilterChip(
+                                            selected = isSelected,
+                                            onClick = { viewModel.selectSeason(s.seasonNumber) },
+                                            label = { Text("Season ${s.seasonNumber}") },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                containerColor = SurfaceVariantDark,
+                                                labelColor = TextSecondary,
+                                                selectedContainerColor = AccentIndigo,
+                                                selectedLabelColor = Color.White
+                                            ),
+                                            border = null,
+                                            modifier = Modifier.testTag("season_chip_${s.seasonNumber}")
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // 4. Horizontal Episode List
-                item {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Episodes (Season $selectedSeason)",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = TextPrimary
-                            )
-                            Text(
-                                text = "${seasonEpisodes.size} Episodes",
-                                fontSize = 12.sp,
-                                color = TextMuted
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        if (seasonEpisodes.isEmpty()) {
-                            Text(
-                                text = "No episodes loaded for this season",
-                                color = TextMuted,
-                                fontSize = 13.sp,
-                                modifier = Modifier.padding(vertical = 12.dp)
-                            )
-                        } else {
-                            LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                modifier = Modifier.fillMaxWidth()
+                    // 4. Horizontal Episode List
+                    item {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                items(seasonEpisodes, key = { it.id }) { ep ->
-                                    val isCurrent = (currentEpisode?.id == ep.id)
-                                    val qStatus = preResolveStatus[PreResolveQueueManager.identity(anime?.backendAnimeId ?: viewModel.animeId, ep)]
-                                    HorizontalEpisodeCard(
-                                        episode = ep,
-                                        isCurrent = isCurrent,
-                                        qStatus = qStatus,
-                                        onClick = {
-                                            if (!isCurrent) {
-                                                viewModel.startPlaybackForEpisode(ep)
+                                Text(
+                                    text = "Episodes (Season $selectedSeason)",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "${seasonEpisodes.size} Episodes",
+                                    fontSize = 12.sp,
+                                    color = TextMuted
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            if (seasonEpisodes.isEmpty()) {
+                                Text(
+                                    text = "No episodes loaded for this season",
+                                    color = TextMuted,
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.padding(vertical = 12.dp)
+                                )
+                            } else {
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    items(seasonEpisodes, key = { it.id }) { ep ->
+                                        val isCurrent = (currentEpisode?.id == ep.id)
+                                        val qStatus = preResolveStatus[PreResolveQueueManager.identity(viewModel.animeId, ep)]
+                                        HorizontalEpisodeCard(
+                                            episode = ep,
+                                            isCurrent = isCurrent,
+                                            qStatus = qStatus,
+                                            onClick = {
+                                                if (!isCurrent) {
+                                                    viewModel.startPlaybackForEpisode(ep)
+                                                }
                                             }
-                                        }
-                                    )
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1058,6 +1061,7 @@ fun PlayerScreen(
                     availableLanguages = availableDownloadLanguages,
                     storageStats = storageStats,
                     initialTab = downloadSheetInitialTab,
+                    isMovie = isMovie,
                     onDismiss = { showDownloadManagementSheet = false },
                     onStartSingleDownload = { q, l -> viewModel.startDownload(q, l) },
                     onStartBatchDownload = { eps, q, l -> viewModel.startBatchDownload(eps, q, l) },
@@ -1588,18 +1592,20 @@ private fun PlayerControlsOverlay(
                         )
                     }
 
-                    IconButton(
-                        onClick = onNextEpisode,
-                        modifier = Modifier
-                            .size(42.dp)
-                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SkipNext,
-                            contentDescription = "Next Episode",
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
-                        )
+                    if (!isMovie) {
+                        IconButton(
+                            onClick = onNextEpisode,
+                            modifier = Modifier
+                                .size(42.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SkipNext,
+                                contentDescription = "Next Episode",
+                                tint = Color.White,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
                     }
                 }
 
@@ -2193,7 +2199,14 @@ private fun TechInfoDialog(
             ) {
                 TechInfoRow("Title", anime?.preferredTitle ?: "Unknown")
                 currentEpisode?.let { ep ->
-                    TechInfoRow("Episode", "Season ${ep.seasonNumber} • Ep ${ep.episodeNumber}")
+                    val isMovieFormat = anime?.mediaCategory?.equals("MOVIE", ignoreCase = true) == true ||
+                        anime?.format?.equals("MOVIE", ignoreCase = true) == true ||
+                        ep.seasonNumber == 0
+                    if (isMovieFormat) {
+                        TechInfoRow("Format", "Feature Film / Movie")
+                    } else {
+                        TechInfoRow("Episode", "Season ${ep.seasonNumber} • Ep ${ep.episodeNumber}")
+                    }
                 }
                 val resStr = if (videoFormat != null && videoFormat.width > 0 && videoFormat.height > 0) {
                     "${videoFormat.width}x${videoFormat.height} @ ${String.format("%.1f", videoFormat.frameRate.coerceAtLeast(0f))} fps"

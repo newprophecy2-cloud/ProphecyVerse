@@ -176,71 +176,50 @@ class DownloadManager private constructor(private val context: Context) {
                     return@launch
                 }
 
-                // Always resolve a fresh URL for an active download. Signed playback URLs and
-                // their authorization headers are short-lived and must not be reused from a
-                // previous attempt or persisted database row.
-                var directUrl: String? = null
-                var headers: List<List<String>> = emptyList()
-                var protocolHint: String? = null
-
-                if (directUrl.isNullOrBlank()) {
-                    val anime = database.animeDao().getAnimeById(animeId)
-                    val backendId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
-                    if (backendId == null) {
-                        downloadDao.upsertDownload(
-                            existing.copy(
-                                downloadStatus = "FAILED",
-                                errorMessage = "Catalog media source not found"
-                            )
-                        )
-                        return@launch
-                    }
-
-                    val episode = database.episodeDao().getEpisodeById(episodeId)
-                        ?: EpisodeEntry(episodeId, animeId, seasonNumber, episodeNumber)
-                    var resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
-                        backendId,
+                // Cache-first stream URL resolution (Room -> Firestore -> lazy discovery/Resolve)
+                val episode = database.episodeDao().getEpisodeById(episodeId)
+                    ?: EpisodeEntry(episodeId, animeId, seasonNumber, episodeNumber, title = episodeTitle)
+                var resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
+                    animeId,
+                    episode,
+                    preferredSourceId = preferredSourceId
+                )
+                if (resolutionResult.isFailure && isTransientResolutionFailure(resolutionResult.exceptionOrNull())) {
+                    delay(1_500L)
+                    resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
+                        animeId,
                         episode,
                         preferredSourceId = preferredSourceId
                     )
-                    if (resolutionResult.isFailure && isTransientResolutionFailure(resolutionResult.exceptionOrNull())) {
-                        delay(1_500L)
-                        resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
-                            backendId,
-                            episode,
-                            preferredSourceId = preferredSourceId
-                        )
-                    }
-                    val verified = resolutionResult.getOrNull()
-                    if (verified == null) {
-                        downloadDao.upsertDownload(
-                            existing.copy(
-                                downloadStatus = "FAILED",
-                                errorMessage = UserFacingErrorMapper.message(
-                                    resolutionResult.exceptionOrNull(),
-                                    "No verified downloadable source is ready yet. Please try again."
-                                )
+                }
+                val verified = resolutionResult.getOrNull()
+                if (verified == null) {
+                    downloadDao.upsertDownload(
+                        existing.copy(
+                            downloadStatus = "FAILED",
+                            errorMessage = UserFacingErrorMapper.message(
+                                resolutionResult.exceptionOrNull(),
+                                "No verified downloadable source is ready yet. Please try again."
                             )
                         )
-                        return@launch
-                    }
-
-                    val source = verified.source
-                    val playData = verified.directData
-                    directUrl = playData.playbackUrl
-                    headers = playData.headers
-                    protocolHint = playData.urlType
-                    existing = existing.copy(
-                        downloadStatus = "DOWNLOADING",
-                        downloadUrl = null,
-                        quality = existing.quality ?: source.quality,
-                        audioLanguage = existing.audioLanguage ?: source.language
                     )
-                    downloadDao.upsertDownload(existing)
+                    return@launch
                 }
 
-                val targetUrl = directUrl
-                if (targetUrl.isNullOrBlank()) {
+                val source = verified.source
+                val playData = verified.directData
+                val targetUrl = playData.playbackUrl
+                val headers = playData.headers
+                val protocolHint = playData.urlType
+                existing = existing.copy(
+                    downloadStatus = "DOWNLOADING",
+                    downloadUrl = null,
+                    quality = existing.quality ?: source.quality,
+                    audioLanguage = existing.audioLanguage ?: source.language
+                )
+                downloadDao.upsertDownload(existing)
+
+                if (targetUrl.isBlank()) {
                     downloadDao.upsertDownload(
                         existing.copy(
                             downloadStatus = "FAILED",
@@ -251,9 +230,12 @@ class DownloadManager private constructor(private val context: Context) {
                 }
 
                 // App-private target file (guaranteed not in Gallery)
+                val isMovie = mediaType.equals("movie", ignoreCase = true) ||
+                    seasonNumber == 0 || episodeId.startsWith("movie_")
                 val sanitizedAnime = animeId.replace(Regex("[^a-zA-Z0-9_]"), "_")
-                val finalFile = File(mediaDir, "${sanitizedAnime}_s${seasonNumber}_e${episodeNumber}.mp4")
-                val tempFile = File(mediaDir, "${sanitizedAnime}_s${seasonNumber}_e${episodeNumber}.tmp")
+                val baseName = if (isMovie) "${sanitizedAnime}_movie" else "${sanitizedAnime}_s${seasonNumber}_e${episodeNumber}"
+                val finalFile = File(mediaDir, "$baseName.mp4")
+                val tempFile = File(mediaDir, "$baseName.tmp")
 
                 executeDownloadLoop(
                     episodeId = episodeId,
@@ -511,8 +493,11 @@ class DownloadManager private constructor(private val context: Context) {
             if (current != null) {
                 // Delete temp file
                 val mediaDir = getAppPrivateMediaDir()
+                val isMovie = current.mediaType.equals("movie", ignoreCase = true) ||
+                    current.seasonNumber == 0 || current.id.startsWith("movie_")
                 val sanitizedAnime = current.animeId.replace(Regex("[^a-zA-Z0-9_]"), "_")
-                val tempFile = File(mediaDir, "${sanitizedAnime}_s${current.seasonNumber}_e${current.episodeNumber}.tmp")
+                val baseName = if (isMovie) "${sanitizedAnime}_movie" else "${sanitizedAnime}_s${current.seasonNumber}_e${current.episodeNumber}"
+                val tempFile = File(mediaDir, "$baseName.tmp")
                 if (tempFile.exists()) tempFile.delete()
                 downloadDao.deleteDownload(episodeId)
             }

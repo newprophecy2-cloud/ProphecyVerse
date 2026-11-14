@@ -136,9 +136,10 @@ object EpisodeSourceAggregator {
             errorMessage?.contains("timeout", ignoreCase = true) == true ||
             declaredState == EpisodeSourceResponseState.TIMEOUT
         val state = when {
-            explicitTimeout -> EpisodeSourceResponseState.TIMEOUT
-            !errorMessage.isNullOrBlank() -> EpisodeSourceResponseState.FAILED
+            explicitTimeout && candidates.isEmpty() -> EpisodeSourceResponseState.TIMEOUT
+            !errorMessage.isNullOrBlank() && candidates.isEmpty() -> EpisodeSourceResponseState.FAILED
             partial == true || declaredState == EpisodeSourceResponseState.PARTIAL -> EpisodeSourceResponseState.PARTIAL
+            !errorMessage.isNullOrBlank() && candidates.isNotEmpty() -> EpisodeSourceResponseState.PARTIAL
             declaredState == EpisodeSourceResponseState.FAILED -> EpisodeSourceResponseState.FAILED
             declaredState == EpisodeSourceResponseState.STALE -> EpisodeSourceResponseState.STALE
             declaredState == EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceResponseState.UNKNOWN

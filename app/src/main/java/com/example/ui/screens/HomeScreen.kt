@@ -105,20 +105,20 @@ fun HomeScreen(
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
     val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
 
-    // Confirmed available only on Home Screen
-    val playableTrending: List<AnimeEntry> = remember(trending) { trending.filter { it.isPlayable } }
-    val playableSeasonal: List<AnimeEntry> = remember(seasonal) { seasonal.filter { it.isPlayable } }
-    val playablePopular: List<AnimeEntry> = remember(popular) { popular.filter { it.isPlayable } }
-    val playableKdramas: List<AnimeEntry> = remember(kdramas) { kdramas.filter { it.isPlayable } }
-    val playableMovies: List<AnimeEntry> = remember(movies) { movies.filter { it.isPlayable } }
-    val playableWebSeries: List<AnimeEntry> = remember(webSeries) { webSeries.filter { it.isPlayable } }
+    // Home displays AniList metadata directly; streaming availability is discovered lazily per item.
+    val visibleTrending: List<AnimeEntry> = trending
+    val visibleSeasonal: List<AnimeEntry> = seasonal
+    val visiblePopular: List<AnimeEntry> = popular
+    val visibleKdramas: List<AnimeEntry> = kdramas
+    val visibleMovies: List<AnimeEntry> = movies
+    val visibleWebSeries: List<AnimeEntry> = webSeries
 
     val featuredAnime: AnimeEntry? = when (selectedCategory) {
-        "KDRAMA" -> playableKdramas.firstOrNull()
-        "MOVIES" -> playableMovies.firstOrNull()
-        "SERIES" -> playableWebSeries.firstOrNull()
-        else -> playableTrending.firstOrNull { entry: AnimeEntry -> !entry.bannerUrl.isNullOrBlank() }
-            ?: playableTrending.firstOrNull() ?: playableSeasonal.firstOrNull()
+        "KDRAMA" -> visibleKdramas.firstOrNull()
+        "MOVIES" -> visibleMovies.firstOrNull()
+        "SERIES" -> visibleWebSeries.firstOrNull()
+        else -> visibleTrending.firstOrNull { entry: AnimeEntry -> !entry.bannerUrl.isNullOrBlank() }
+            ?: visibleTrending.firstOrNull() ?: visibleSeasonal.firstOrNull()
     }
 
     val context = LocalContext.current
@@ -171,7 +171,7 @@ fun HomeScreen(
                             letterSpacing = 0.5.sp
                         )
                         Text(
-                            text = "Verified Streaming & Catalog",
+                            text = "AniList Catalog & Direct Streaming",
                             style = MaterialTheme.typography.bodySmall,
                             color = AccentCyan,
                             fontSize = 11.sp
@@ -273,14 +273,12 @@ fun HomeScreen(
             }
         }
 
-        // Category Filter Chips (All, Anime, K-Drama, Movies, Web Series)
+        // Category Filter Chips (All, Anime, Movies)
         item {
             val categories = listOf(
                 Triple("ALL", "All", Icons.Default.AutoAwesome),
                 Triple("ANIME", "Anime", Icons.Default.PlayArrow),
-                Triple("KDRAMA", "K-Drama", Icons.Default.Favorite),
-                Triple("MOVIES", "Movies", Icons.Default.Movie),
-                Triple("SERIES", "Web Series", Icons.Default.Tv)
+                Triple("MOVIES", "Movies", Icons.Default.Movie)
             )
             LazyRow(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
@@ -376,12 +374,12 @@ fun HomeScreen(
         // 1. ANIME RAILS (Trending & Seasonal)
         if (selectedCategory == "ALL" || selectedCategory == "ANIME") {
             item {
-                SectionHeader(title = "Trending Anime", subtitle = "Confirmed available to play")
-                if (playableTrending.isEmpty() && isRefreshing) {
+                SectionHeader(title = "Trending Anime", subtitle = "Trending now on AniList")
+                if (visibleTrending.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playableTrending.isNotEmpty()) {
+                } else if (visibleTrending.isNotEmpty()) {
                     AnimeRail(
-                        animes = playableTrending,
+                        animes = visibleTrending,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "trending"
                     )
@@ -391,11 +389,11 @@ fun HomeScreen(
 
             item {
                 SectionHeader(title = "This Season", subtitle = "Top currently airing anime releases")
-                if (playableSeasonal.isEmpty() && isRefreshing) {
+                if (visibleSeasonal.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playableSeasonal.isNotEmpty()) {
+                } else if (visibleSeasonal.isNotEmpty()) {
                     AnimeRail(
-                        animes = playableSeasonal,
+                        animes = visibleSeasonal,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "seasonal"
                     )
@@ -404,15 +402,15 @@ fun HomeScreen(
             }
         }
 
-        // 2. K-DRAMA RAIL
-        if (selectedCategory == "ALL" || selectedCategory == "KDRAMA") {
+        // 2. K-DRAMA RAIL (only shown if populated in Room)
+        if ((selectedCategory == "ALL" && visibleKdramas.isNotEmpty()) || selectedCategory == "KDRAMA") {
             item {
-                SectionHeader(title = "K-Drama Hits", subtitle = "Verified Korean drama series available now")
-                if (playableKdramas.isEmpty() && isRefreshing) {
+                SectionHeader(title = "K-Drama Hits", subtitle = "Korean drama series")
+                if (visibleKdramas.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playableKdramas.isNotEmpty()) {
+                } else if (visibleKdramas.isNotEmpty()) {
                     AnimeRail(
-                        animes = playableKdramas,
+                        animes = visibleKdramas,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "kdrama"
                     )
@@ -424,12 +422,12 @@ fun HomeScreen(
         // 3. MOVIES RAIL
         if (selectedCategory == "ALL" || selectedCategory == "MOVIES") {
             item {
-                SectionHeader(title = "Movies", subtitle = "Verified feature films and anime movies")
-                if (playableMovies.isEmpty() && isRefreshing) {
+                SectionHeader(title = "Movies", subtitle = "Popular anime films on AniList")
+                if (visibleMovies.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playableMovies.isNotEmpty()) {
+                } else if (visibleMovies.isNotEmpty()) {
                     AnimeRail(
-                        animes = playableMovies,
+                        animes = visibleMovies,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "movies"
                     )
@@ -438,15 +436,15 @@ fun HomeScreen(
             }
         }
 
-        // 4. WEB SERIES RAIL
-        if (selectedCategory == "ALL" || selectedCategory == "SERIES") {
+        // 4. WEB SERIES RAIL (only shown if populated in Room)
+        if ((selectedCategory == "ALL" && visibleWebSeries.isNotEmpty()) || selectedCategory == "SERIES") {
             item {
-                SectionHeader(title = "Web Series", subtitle = "Confirmed streaming live action & web series")
-                if (playableWebSeries.isEmpty() && isRefreshing) {
+                SectionHeader(title = "Web Series", subtitle = "Live action & web series")
+                if (visibleWebSeries.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playableWebSeries.isNotEmpty()) {
+                } else if (visibleWebSeries.isNotEmpty()) {
                     AnimeRail(
-                        animes = playableWebSeries,
+                        animes = visibleWebSeries,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "series"
                     )
@@ -458,12 +456,12 @@ fun HomeScreen(
         // All Time Popular Rail
         if (selectedCategory == "ALL" || selectedCategory == "ANIME") {
             item {
-                SectionHeader(title = "All-Time Popular", subtitle = "Acclaimed legends")
-                if (playablePopular.isEmpty() && isRefreshing) {
+                SectionHeader(title = "All-Time Popular", subtitle = "Acclaimed AniList legends")
+                if (visiblePopular.isEmpty() && isRefreshing) {
                     LoadingRail()
-                } else if (playablePopular.isNotEmpty()) {
+                } else if (visiblePopular.isNotEmpty()) {
                     AnimeRail(
-                        animes = playablePopular,
+                        animes = visiblePopular,
                         onAnimeClick = onAnimeClick,
                         testTagPrefix = "popular"
                     )
@@ -527,21 +525,19 @@ fun HeroBanner(
                     .padding(16.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (anime.isPlayable) {
-                        Surface(
-                            shape = RoundedCornerShape(4.dp),
-                            color = PlayableGreen
-                        ) {
-                            Text(
-                                text = "PLAYABLE",
-                                color = Color.White,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = AccentIndigo
+                    ) {
+                        Text(
+                            text = if (anime.format?.equals("MOVIE", ignoreCase = true) == true) "MOVIE" else "FEATURED",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
                     }
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = "${anime.format ?: "ANIME"} • ${anime.year ?: ""}",
                         color = AccentCyan,
@@ -634,6 +630,9 @@ fun ContinueWatchingCard(
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark)
     ) {
+        val isMovieHistory = history.mediaType.equals("movie", ignoreCase = true) ||
+            history.seasonNumber == 0 ||
+            history.episodeId.startsWith("movie_")
         Column(modifier = Modifier.padding(12.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -645,7 +644,7 @@ fun ContinueWatchingCard(
                     color = AccentIndigo.copy(alpha = 0.2f)
                 ) {
                     Text(
-                        text = "S${history.seasonNumber} : E${history.episodeNumber}",
+                        text = if (isMovieHistory) "Movie" else "S${history.seasonNumber} : E${history.episodeNumber}",
                         color = AccentIndigo,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -663,7 +662,7 @@ fun ContinueWatchingCard(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = history.episodeTitle ?: "Episode ${history.episodeNumber}",
+                text = history.episodeTitle ?: if (isMovieHistory) (history.animeTitle ?: "Full Movie") else "Episode ${history.episodeNumber}",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = TextPrimary,

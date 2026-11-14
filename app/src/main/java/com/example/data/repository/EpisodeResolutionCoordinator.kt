@@ -4,6 +4,7 @@ import android.util.Log
 import com.example.data.local.EpisodeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
+import com.example.data.streaming.MonotonicMetrics
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -34,59 +35,62 @@ object EpisodeResolutionCoordinator {
 data class VerifiedEpisodePlayback(
     val source: ProphecySourceDto,
     val directData: DirectPlayData,
-    val candidates: List<ProphecySourceDto>
+    val candidates: List<ProphecySourceDto>,
+    val cacheTier: String = "BACKEND_RESOLVE"
 )
 
 suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
-    backendAnimeId: String,
+    animeOrBackendId: String,
     episode: EpisodeEntry,
-    preferredSourceId: String? = null
+    preferredSourceId: String? = null,
+    forceResolveFresh: Boolean = false
 ): Result<VerifiedEpisodePlayback> {
-    if (backendAnimeId.isBlank() || episode.id.isBlank()) {
+    val targetAnimeId = episode.animeId.takeIf { it.isNotBlank() } ?: animeOrBackendId
+    if (targetAnimeId.isBlank() || episode.id.isBlank()) {
         return Result.failure(IllegalArgumentException("Episode identity is incomplete"))
     }
     val key = buildString {
-        append(backendAnimeId).append('|')
+        append(targetAnimeId).append('|')
             .append(episode.seasonNumber).append('|')
+            .append(episode.episodeNumber).append('|')
             .append(episode.id).append('|')
-            .append(preferredSourceId.orEmpty())
+            .append(preferredSourceId.orEmpty()).append('|')
+            .append(forceResolveFresh)
     }
     return EpisodeResolutionCoordinator.resolve("verified:$key") {
-        val startedAt = System.currentTimeMillis()
+        val startedAt = MonotonicMetrics.nowMs()
         try {
-            withTimeout(18_000L) {
-                val sourceResult = fetchEpisodeSourcesForCanonical(backendAnimeId, episode)
-                val sources = sourceResult.getOrElse { return@withTimeout Result.failure(it) }
-                    .filter { it.hasUsableSourceId }
-                    .distinctBy { it.stableIdentity }
-                val ordered = if (preferredSourceId.isNullOrBlank()) {
-                    sources.sortedWith(compareByDescending<ProphecySourceDto> { it.downloadable == true })
-                } else {
-                    sources.sortedWith(
-                        compareBy<ProphecySourceDto> { if (it.id == preferredSourceId) 0 else 1 }
-                            .thenByDescending { it.downloadable == true }
+            withTimeout(22_000L) {
+                val resolved = resolvePlayableStream(
+                    animeId = targetAnimeId,
+                    seasonNumber = episode.seasonNumber,
+                    episodeNumber = episode.episodeNumber,
+                    catalogEpisodeId = episode.id,
+                    preferredSourceId = preferredSourceId,
+                    forceResolveFresh = forceResolveFresh
+                ).getOrElse { return@withTimeout Result.failure(it) }
+
+                MonotonicMetrics.recordDuration(
+                    "episode_resolution_total_ms",
+                    startedAt,
+                    "tier=${resolved.cacheTier} candidates=${resolved.candidates.size}"
+                )
+                Result.success(
+                    VerifiedEpisodePlayback(
+                        source = resolved.source,
+                        directData = resolved.directData,
+                        candidates = resolved.candidates,
+                        cacheTier = resolved.cacheTier
                     )
-                }
-                var lastError: Throwable? = null
-                for (source in ordered) {
-                    val direct = resolveDirectPlayback(source.id).getOrNull()
-                    if (direct == null) {
-                        lastError = IllegalStateException("Source resolution was unavailable")
-                        continue
-                    }
-                    if (direct.sourceId != source.id || direct.playbackUrl.isBlank()) {
-                        lastError = IllegalStateException("Resolved source identity did not match")
-                        continue
-                    }
-                    Log.i("AnimeRepository", "episode_resolution_total_ms=${System.currentTimeMillis() - startedAt} candidates=${ordered.size}")
-                    return@withTimeout Result.success(VerifiedEpisodePlayback(source, direct, ordered))
-                }
-                Result.failure(lastError ?: IllegalStateException("No verified playable source available"))
+                )
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.i("AnimeRepository", "episode_resolution_total_ms=${System.currentTimeMillis() - startedAt} outcome=failed category=${e::class.simpleName}")
+            Log.i(
+                "EpisodeResolution",
+                "episode_resolution_total_ms=${MonotonicMetrics.nowMs() - startedAt} outcome=failed category=${e::class.simpleName}"
+            )
             Result.failure(e)
         }
     }

@@ -85,8 +85,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             viewModelScope.launch {
-                // When internet connectivity returns, automatically refresh feeds in background
-                repository.processPendingSharedCatalogWrites()
+                // When internet connectivity returns, automatically refresh AniList feeds in background
                 repository.refreshHomeDiscovery(force = false)
             }
         }
@@ -96,8 +95,6 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         try {
             connectivityManager?.registerDefaultNetworkCallback(networkCallback)
         } catch (_: Exception) {}
-        // Resume only the durable pending queue after process restart; no catalog scan is performed.
-        viewModelScope.launch { repository.processPendingSharedCatalogWrites() }
         refreshHome()
     }
 
@@ -147,11 +144,18 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
     private val _isSearching = MutableStateFlow(false)
     val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
 
+    private val _isLoadingMore = MutableStateFlow(false)
+    val isLoadingMore: StateFlow<Boolean> = _isLoadingMore.asStateFlow()
+
+    private val _hasNextPage = MutableStateFlow(false)
+    val hasNextPage: StateFlow<Boolean> = _hasNextPage.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
     private var searchJob: Job? = null
-    private var searchPrefetchJob: Job? = null
+    private var loadMoreJob: Job? = null
+    private var currentPage: Int = 1
     private var searchRequestSequence = 0L
 
     // Database-First: observe Room query results
@@ -171,7 +175,10 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         _searchQuery.value = newQuery
         val requestId = ++searchRequestSequence
         searchJob?.cancel()
-        searchPrefetchJob?.cancel()
+        loadMoreJob?.cancel()
+        currentPage = 1
+        _hasNextPage.value = false
+        _isLoadingMore.value = false
 
         if (newQuery.isBlank()) {
             _isSearching.value = false
@@ -181,16 +188,37 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         searchJob = viewModelScope.launch {
             _isSearching.value = true
             _error.value = null
-            val res = repository.searchAnime(newQuery)
+            val res = repository.searchAnimePage(newQuery, page = 1)
             if (requestId == searchRequestSequence) {
-                if (res.isFailure) {
+                res.onSuccess { pageRes ->
+                    currentPage = pageRes.currentPage
+                    _hasNextPage.value = pageRes.hasNextPage
+                }.onFailure {
+                    val savedState = repository.getSearchQueryState(newQuery)
+                    _hasNextPage.value = savedState?.hasNextPage ?: false
                     _error.value = "Network search failed. Showing local results."
                 }
                 _isSearching.value = false
-                if (res.isSuccess) {
-                    viewModelScope.launch { repository.syncSearchResults(newQuery) }
-                    searchPrefetchJob = viewModelScope.launch { repository.prefetchSearchResults(newQuery) }
+            }
+        }
+    }
+
+    fun loadNextPage() {
+        val query = _searchQuery.value.trim()
+        if (query.isBlank() || _isSearching.value || _isLoadingMore.value || !_hasNextPage.value) return
+        val requestId = searchRequestSequence
+        val nextPage = currentPage + 1
+        loadMoreJob = viewModelScope.launch {
+            _isLoadingMore.value = true
+            val res = repository.searchAnimePage(query, page = nextPage)
+            if (requestId == searchRequestSequence) {
+                res.onSuccess { pageRes ->
+                    currentPage = pageRes.currentPage
+                    _hasNextPage.value = pageRes.hasNextPage
+                }.onFailure {
+                    _error.value = "Could not load next search page."
                 }
+                _isLoadingMore.value = false
             }
         }
     }
@@ -264,9 +292,10 @@ class DetailViewModel(
     val syncError: StateFlow<String?> = _syncError.asStateFlow()
     private var refreshJob: Job? = null
     private var sourceDiscoveryJob: Job? = null
+    private var scopedListenerJob: Job? = null
     private var sourceRequestGeneration: Long = 0L
 
-    // In-memory episode source selection
+    // In-memory episode or movie source selection
     private val _episodeSources = MutableStateFlow<List<ProphecySourceDto>>(emptyList())
     val episodeSources: StateFlow<List<ProphecySourceDto>> = _episodeSources.asStateFlow()
 
@@ -305,7 +334,7 @@ class DetailViewModel(
         viewModelScope.launch {
             combine(lastPlayed, allCatalogEpisodes) { history, records -> history to records }
                 .collect { (history, records) ->
-                if (history != null) {
+                if (history != null && history.seasonNumber > 0) {
                     _selectedSeason.value = history.seasonNumber
                     val ordered = episodesForDisplay(
                         records, history.seasonNumber, _catalogRefreshStatus.value.currentRefreshEpisodeIds
@@ -319,10 +348,23 @@ class DetailViewModel(
         }
         viewModelScope.launch {
             combine(animeEntry, episodes, lastPlayed) { anime, window, history -> Triple(anime, window, history) }
-                .collect { (anime, window, history) -> queueAutomaticSourceDiscovery(window, anime, history) }
+                .collect { (anime, window, history) ->
+                    if (anime != null && com.example.data.streaming.ContentIdentityHelper.isMovie(anime)) {
+                        attachScopedListener(anime, isMovie = true, seasonNumber = 0, episodeNumber = 1, catalogEpisodeId = null)
+                    }
+                    checkCachedSourceStatesForWindow(window, anime, history)
+                }
         }
         refreshDetails()
     }
+
+    fun syntheticMovieTarget(entry: AnimeEntry): EpisodeEntry = EpisodeEntry(
+        id = "movie_${entry.id}",
+        animeId = entry.id,
+        seasonNumber = 0,
+        episodeNumber = 1,
+        title = entry.preferredTitle
+    )
 
     fun refreshDetails() {
         if (refreshJob?.isActive == true) return
@@ -337,9 +379,8 @@ class DetailViewModel(
                         )
                     } catch (cancelled: kotlinx.coroutines.CancellationException) {
                         throw cancelled
-                    } catch (_: Exception) {
-                        // Analytics is optional; it must not prevent catalog refresh.
-                    }
+                    } catch (_: Exception) {}
+
                     val result = repository.refreshAnimeDetails(animeId)
                     val outcome = result.getOrNull()
                     if (outcome != null) {
@@ -347,22 +388,21 @@ class DetailViewModel(
                         if (!outcome.errorMessage.isNullOrBlank()) {
                             _syncError.value = outcome.errorMessage
                         }
-                        viewModelScope.launch { repository.refreshOptionalAniListMetadata(animeId) }
                     } else {
                         _catalogRefreshStatus.value = EpisodeCatalogRefreshStatus(
                             EpisodeCatalogState.FAILED, false, false,
-                            "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                            "Catalog refresh failed. Cached metadata remains available; tap retry to try again."
                         )
-                        _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                        _syncError.value = "Catalog refresh failed. Cached metadata remains available; tap retry to try again."
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
                     _catalogRefreshStatus.value = EpisodeCatalogRefreshStatus(
                         EpisodeCatalogState.FAILED, false, false,
-                        "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                        "Catalog refresh failed. Cached metadata remains available; tap retry to try again."
                     )
-                    _syncError.value = "Catalog refresh failed. Cached episodes remain available; tap retry to try again."
+                    _syncError.value = "Catalog refresh failed. Cached metadata remains available; tap retry to try again."
                 }
             }
         }
@@ -371,7 +411,6 @@ class DetailViewModel(
     fun selectSeason(seasonNumber: Int) {
         _selectedSeason.value = seasonNumber
         _episodeWindowStart.value = 0
-        viewModelScope.launch { repository.syncOpenedSeason(animeId, seasonNumber) }
     }
 
     fun loadNextEpisodeWindow() {
@@ -383,12 +422,14 @@ class DetailViewModel(
     }
 
     fun focusEpisodeWindow(episode: EpisodeEntry) {
-        _selectedSeason.value = episode.seasonNumber
-        val ordered = episodesForDisplay(
-            allCatalogEpisodes.value, episode.seasonNumber, _catalogRefreshStatus.value.currentRefreshEpisodeIds
-        )
-        val index = ordered.indexOfFirst { it.id == episode.id }
-        _episodeWindowStart.value = if (index >= 0) (index / 30) * 30 else 0
+        if (episode.seasonNumber > 0) {
+            _selectedSeason.value = episode.seasonNumber
+            val ordered = episodesForDisplay(
+                allCatalogEpisodes.value, episode.seasonNumber, _catalogRefreshStatus.value.currentRefreshEpisodeIds
+            )
+            val index = ordered.indexOfFirst { it.id == episode.id }
+            _episodeWindowStart.value = if (index >= 0) (index / 30) * 30 else 0
+        }
     }
 
     private fun episodesForDisplay(
@@ -406,72 +447,55 @@ class DetailViewModel(
             if (refreshed.size == 1) listOf(refreshed.single()) else sameNumber
         }
 
-    private fun queueAutomaticSourceDiscovery(
+    /**
+     * Passive cache check for visible Episode rows (Room only; never triggers bulk Backend scans).
+     */
+    private fun checkCachedSourceStatesForWindow(
         window: List<EpisodeEntry>,
         current: AnimeEntry?,
         history: PlaybackHistory?
     ) {
         current ?: return
-        val backendId = current.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
-        if (backendId == null) {
-            automaticSourceJobs.values.forEach { it.cancel() }
-            automaticSourceJobs.clear()
-            _episodeSourceStates.value = emptyMap()
-            return
-        }
         val visibleIds = window.map { it.id }.toSet()
         val selectedId = _selectedEpisodeForSources.value?.id
         automaticSourceJobs.toMap().forEach { (episodeId, job) ->
             if (episodeId !in visibleIds && episodeId != selectedId) {
                 job.cancel()
-                _episodeSourceStates.value = _episodeSourceStates.value - episodeId
             }
         }
         _episodeSourceStates.value = _episodeSourceStates.value.filterKeys { it in visibleIds || it == selectedId }
         if (window.isEmpty()) return
-        val priorityEpisodeId = history?.episodeId
-        val ordered = window.sortedWith(compareBy<EpisodeEntry> { if (it.id == priorityEpisodeId) 0 else 1 }
+
+        val ordered = window.sortedWith(compareBy<EpisodeEntry> { if (it.id == history?.episodeId) 0 else 1 }
             .thenBy { it.episodeNumber })
         ordered.forEach { episode ->
-            val existingState = _episodeSourceStates.value[episode.id]
-            if (existingState in setOf(EpisodeSourceState.LOADING, EpisodeSourceState.AVAILABLE,
-                    EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL)) return@forEach
             if (automaticSourceJobs[episode.id]?.isActive == true) return@forEach
-            _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
+            val existingState = _episodeSourceStates.value[episode.id]
+            if (existingState in setOf(EpisodeSourceState.AVAILABLE, EpisodeSourceState.EMPTY, EpisodeSourceState.PARTIAL)) return@forEach
             automaticSourceJobs[episode.id] = viewModelScope.launch {
                 try {
-                    automaticSourceSemaphore.withPermit {
-                        val result = repository.fetchEpisodeSourceSnapshotForCanonical(backendId, episode)
-                        val state = result.getOrNull()?.state?.let {
-                            when (it) {
-                                EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
-                                EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
-                                EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
-                                EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
-                                EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
-                                EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
-                                EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
-                            }
-                        } ?: run {
-                            val error = result.exceptionOrNull()
-                            if (generateSequence(error) { it.cause }.any { it is java.net.SocketTimeoutException }) {
-                                EpisodeSourceState.TIMEOUT
-                            } else {
-                                EpisodeSourceState.FAILED
-                            }
-                        }
-                        _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
+                    val cached = repository.getCachedEpisodeSourceSnapshot(
+                        backendAnimeId = animeId,
+                        episodeId = episode.id,
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber
+                    )
+                    if (cached != null) {
+                        _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to mapResponseState(cached.state))
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    _episodeSourceStates.value = _episodeSourceStates.value - episode.id
                     throw cancelled
                 } catch (_: Exception) {
-                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
                 } finally {
                     automaticSourceJobs.remove(episode.id)
                 }
             }
         }
+    }
+
+    fun openMovieSourceChooser(forceRefresh: Boolean = false) {
+        val entry = animeEntry.value ?: return
+        openSourceChooser(syntheticMovieTarget(entry), forceRefresh = forceRefresh)
     }
 
     fun openSourceChooser(episode: EpisodeEntry, forceRefresh: Boolean = false) {
@@ -481,86 +505,46 @@ class DetailViewModel(
         val requestGeneration = ++sourceRequestGeneration
         sourceDiscoveryJob?.cancel()
         _selectedEpisodeForSources.value = episode
-        // Clear only when changing Episode; retry retains this Episode's candidates during refresh.
         if (!sameEpisode) _episodeSources.value = emptyList()
         _isLoadingSources.value = false
         _sourceError.value = null
         _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.LOADING)
-        automaticSourceJobs.toMap().forEach { (episodeId, job) ->
-            if (episodeId != episode.id) {
-                job.cancel()
-                _episodeSourceStates.value = _episodeSourceStates.value - episodeId
-            }
-        }
-        val current = animeEntry.value
-        val backendId = current?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
 
-        if (backendId == null) {
-            _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to EpisodeSourceState.FAILED)
-            _sourceError.value = "This title is metadata-only and not currently playable in catalog."
-            return
+        val entry = animeEntry.value
+        val isMovie = com.example.data.streaming.ContentIdentityHelper.isMovie(entry) ||
+            episode.seasonNumber == 0 || episode.id.startsWith("movie_")
+        if (entry != null) {
+            attachScopedListener(entry, isMovie, episode.seasonNumber, episode.episodeNumber, episode.id)
         }
 
-        // Separate cancellable catalog sync; never make playback source resolution wait on Firestore.
-        viewModelScope.launch { repository.syncOpenedEpisode(animeId, episode) }
         sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
             try {
-                val cached = repository.getCachedEpisodeSourceSnapshot(
-                    backendId,
-                    episode.id,
-                    seasonNumber = episode.seasonNumber,
-                    episodeNumber = episode.episodeNumber
-                )
-                if (requestGeneration != sourceRequestGeneration) return@launch
-                if (cached != null) {
-                    _episodeSources.value = cached.sources
-                    val cachedState = when (cached.state) {
-                        EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
-                        EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
-                        EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
-                        EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
-                        EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
-                        EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
-                        EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
-                    }
-                    _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to cachedState)
-                    if (cached.isStale) _sourceError.value = "Showing cached source candidates; they are stale and not verified current. Refreshing…"
-                }
                 val res = automaticSourceSemaphore.withPermit {
-                    repository.fetchEpisodeSourceSnapshotForCanonical(backendId, episode, forceRefresh)
+                    repository.discoverStreamsForScope(
+                        animeId = animeId,
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber,
+                        catalogEpisodeId = episode.id,
+                        forceRefresh = forceRefresh
+                    )
                 }
                 if (requestGeneration != sourceRequestGeneration) return@launch
                 val snapshot = res.getOrNull()
                 if (snapshot != null) {
                     _episodeSources.value = snapshot.sources
-                    val state = when (snapshot.state) {
-                        EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
-                        EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
-                        EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
-                        EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
-                        EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
-                        EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
-                        EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
-                    }
+                    val state = mapResponseState(snapshot.state)
                     _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
                     if (!snapshot.errorMessage.isNullOrBlank()) {
                         _sourceError.value = snapshot.errorMessage
                     } else if (snapshot.sources.isEmpty()) {
                         _sourceError.value = when (snapshot.state) {
-                            EpisodeSourceResponseState.EMPTY -> "The backend confirmed that no sources are currently available."
-                            EpisodeSourceResponseState.PARTIAL -> "Source lookup is partial; retry to check again."
-                            EpisodeSourceResponseState.FAILED -> snapshot.errorMessage ?: "Source lookup failed. Retry to check again."
-                            EpisodeSourceResponseState.TIMEOUT -> snapshot.errorMessage ?: "Source lookup timed out. Retry to check again."
-                            EpisodeSourceResponseState.STALE -> snapshot.errorMessage ?: "Showing stale, unverified source candidates."
-                            else -> "The backend returned no source candidates, but did not confirm an empty result. Retry to check again."
+                            EpisodeSourceResponseState.EMPTY -> "No streaming sources are currently available for this title."
+                            EpisodeSourceResponseState.PARTIAL -> "Source discovery is partial; retry to check again."
+                            else -> "No streaming sources returned yet. Tap Retry to check again."
                         }
                     } else if (snapshot.state == EpisodeSourceResponseState.PARTIAL) {
-                        _sourceError.value = "Partial source response; available candidates are shown below."
-                    } else if (snapshot.state == EpisodeSourceResponseState.FAILED ||
-                        snapshot.state == EpisodeSourceResponseState.TIMEOUT ||
-                        snapshot.state == EpisodeSourceResponseState.STALE) {
-                        _sourceError.value = snapshot.errorMessage ?: "Some source information may be unavailable."
+                        _sourceError.value = "Partial source discovery; available candidates are shown below."
                     }
                 } else {
                     val error = res.exceptionOrNull()
@@ -568,7 +552,7 @@ class DetailViewModel(
                     _episodeSourceStates.value = _episodeSourceStates.value + (
                         episode.id to if (timedOut) EpisodeSourceState.TIMEOUT else EpisodeSourceState.FAILED
                     )
-                    _sourceError.value = UserFacingErrorMapper.message(res.exceptionOrNull())
+                    _sourceError.value = UserFacingErrorMapper.message(error, "No streaming sources discovered yet.")
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
@@ -581,20 +565,85 @@ class DetailViewModel(
             } finally {
                 if (requestGeneration == sourceRequestGeneration) {
                     _isLoadingSources.value = false
-                    queueAutomaticSourceDiscovery(episodes.value, animeEntry.value, lastPlayed.value)
                 }
             }
         }
+    }
+
+    private fun attachScopedListener(
+        entry: AnimeEntry,
+        isMovie: Boolean,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        catalogEpisodeId: String?
+    ) {
+        val contentKey = com.example.data.streaming.ContentIdentityHelper.canonicalContentKey(animeId, entry)
+        val effectiveSeason = if (isMovie) 0 else com.example.data.streaming.ContentIdentityHelper.effectiveSeasonNumber(entry, seasonNumber, isMovie = false)
+        val targetEpisodeId = catalogEpisodeId ?: "movie_${entry.id}"
+        scopedListenerJob?.cancel()
+        scopedListenerJob = viewModelScope.launch {
+            repository.streamingRepository.observeScopedStreamingUpdates(
+                contentKey = contentKey,
+                isMovie = isMovie,
+                seasonNumber = effectiveSeason,
+                episodeNumber = if (isMovie) 1 else episodeNumber,
+                catalogEpisodeId = targetEpisodeId
+            ).collect { scoped ->
+                val activeEp = _selectedEpisodeForSources.value
+                if (scoped.sources.isNotEmpty() && (isMovie || activeEp?.id == targetEpisodeId)) {
+                    val dtos = scoped.sources.filter { it.status != "REMOVED" && it.deletedAt == null }
+                        .map {
+                            ProphecySourceDto(
+                                id = it.sourceId,
+                                label = it.sourceName,
+                                quality = it.quality,
+                                codec = it.codec,
+                                language = it.audioLanguage,
+                                sizeBytes = it.sizeBytes,
+                                downloadable = it.downloadable,
+                                expiresAt = it.expiresAt
+                            )
+                        }
+                    if (dtos.isNotEmpty()) {
+                        _episodeSources.value = dtos
+                        _episodeSourceStates.value = _episodeSourceStates.value + (targetEpisodeId to EpisodeSourceState.AVAILABLE)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun mapResponseState(state: EpisodeSourceResponseState): EpisodeSourceState = when (state) {
+        EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
+        EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
+        EpisodeSourceResponseState.PARTIAL -> EpisodeSourceState.PARTIAL
+        EpisodeSourceResponseState.FAILED -> EpisodeSourceState.FAILED
+        EpisodeSourceResponseState.TIMEOUT -> EpisodeSourceState.TIMEOUT
+        EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceState.UNKNOWN
+        EpisodeSourceResponseState.STALE -> EpisodeSourceState.STALE
     }
 
     fun closeSourceChooser() {
         sourceRequestGeneration += 1L
         sourceDiscoveryJob?.cancel()
         sourceDiscoveryJob = null
+        val anime = animeEntry.value
+        if (anime == null || !com.example.data.streaming.ContentIdentityHelper.isMovie(anime)) {
+            scopedListenerJob?.cancel()
+            scopedListenerJob = null
+        }
         _isLoadingSources.value = false
         _selectedEpisodeForSources.value = null
         _episodeSources.value = emptyList()
         _sourceError.value = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        scopedListenerJob?.cancel()
+        sourceDiscoveryJob?.cancel()
+        refreshJob?.cancel()
+        automaticSourceJobs.values.forEach { it.cancel() }
     }
 
     fun toggleWatchlist(status: String = "WATCHING") {
@@ -708,9 +757,11 @@ class PlayerViewModel(
     private var activeDirectData: DirectPlayData? = null
     private var activeSourceId: String? = null
     private var playbackResolutionJob: Job? = null
+    private var scopedListenerJob: Job? = null
     private var playbackGeneration: Long = 0L
     private var retriedSourceGeneration: Long = -1L
     private val retriedSourceIds = mutableSetOf<String>()
+    private val reportedSuccessKeys = mutableSetOf<String>()
 
     val unifiedAudioTracks: StateFlow<List<PlayerManager.TrackOption>> = combine(
         _availableSources,
@@ -735,31 +786,54 @@ class PlayerViewModel(
             flushProgress()
         }
 
+        // Report actual playback success to Firestore/Room when ExoPlayer begins playing a source
         viewModelScope.launch {
-            // Find episode or wait for database
-            repository.observeAllEpisodes(animeId).collect { epList ->
-                if (epList.isNotEmpty()) {
-                    if (_currentEpisode.value == null) {
-                        val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
-                        _currentEpisode.value = target
-                        _selectedSeason.value = target.seasonNumber
-                        startPlaybackForEpisode(
-                            target,
-                            preferredSourceId = if (target.id == initialEpisodeId) initialPreferredSourceId else null
-                        )
-                    } else {
-                        val current = _currentEpisode.value
-                        val anime = AppDatabase.getInstance(application).animeDao().getAnimeById(animeId) ?: animeEntry.value
-                        val bId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
-                        if (current != null && bId != null) {
-                            // Only the current season is needed by the rolling window; avoid
-                            // canonicalizing a large multi-season catalog on every Room emission.
-                            val currentSeasonEpisodes = epList.filter { it.seasonNumber == current.seasonNumber }
-                            preResolveManager.slideWindow(bId, current, currentSeasonEpisodes)
-                        }
+            playerManager.isPlaying.collect { playing ->
+                val ep = _currentEpisode.value
+                val srcId = activeSourceId
+                if (playing && ep != null && !srcId.isNullOrBlank()) {
+                    val key = "${ep.id}|$srcId"
+                    if (reportedSuccessKeys.add(key)) {
+                        repository.reportPlaybackSuccess(animeId, srcId, ep.seasonNumber, ep.episodeNumber)
                     }
                 }
             }
+        }
+
+        // Start either Flat Movie playback immediately or Series Episode playback once Room emits episodes
+        viewModelScope.launch {
+            combine(animeEntry, repository.observeAllEpisodes(animeId)) { anime, epList -> anime to epList }
+                .collect { (anime, epList) ->
+                    val isMovieTarget = initialEpisodeId.startsWith("movie_") ||
+                        com.example.data.streaming.ContentIdentityHelper.isMovie(anime)
+                    if (_currentEpisode.value == null) {
+                        if (isMovieTarget) {
+                            val movieEp = EpisodeEntry(
+                                id = if (initialEpisodeId.startsWith("movie_")) initialEpisodeId else "movie_$animeId",
+                                animeId = animeId,
+                                seasonNumber = 0,
+                                episodeNumber = 1,
+                                title = anime?.preferredTitle ?: "Full Movie"
+                            )
+                            _currentEpisode.value = movieEp
+                            startPlaybackForEpisode(movieEp, preferredSourceId = initialPreferredSourceId)
+                        } else if (epList.isNotEmpty()) {
+                            val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
+                            _currentEpisode.value = target
+                            _selectedSeason.value = target.seasonNumber
+                            startPlaybackForEpisode(
+                                target,
+                                preferredSourceId = if (target.id == initialEpisodeId) initialPreferredSourceId else null
+                            )
+                        }
+                    } else if (!isMovieTarget && epList.isNotEmpty()) {
+                        val current = _currentEpisode.value
+                        if (current != null && current.seasonNumber > 0) {
+                            val currentSeasonEpisodes = epList.filter { it.seasonNumber == current.seasonNumber }
+                            preResolveManager.slideWindow(animeId, current, currentSeasonEpisodes, isMovie = false)
+                        }
+                    }
+                }
         }
 
         var lastWatchTimeTrackMs = System.currentTimeMillis()
@@ -769,11 +843,9 @@ class PlayerViewModel(
 
         // Save playback locally at the player cadence, but bound cloud writes to one/minute.
         playerManager.onPositionUpdate = { session, posMs, durMs ->
-            // The player owns an immutable session identity. Never attribute a release
-            // callback to mutable _currentEpisode, which may already be the next episode.
             val ep = allEpisodes.value.firstOrNull {
                 it.id == session.episodeId && it.seasonNumber == session.seasonNumber
-            }
+            } ?: _currentEpisode.value?.takeIf { it.id == session.episodeId }
             if (ep != null && durMs > 0) {
                 val now = System.currentTimeMillis()
                 val deltaSec = (now - lastWatchTimeTrackMs) / 1000
@@ -789,6 +861,11 @@ class PlayerViewModel(
                 viewModelScope.launch {
                     val isCompleted = durMs > 0 && posMs >= (durMs * 0.9)
                     val anime = animeEntry.value
+                    val resolvedType = if (com.example.data.streaming.ContentIdentityHelper.isMovie(anime) || ep.seasonNumber == 0) {
+                        "MOVIE"
+                    } else {
+                        anime?.format ?: "ANIME"
+                    }
                     repository.updatePlaybackProgress(
                         animeId = animeId,
                         episodeId = ep.id,
@@ -799,10 +876,9 @@ class PlayerViewModel(
                         durationMs = durMs,
                         animeTitle = anime?.preferredTitle ?: anime?.titleEnglish,
                         posterUrl = anime?.posterUrl,
-                        mediaType = anime?.format ?: "ANIME"
+                        mediaType = resolvedType
                     )
 
-                    // Non-blocking cloud history synchronization
                     val firstSyncForEpisode = lastCloudSyncEpisodeId != ep.id
                     val completionNeedsSync = isCompleted && completedCloudSyncEpisodeIds.add(ep.id)
                     if (firstSyncForEpisode || now - lastCloudSyncMs >= 60_000L || completionNeedsSync) {
@@ -900,22 +976,51 @@ class PlayerViewModel(
                 }
             }
 
-            // 2. Online playback flow using ProphecyVerse catalog
+            // 2. Online cache-first playback flow (Room -> Firestore -> Lazy Backend Discovery + Distributed Resolve)
             val anime = db.animeDao().getAnimeById(animeId) ?: animeEntry.value
             if (requestGeneration != playbackGeneration) return@launch
-            val backendId = anime?.backendAnimeId ?: if (animeId.startsWith("anilist_")) null else animeId
+            val isMovieTarget = com.example.data.streaming.ContentIdentityHelper.isMovie(anime) ||
+                episode.seasonNumber == 0 || episode.id.startsWith("movie_")
+            val contentKey = com.example.data.streaming.ContentIdentityHelper.canonicalContentKey(animeId, anime)
+            val effectiveSeason = if (isMovieTarget) 0 else com.example.data.streaming.ContentIdentityHelper.effectiveSeasonNumber(anime, episode.seasonNumber, isMovie = false)
 
-            if (backendId == null) {
-                _resolutionError.value = "Cannot play: Anime has no playable backend catalog ID."
-                _isResolving.value = false
-                return@launch
+            // Attach scoped Firestore snapshot listener strictly for this opened Movie or Episode
+            scopedListenerJob?.cancel()
+            scopedListenerJob = viewModelScope.launch {
+                repository.streamingRepository.observeScopedStreamingUpdates(
+                    contentKey = contentKey,
+                    isMovie = isMovieTarget,
+                    seasonNumber = effectiveSeason,
+                    episodeNumber = if (isMovieTarget) 1 else episode.episodeNumber,
+                    catalogEpisodeId = episode.id
+                ).collect { scoped ->
+                    if (requestGeneration == playbackGeneration && scoped.sources.isNotEmpty()) {
+                        val dtos = scoped.sources.filter { it.status != "REMOVED" && it.deletedAt == null }
+                            .map {
+                                ProphecySourceDto(
+                                    id = it.sourceId,
+                                    label = it.sourceName,
+                                    quality = it.quality,
+                                    codec = it.codec,
+                                    language = it.audioLanguage,
+                                    sizeBytes = it.sizeBytes,
+                                    downloadable = it.downloadable,
+                                    expiresAt = it.expiresAt
+                                )
+                            }
+                        if (dtos.isNotEmpty() && _availableSources.value.isEmpty()) {
+                            _availableSources.value = dtos
+                        }
+                    }
+                }
             }
 
-            // Recalculate/cancel obsolete background work as soon as this episode is selected.
-            preResolveManager.slideWindow(backendId, episode, allEpisodes.value)
-            // 3. Fast-Path: Check the season-aware pre-resolve cache for instant start (< 25m TTL)
-            if (preferredSourceId == null) {
-                val prepared = preResolveManager.getPreparedSource(backendId, episode)
+            // Recalculate/cancel obsolete pre-resolution work when episode changes (excluded for Movies)
+            preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = isMovieTarget)
+
+            // 3. Fast-Path: Check pre-resolve cache for instant episode start
+            if (preferredSourceId == null && !isMovieTarget) {
+                val prepared = preResolveManager.getPreparedSource(animeId, episode)
                 if (requestGeneration != playbackGeneration) return@launch
                 if (prepared != null) {
                     val lastSavedPos = try {
@@ -933,25 +1038,29 @@ class PlayerViewModel(
                         startPositionMs = lastSavedPos,
                         onPlaybackFailed = {
                             if (requestGeneration == playbackGeneration) {
-                                preResolveManager.discardPreparedSource(backendId, episode)
+                                preResolveManager.discardPreparedSource(animeId, episode)
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
-                                _isResolving.value = true
-                                val freshSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
-                                if (requestGeneration == playbackGeneration) {
-                                    resolveWithFallback(backendId, episode, freshSources, 0, requestGeneration = requestGeneration)
+                                    _isResolving.value = true
+                                    val freshSources = repository.discoverStreamsForScope(
+                                        animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
+                                    ).getOrNull()?.sources ?: emptyList()
+                                    if (requestGeneration == playbackGeneration) {
+                                        resolveWithFallback(animeId, episode, freshSources, 0, requestGeneration = requestGeneration, forceFresh = true)
+                                    }
                                 }
-                            }
                             }
                         },
                         onRetryNeeded = {
                             if (requestGeneration == playbackGeneration) {
-                                preResolveManager.discardPreparedSource(backendId, episode)
+                                preResolveManager.discardPreparedSource(animeId, episode)
                                 repository.invalidateDirectPlayback(prepared.source.id)
                                 playbackResolutionJob = viewModelScope.launch {
-                                    val refreshedSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
+                                    val refreshedSources = repository.discoverStreamsForScope(
+                                        animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
+                                    ).getOrNull()?.sources ?: emptyList()
                                     if (requestGeneration == playbackGeneration) {
-                                        resolveWithFallback(backendId, episode, refreshedSources, 0, requestGeneration = requestGeneration)
+                                        resolveWithFallback(animeId, episode, refreshedSources, 0, requestGeneration = requestGeneration, forceFresh = true)
                                     }
                                 }
                             }
@@ -959,19 +1068,18 @@ class PlayerViewModel(
                         providerName = prepared.source.displayProviderName,
                         sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
                     )
-
                     return@launch
                 }
             }
 
-            // Shared single-flight path: Player, pre-resolve, and downloads wait on the
-            // same verified operation instead of issuing competing source/direct requests.
-            val sharedResolution = repository.resolveVerifiedPlaybackForEpisode(
-                backendId, episode, preferredSourceId
-            ).getOrNull()
+            // Cache-first resolution: Room -> Firestore -> Distributed-locked Resolve
+            val sharedResult = repository.resolveVerifiedPlaybackForEpisode(
+                animeId, episode, preferredSourceId
+            )
+            val sharedResolution = sharedResult.getOrNull()
             if (sharedResolution != null) {
                 resolveWithFallback(
-                    backendId,
+                    animeId,
                     episode,
                     sharedResolution.candidates,
                     0,
@@ -983,27 +1091,24 @@ class PlayerViewModel(
                 return@launch
             }
 
-            // Route D: Get sources for the selected episode. Retry a transient network failure
-            // once; an authoritative empty response remains an empty-source result.
-            var sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode)
-            if (sourcesRes.isFailure && isTransientNetworkFailure(sourcesRes.exceptionOrNull())) {
-                _isResolving.value = true
-                delay(2_500L)
-                if (requestGeneration != playbackGeneration) return@launch
-                sourcesRes = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true)
-            }
+            val discoveryRes = repository.discoverStreamsForScope(
+                animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
+            )
             if (requestGeneration != playbackGeneration) return@launch
-            if (sourcesRes.isFailure || sourcesRes.getOrNull().isNullOrEmpty()) {
-                _resolutionError.value = "No playable sources found for this episode."
+            val sources = discoveryRes.getOrNull()?.sources.orEmpty()
+            if (sources.isEmpty()) {
+                _resolutionError.value = UserFacingErrorMapper.message(
+                    sharedResult.exceptionOrNull() ?: discoveryRes.exceptionOrNull(),
+                    "No playable sources found for this title."
+                )
                 _isResolving.value = false
                 return@launch
             }
 
-            val sources = sourcesRes.getOrNull()!!
             val candidates = if (preferredSourceId != null) {
                 val selected = sources.firstOrNull { it.id == preferredSourceId }
                 if (selected == null) {
-                    _resolutionError.value = "The selected source is not available for this episode."
+                    _resolutionError.value = "The selected source is not available."
                     _isResolving.value = false
                     return@launch
                 }
@@ -1013,7 +1118,7 @@ class PlayerViewModel(
             }
 
             resolveWithFallback(
-                backendId,
+                animeId,
                 episode,
                 candidates,
                 0,
@@ -1057,14 +1162,15 @@ class PlayerViewModel(
         }
 
     private suspend fun resolveWithFallback(
-        backendId: String,
+        targetAnimeId: String,
         episode: EpisodeEntry,
         candidates: List<ProphecySourceDto>,
         startIndex: Int = 0,
         prioritize: Boolean = false,
         startPositionOverrideMs: Long? = null,
         requestGeneration: Long,
-        preResolved: com.example.data.repository.VerifiedEpisodePlayback? = null
+        preResolved: com.example.data.repository.VerifiedEpisodePlayback? = null,
+        forceFresh: Boolean = false
     ) {
         if (requestGeneration != playbackGeneration) return
         val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
@@ -1080,17 +1186,26 @@ class PlayerViewModel(
             activeSourceId = source.id
             _activeSource.value = source
 
-            // Route E: The ONE AND ONLY playback route: POST /api/v1/play/direct
-            var playRes = if (i == 0 && preResolved?.source?.id == source.id) {
+            var playRes = if (i == 0 && !forceFresh && preResolved?.source?.id == source.id) {
                 Result.success(preResolved.directData)
             } else {
-                repository.resolveDirectPlayback(source.id)
+                repository.resolveVerifiedPlaybackForEpisode(
+                    targetAnimeId,
+                    episode,
+                    preferredSourceId = source.id,
+                    forceResolveFresh = forceFresh
+                ).map { it.directData }
             }
             if (playRes.isFailure && isTransientNetworkFailure(playRes.exceptionOrNull())) {
                 _isResolving.value = true
-                delay(2_500L)
+                delay(2_000L)
                 if (requestGeneration != playbackGeneration) return
-                playRes = repository.resolveDirectPlayback(source.id, forceRefresh = true)
+                playRes = repository.resolveVerifiedPlaybackForEpisode(
+                    targetAnimeId,
+                    episode,
+                    preferredSourceId = source.id,
+                    forceResolveFresh = true
+                ).map { it.directData }
             }
             if (requestGeneration != playbackGeneration) return
             if (playRes.isSuccess && playRes.getOrNull() != null) {
@@ -1101,26 +1216,21 @@ class PlayerViewModel(
                 }
                 activeDirectData = directData
 
-                // Fetch last saved position from database unless a source switch supplied it.
                 val lastSavedPos = try {
                     startPositionOverrideMs
                         ?: AppDatabase.getInstance(getApplication()).playbackHistoryDao()
-                            .getHistoryForEpisode(animeId, episode.id)?.positionMs
+                            .getHistoryForEpisode(targetAnimeId, episode.id)?.positionMs
                         ?: 0L
                 } catch (e: Exception) { startPositionOverrideMs ?: 0L }
                 if (requestGeneration != playbackGeneration) return
-                // Publish source state only after this candidate has completed direct-play
-                // validation, so incomplete resolution is never presented as ready.
+
                 _availableSources.value = orderedCandidates
                 _isResolving.value = false
 
-                // Initialize Media3 ExoPlayer with direct URL and headers
                 playerManager.initializePlayer(
                     directData = directData,
                     startPositionMs = lastSavedPos,
                     onPlaybackFailed = {
-                        // Try the next candidate, but always terminate in a user-visible error
-                        // when the final candidate also fails.
                         if (requestGeneration == playbackGeneration) {
                             if (i + 1 < orderedCandidates.size) {
                                 _isResolving.value = true
@@ -1128,7 +1238,7 @@ class PlayerViewModel(
                                 playbackResolutionJob = viewModelScope.launch {
                                     _isResolving.value = true
                                     resolveWithFallback(
-                                        backendId, episode, orderedCandidates, i + 1,
+                                        targetAnimeId, episode, orderedCandidates, i + 1,
                                         startPositionOverrideMs = lastSavedPos,
                                         requestGeneration = requestGeneration
                                     )
@@ -1146,20 +1256,22 @@ class PlayerViewModel(
                             repository.invalidateDirectPlayback(source.id)
                             playbackResolutionJob?.cancel()
                             playbackResolutionJob = viewModelScope.launch {
-                                // Refresh both source candidates and the source's resolved URL.
-                                val refreshedSources = repository.fetchEpisodeSourcesForCanonical(backendId, episode, forceRefresh = true).getOrNull() ?: emptyList()
+                                val refreshedSources = repository.discoverStreamsForScope(
+                                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
+                                ).getOrNull()?.sources ?: emptyList()
                                 if (requestGeneration != playbackGeneration) return@launch
                                 val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
                                 resolveWithFallback(
-                                    backendId, episode, newCandidates, 0,
+                                    targetAnimeId, episode, newCandidates, 0,
                                     startPositionOverrideMs = lastSavedPos,
-                                    requestGeneration = requestGeneration
+                                    requestGeneration = requestGeneration,
+                                    forceFresh = true
                                 )
                             }
                         }
                     },
                     providerName = source.displayProviderName,
-                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
+                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(targetAnimeId, episode.seasonNumber, episode.id, 0L)
                 )
 
                 return
@@ -1325,6 +1437,8 @@ class PlayerViewModel(
     override fun onCleared() {
         super.onCleared()
         flushProgress()
+        scopedListenerJob?.cancel()
+        playbackResolutionJob?.cancel()
         preResolveManager.clear()
         playerManager.release()
     }

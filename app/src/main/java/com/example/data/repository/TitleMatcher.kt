@@ -135,15 +135,119 @@ object TitleMatcher {
         return maxSimilarity
     }
 
+    private val EXPLICIT_SEASON_REGEX = Regex("""\b(?:season|series|s)\s*0?([1-9]\d?)\b|\b([1-9]\d?)(?:st|nd|rd|th)\s+season\b""", RegexOption.IGNORE_CASE)
+    private val ROMAN_SEASON_REGEX = Regex("""(?:^|\s)(ii|iii|iv|v|vi)$""", RegexOption.IGNORE_CASE)
+    private val TRAILING_MARKER_REGEX = Regex(
+        """\s+(?:season\s*\d+|s\d+|\d+(?:st|nd|rd|th)\s+season|(?:the\s+)?final\s+season|part\s*\d+|cour\s*\d+|ii|iii|iv|v|vi)$""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun stripSequelMarkers(raw: String?): String {
+        if (raw.isNullOrBlank()) return ""
+        var current = raw.trim()
+        val beforeColonOrDash = current
+            .replace(Regex("""\s+[-–]\s*[^-–]+[-–]\s*$"""), "")
+            .replace(TRAILING_MARKER_REGEX, "")
+            .trim()
+        if (beforeColonOrDash.length >= 3) current = beforeColonOrDash
+        val withoutArc = current.replace(Regex("""\s+[\w']+(?:\s+[\w']+){0,3}\s+arc$""", RegexOption.IGNORE_CASE), "").trim()
+        if (withoutArc.length >= 3) current = withoutArc
+        val beforeColon = current.substringBefore(':').trim()
+        val finalCandidate = if (beforeColon.length >= 4 && current.contains(':')) {
+            // Keep longer prefix unless the part after ':' looks like a season/arc subtitle
+            val afterColon = current.substringAfter(':').trim()
+            if (afterColon.contains("arc", true) || afterColon.contains("season", true) ||
+                afterColon.contains("part", true) || afterColon.contains("chapter", true) ||
+                beforeColon.split(" ").size >= 2
+            ) beforeColon else current
+        } else {
+            current
+        }
+        return normalize(finalCandidate)
+    }
+
+    fun buildSearchQueryVariants(
+        titles: List<String>,
+        aliases: List<String> = emptyList(),
+        isMovie: Boolean = false,
+        canonicalTitle: String? = null
+    ): List<String> {
+        val out = LinkedHashSet<String>()
+        val cleanCanonical = canonicalTitle?.trim()?.takeIf { it.isNotBlank() }
+        val all = (titles + aliases).map { it.trim() }.filter { it.isNotBlank() }
+
+        if (!isMovie && cleanCanonical != null) {
+            out += cleanCanonical
+        }
+        all.take(4).forEach { out += it }
+        if (!isMovie) {
+            for (t in all.take(4)) {
+                val stripped = t
+                    .replace(Regex("""\s*-\s*[^-]+-\s*$"""), "")
+                    .replace(TRAILING_MARKER_REGEX, "")
+                    .trim()
+                if (stripped.length >= 3 && stripped.lowercase(Locale.ROOT) != t.lowercase(Locale.ROOT)) {
+                    out += stripped
+                }
+                if (t.contains(':')) {
+                    val prefix = t.substringBefore(':').trim()
+                    if (prefix.length >= 4 && prefix.split(" ").size >= 2) {
+                        out += prefix
+                    }
+                }
+            }
+        }
+        return out.toList().take(6)
+    }
+
+    fun extractSeasonHint(titles: List<String>): Int? {
+        for (raw in titles) {
+            val match = EXPLICIT_SEASON_REGEX.find(raw)
+            if (match != null) {
+                val num = (match.groupValues[1].takeIf { it.isNotBlank() }
+                    ?: match.groupValues[2].takeIf { it.isNotBlank() })?.toIntOrNull()
+                if (num != null && num in 1..20) return num
+            }
+            val norm = normalize(raw)
+            ROMAN_SEASON_REGEX.find(norm)?.groupValues?.getOrNull(1)?.lowercase(Locale.ROOT)?.let { roman ->
+                return when (roman) {
+                    "ii" -> 2
+                    "iii" -> 3
+                    "iv" -> 4
+                    "v" -> 5
+                    "vi" -> 6
+                    else -> null
+                }
+            }
+        }
+        return null
+    }
+
+    fun hasSequelMarker(titles: List<String>): Boolean {
+        if (extractSeasonHint(titles) != null) return true
+        return titles.any { raw ->
+            val lower = raw.lowercase(Locale.ROOT)
+            lower.contains("final season") || lower.contains("part 2") || lower.contains("cour 2") ||
+                lower.contains(" arc") || Regex("""-[^-]+-\s*$""").containsMatchIn(raw)
+        }
+    }
+
     /**
      * Match confidence between an existing AnimeEntry and a ProphecySearchResultItem.
      */
     fun computeMatchConfidenceForEntry(
         entry: com.example.data.local.AnimeEntry,
-        prophecyItem: ProphecySearchResultItem
+        prophecyItem: ProphecySearchResultItem,
+        aliases: List<String> = emptyList()
     ): Float {
-        val normProphecy = normalize(prophecyItem.title)
-        if (normProphecy.isBlank()) return 0f
+        val prophecyTitles = buildList {
+            add(normalize(prophecyItem.title))
+            prophecyItem.titleEnglish?.let { add(normalize(it)) }
+            prophecyItem.titleRomaji?.let { add(normalize(it)) }
+            prophecyItem.titleNative?.let { add(normalize(it)) }
+            prophecyItem.alternativeTitles?.forEach { add(normalize(it)) }
+        }.filter { it.isNotBlank() }.distinct()
+        if (prophecyTitles.isEmpty()) return 0f
 
         val entryIsLiveAction = isLiveAction(entry.preferredTitle, entry.format, entry.year)
         val prophecyIsLiveAction = isLiveAction(
@@ -158,35 +262,68 @@ object TitleMatcher {
         }
 
         // Prevent anime TV series from matching movies
-        val entryIsMovie = entry.format?.equals("movie", ignoreCase = true) == true
+        val entryIsMovie = entry.mediaCategory.equals("MOVIE", ignoreCase = true) ||
+            entry.format?.equals("movie", ignoreCase = true) == true
         val prophecyIsMovie = prophecyItem.mediaType?.equals("movie", ignoreCase = true) == true
-        if (entry.format != null && prophecyItem.mediaType != null && entryIsMovie != prophecyIsMovie) {
+        if ((entryIsMovie || entry.format != null) && prophecyItem.mediaType != null && entryIsMovie != prophecyIsMovie) {
             return 0f
         }
 
-        val candidateTitles = buildList {
-            add(normalize(entry.preferredTitle))
-            entry.titleEnglish?.let { add(normalize(it)) }
-            entry.titleRomaji?.let { add(normalize(it)) }
-            entry.titleNative?.let { add(normalize(it)) }
-        }.filter { it.isNotBlank() }
+        val rawEntryTitles = buildList {
+            entry.canonicalTitle?.let { add(it) }
+            add(entry.preferredTitle)
+            entry.titleEnglish?.let { add(it) }
+            entry.titleRomaji?.let { add(it) }
+            entry.titleNative?.let { add(it) }
+            aliases.forEach { add(it) }
+        }.filter { it.isNotBlank() }.distinct()
+
+        val candidateTitles = rawEntryTitles.map(::normalize).filter { it.isNotBlank() }.distinct()
+        val entryYear = entry.year?.toIntOrNull()
+        val prophecyYear = prophecyItem.year?.toIntOrNull()
+        val hasCanonicalSequel = !entryIsMovie &&
+            (entry.canonicalAnimeId != null || (entry.canonicalSeasonNumber ?: 1) > 1)
+        val isUnifiedSeriesMatch = !entryIsMovie && !prophecyIsMovie &&
+            (hasCanonicalSequel || (prophecyItem.seasonCount ?: 0) >= 2 || hasSequelMarker(rawEntryTitles)) &&
+            (entryYear == null || prophecyYear == null || entryYear >= prophecyYear || hasCanonicalSequel)
 
         var maxSimilarity = 0f
         for (candidate in candidateTitles) {
-            val sim = titleSimilarity(candidate, normProphecy)
-            if (sim > maxSimilarity) {
-                maxSimilarity = sim
+            for (pTitle in prophecyTitles) {
+                val sim = titleSimilarity(candidate, pTitle)
+                if (sim > maxSimilarity) {
+                    maxSimilarity = sim
+                }
+            }
+        }
+
+        if (isUnifiedSeriesMatch && maxSimilarity < 0.90f) {
+            val strippedEntryTitles = rawEntryTitles.map(::stripSequelMarkers).filter { it.isNotBlank() }.distinct()
+            val strippedProphecyTitles = buildList {
+                add(prophecyItem.title)
+                prophecyItem.titleEnglish?.let { add(it) }
+                prophecyItem.titleRomaji?.let { add(it) }
+            }.map(::stripSequelMarkers).filter { it.isNotBlank() }.distinct()
+
+            for (sEntry in strippedEntryTitles) {
+                for (pTitle in prophecyTitles + strippedProphecyTitles) {
+                    val sim = if (sEntry == pTitle) 0.92f else titleSimilarity(sEntry, pTitle) * 0.92f
+                    if (sim > maxSimilarity) {
+                        maxSimilarity = sim
+                    }
+                }
             }
         }
 
         if (maxSimilarity < 0.50f) return maxSimilarity
 
-        val entryYear = entry.year?.toIntOrNull()
-        val prophecyYear = prophecyItem.year?.toIntOrNull()
         if (entryYear != null && prophecyYear != null) {
             val yearDiff = kotlin.math.abs(entryYear - prophecyYear)
             if (yearDiff == 0) {
                 maxSimilarity = (maxSimilarity + 0.15f).coerceAtMost(1.0f)
+            } else if (isUnifiedSeriesMatch && (entryYear > prophecyYear || hasCanonicalSequel)) {
+                // Multi-season unified backend entries carry the Season 1 premiere year
+                maxSimilarity = (maxSimilarity + 0.05f).coerceAtMost(1.0f)
             } else if (yearDiff in 1..2) {
                 // minor difference
             } else if (yearDiff in 3..5) {
@@ -199,11 +336,47 @@ object TitleMatcher {
         val isReleasing = entry.status.equals("RELEASING", ignoreCase = true)
         val epCount = entry.episodeCount ?: if (isReleasing) 1000 else 0
         val seasons = prophecyItem.seasonCount ?: 0
-        if (epCount > 100 && seasons in 1..2 && (prophecyYear != null && entryYear != null && kotlin.math.abs(entryYear - prophecyYear) > 3)) {
+        if (!isUnifiedSeriesMatch && epCount > 100 && seasons in 1..2 &&
+            (prophecyYear != null && entryYear != null && kotlin.math.abs(entryYear - prophecyYear) > 3)
+        ) {
             maxSimilarity = (maxSimilarity - 0.50f).coerceAtLeast(0f)
         }
 
         return maxSimilarity
+    }
+
+    /**
+     * Ranks valid backend search candidates (confidence >= 0.75) so unified multi-season
+     * and multi-provider entries decisively outrank single-provider addon duplicates.
+     */
+    fun scoreBackendCandidateForEntry(
+        entry: com.example.data.local.AnimeEntry,
+        prophecyItem: ProphecySearchResultItem,
+        aliases: List<String> = emptyList()
+    ): Pair<Float, Float> {
+        val baseConfidence = computeMatchConfidenceForEntry(entry, prophecyItem, aliases)
+        if (baseConfidence < 0.75f) return baseConfidence to 0f
+
+        var selectionScore = baseConfidence
+        val isMovie = entry.mediaCategory.equals("MOVIE", ignoreCase = true) ||
+            entry.format.equals("MOVIE", ignoreCase = true)
+        val seasonCount = prophecyItem.seasonCount ?: 0
+        val providerCount = prophecyItem.providerMappings?.size ?: 0
+        val canonicalAnilist = entry.canonicalAnimeId ?: entry.aniListId
+        if (canonicalAnilist != null && prophecyItem.canonicalId == "anilist_$canonicalAnilist") {
+            selectionScore += 0.08f
+        }
+        if (!isMovie) {
+            if (seasonCount >= 2) {
+                selectionScore += 0.12f + (seasonCount.coerceAtMost(10) * 0.005f)
+            } else if (seasonCount == 1 && (entry.canonicalSeasonNumber ?: 1) <= 1) {
+                selectionScore += 0.02f
+            }
+        }
+        if (providerCount > 1) {
+            selectionScore += 0.05f + (providerCount.coerceAtMost(5) * 0.005f)
+        }
+        return baseConfidence to selectionScore
     }
 
     private fun titleSimilarity(s1: String, s2: String): Float {

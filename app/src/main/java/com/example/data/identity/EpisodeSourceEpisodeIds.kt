@@ -12,11 +12,11 @@ object EpisodeSourceEpisodeIds {
         return encode(ids).takeIf { ids.size > 1 }
     }
 
-    private fun encode(ids: List<String>): String = buildString {
+    internal fun encode(ids: List<String>): String = buildString {
         ids.forEach { id -> append(id.length).append(':').append(id) }
     }
 
-    private fun decode(value: String?): List<String> {
+    internal fun decode(value: String?): List<String> {
         if (value.isNullOrEmpty()) return emptyList()
         val result = mutableListOf<String>()
         var index = 0

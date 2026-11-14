@@ -98,7 +98,8 @@ fun CompactDownloadActionRow(
     onOpenDownloadSheet: () -> Unit,
     onOpenBatchSheet: () -> Unit,
     onOpenQueueSheet: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isMovie: Boolean = false
 ) {
     Row(
         modifier = modifier.fillMaxWidth(),
@@ -209,33 +210,35 @@ fun CompactDownloadActionRow(
             }
         }
 
-        // Compact Batch Download Button
-        Surface(
-            onClick = onOpenBatchSheet,
-            shape = RoundedCornerShape(18.dp),
-            color = SurfaceVariantDark,
-            border = BorderStroke(1.dp, SurfaceHighlight),
-            modifier = Modifier
-                .height(36.dp)
-                .testTag("compact_batch_download_button")
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+        // Compact Batch Download Button (Series only)
+        if (!isMovie) {
+            Surface(
+                onClick = onOpenBatchSheet,
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceVariantDark,
+                border = BorderStroke(1.dp, SurfaceHighlight),
+                modifier = Modifier
+                    .height(36.dp)
+                    .testTag("compact_batch_download_button")
             ) {
-                Icon(
-                    imageVector = Icons.Default.Tune,
-                    contentDescription = "Batch Download",
-                    tint = TextSecondary,
-                    modifier = Modifier.size(15.dp)
-                )
-                Text(
-                    text = "Batch Download",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = TextSecondary
-                )
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = "Batch Download",
+                        tint = TextSecondary,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = "Batch Download",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = TextSecondary
+                    )
+                }
             }
         }
 
@@ -287,6 +290,7 @@ fun DownloadManagementBottomSheet(
     availableLanguages: List<String>,
     storageStats: DownloadManager.StorageStats,
     initialTab: Int = 0,
+    isMovie: Boolean = false,
     onDismiss: () -> Unit,
     onStartSingleDownload: (quality: String?, audioLang: String?) -> Unit,
     onStartBatchDownload: (episodes: List<EpisodeEntry>, quality: String?, audioLang: String?) -> Unit,
@@ -299,7 +303,10 @@ fun DownloadManagementBottomSheet(
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val context = LocalContext.current
-    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab.coerceIn(0, 2)) }
+    var selectedTab by remember(initialTab, isMovie) {
+        val clamped = if (isMovie && initialTab == 1) 0 else initialTab.coerceIn(0, 2)
+        mutableIntStateOf(clamped)
+    }
     var activeBatchSeason by remember(selectedSeason) { mutableIntStateOf(selectedSeason) }
 
     val defaultQualities = remember(availableQualities) {
@@ -360,7 +367,7 @@ fun DownloadManagementBottomSheet(
                         color = Color.White
                     )
                     Text(
-                        text = "$animeTitle • Season $selectedSeason",
+                        text = if (isMovie) "$animeTitle • Movie" else "$animeTitle • Season $selectedSeason",
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
                         maxLines = 1,
@@ -435,7 +442,7 @@ fun DownloadManagementBottomSheet(
                     onClick = { selectedTab = 0 },
                     text = {
                         Text(
-                            text = "This Episode",
+                            text = if (isMovie) "This Movie" else "This Episode",
                             fontSize = 12.sp,
                             fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Normal,
                             color = if (selectedTab == 0) AccentCyan else TextMuted
@@ -443,19 +450,21 @@ fun DownloadManagementBottomSheet(
                     },
                     modifier = Modifier.testTag("tab_this_episode")
                 )
-                Tab(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    text = {
-                        Text(
-                            text = "Batch (${seasonEps.size} eps)",
-                            fontSize = 12.sp,
-                            fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
-                            color = if (selectedTab == 1) AccentCyan else TextMuted
-                        )
-                    },
-                    modifier = Modifier.testTag("tab_batch_download")
-                )
+                if (!isMovie) {
+                    Tab(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        text = {
+                            Text(
+                                text = "Batch (${seasonEps.size} eps)",
+                                fontSize = 12.sp,
+                                fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
+                                color = if (selectedTab == 1) AccentCyan else TextMuted
+                            )
+                        },
+                        modifier = Modifier.testTag("tab_batch_download")
+                    )
+                }
                 Tab(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },

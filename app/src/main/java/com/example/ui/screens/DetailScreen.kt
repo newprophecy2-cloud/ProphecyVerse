@@ -271,8 +271,17 @@ fun DetailScreen(
                                         )
                                         Spacer(modifier = Modifier.width(10.dp))
                                     }
+                                    val metaParts = buildList {
+                                        add(item.format ?: "ANIME")
+                                        item.year?.takeIf { it.isNotBlank() }?.let { add(it) }
+                                        if (!isMovie) {
+                                            val epCount = maxOf(selectedSeasonEpisodeCount, item.episodeCount ?: 0)
+                                            if (epCount > 0) add("$epCount Eps")
+                                        }
+                                        item.status?.takeIf { it.isNotBlank() }?.let { add(it.replace('_', ' ')) }
+                                    }
                                     Text(
-                                        text = "${item.format ?: "ANIME"} • ${item.year ?: ""}",
+                                        text = metaParts.joinToString(" • "),
                                         color = TextSecondary,
                                         fontSize = 12.sp
                                     )
@@ -291,7 +300,30 @@ fun DetailScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (item.isPlayable && episodes.isNotEmpty()) {
+                        if (isMovie) {
+                            val targetMovieEpId = lastPlayed?.episodeId ?: "movie_${item.id}"
+                            Button(
+                                onClick = { onPlayEpisode(item.id, targetMovieEpId, null) },
+                                colors = ButtonDefaults.buttonColors(containerColor = PlayableGreen),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(44.dp)
+                                    .testTag("play_primary_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = Color.White
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (lastPlayed != null) "Resume Movie" else "Play Movie",
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                        } else if (episodes.isNotEmpty()) {
                             val firstOrResume = episodes.firstOrNull { it.id == lastPlayed?.episodeId }
                                 ?: episodes.first()
                             Button(
@@ -310,11 +342,7 @@ fun DetailScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = if (isMovie) {
-                                        if (lastPlayed != null) "Resume Movie" else "Play Movie"
-                                    } else {
-                                        if (lastPlayed != null) "Resume Ep ${lastPlayed?.episodeNumber}" else "Play Ep 1"
-                                    },
+                                    text = if (lastPlayed != null) "Resume Ep ${lastPlayed?.episodeNumber}" else "Play Ep 1",
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White
                                 )
@@ -423,8 +451,8 @@ fun DetailScreen(
                     }
                 }
 
-                // Seasons & Episodes Section
-                if (item.isPlayable) {
+                // Playback & Episodes / Movie Section
+                run {
                     // Dedicated Continue Watching Card when lastPlayed is available
                     if (lastPlayed != null) {
                         item {
@@ -506,8 +534,14 @@ fun DetailScreen(
                     }
 
                     item {
+                        val displayEpCount = maxOf(selectedSeasonEpisodeCount, item.episodeCount ?: 0)
+                        val sectionTitle = when {
+                            isMovie -> "Movie Playback"
+                            displayEpCount > 0 -> "Episodes ($displayEpCount)"
+                            else -> "Episodes"
+                        }
                         Text(
-                            text = if (isMovie) "Movie Playback" else "Episodes",
+                            text = sectionTitle,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary,
@@ -552,151 +586,26 @@ fun DetailScreen(
                         }
                     }
 
-                    // Episodes List
-                    if (episodes.isEmpty()) {
+                    if (isMovie) {
                         item {
-                            if (isLoading) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(32.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Column(
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                                    ) {
-                                        CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(28.dp))
-                                        Text(
-                                            text = "Syncing episodes from catalog...",
-                                            color = TextSecondary,
-                                            fontSize = 13.sp
-                                        )
-                                    }
-                                }
-                            } else if (syncError != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 20.dp, vertical = 24.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Card(
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(20.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            Text("Catalog sync failed", color = TextPrimary, fontWeight = FontWeight.Bold)
-                                            Text(syncError ?: "Unable to load episodes.", color = TextMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
-                                            Button(
-                                                onClick = { viewModel.refreshDetails() },
-                                                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
-                                                shape = RoundedCornerShape(8.dp)
-                                            ) {
-                                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text("Retry", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                val emptyTitle = when {
-                                    selectedSeasonEpisodeCount > 0 -> "No episodes in this page"
-                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE -> "Standalone movie — no episode catalog required"
-                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes in catalog"
-                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE -> "No episodes in this season"
-                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.FAILED -> "Episode catalog could not be refreshed"
-                                    catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.PARTIAL -> "Episode catalog is partial"
-                                    else -> "Episode catalog not yet confirmed"
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 20.dp, vertical = 24.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Card(
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(20.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Info,
-                                                contentDescription = null,
-                                                tint = AccentCoral,
-                                                modifier = Modifier.size(32.dp)
-                                            )
-                                            Text(
-                                                text = if (item.backendAnimeId == null) "Catalog Episodes Not Available" else emptyTitle,
-                                                color = TextPrimary,
-                                                fontSize = 15.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                textAlign = TextAlign.Center
-                                            )
-                                            Text(
-                                                text = if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE) {
-                                                    "This standalone movie has no episodic season catalog. Playback is offered only when the backend provides its real movie episode/source record; no synthetic episode is created."
-                                                } else if (item.backendAnimeId == null) {
-                                                    "Playable episodes for \"${item.preferredTitle}\" are not currently available in the streaming provider catalog.\n(Live Action was strictly excluded to prevent incorrect playback)."
-                                                } else if (selectedSeasonEpisodeCount > 0) {
-                                                    "No records are in the current page. ${if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE) "The selected season catalog is complete." else "More episodes may exist; catalog completeness is unknown."}"
-                                                } else if (catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY) {
-                                                    "The current response explicitly confirmed an empty episode catalog."
-                                                } else {
-                                                    "Episodes for Season $selectedSeason are not available in the current local catalog. ${catalogRefreshStatus.errorMessage ?: "The catalog may be partial or unconfirmed."}"
-                                                },
-                                                color = TextMuted,
-                                                fontSize = 12.sp,
-                                                textAlign = TextAlign.Center,
-                                                lineHeight = 17.sp
-                                            )
-                                            Spacer(modifier = Modifier.height(4.dp))
-                                            if (catalogRefreshStatus.state != com.example.data.repository.EpisodeCatalogState.NOT_APPLICABLE) Button(
-                                                onClick = { viewModel.refreshDetails() },
-                                                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
-                                                shape = RoundedCornerShape(8.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Refresh,
-                                                    contentDescription = null,
-                                                    modifier = Modifier.size(16.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text("Retry Catalog Sync", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        items(episodes, key = { it.id }) { ep ->
-                            val downloadEntry = downloadsByEpisode[ep.id]
+                            val movieEpId = "movie_${item.id}"
+                            val movieDownload = downloadsByEpisode[movieEpId]
+                            val movieCardModel = EpisodeEntry(
+                                id = movieEpId,
+                                animeId = item.id,
+                                seasonNumber = 0,
+                                episodeNumber = 1,
+                                title = item.preferredTitle,
+                                overview = item.year?.let { "Feature Film • $it" } ?: "Feature Film"
+                            )
                             EpisodeRow(
-                                episode = ep,
-                                isMovie = isMovie,
-                                isPlayed = lastPlayed?.episodeId == ep.id,
-                                downloadEntry = downloadEntry,
-                                onPlayClick = {
-                                    viewModel.focusEpisodeWindow(ep)
-                                    onPlayEpisode(item.id, ep.id, null)
-                                },
-                                onSourcesClick = {
-                                    viewModel.focusEpisodeWindow(ep)
-                                    viewModel.openSourceChooser(ep)
-                                },
-                                sourceStateLabel = episodeSourceStates[ep.id]?.let { state ->
+                                episode = movieCardModel,
+                                isMovie = true,
+                                isPlayed = lastPlayed != null,
+                                downloadEntry = movieDownload,
+                                onPlayClick = { onPlayEpisode(item.id, movieEpId, null) },
+                                onSourcesClick = { viewModel.openMovieSourceChooser() },
+                                sourceStateLabel = episodeSourceStates[movieEpId]?.let { state ->
                                     when (state) {
                                         DetailViewModel.EpisodeSourceState.NOT_LOADED -> null
                                         DetailViewModel.EpisodeSourceState.LOADING -> "Sources · loading"
@@ -716,13 +625,13 @@ fun DetailScreen(
                                             authManager.setPendingDownload(
                                                 com.example.data.firebase.PendingDownload(
                                                     animeId = item.id,
-                                                    episodeId = ep.id,
-                                                    seasonNumber = ep.seasonNumber,
-                                                    episodeNumber = ep.episodeNumber,
-                                                    episodeTitle = ep.title,
+                                                    episodeId = movieEpId,
+                                                    seasonNumber = 0,
+                                                    episodeNumber = 1,
+                                                    episodeTitle = item.preferredTitle,
                                                     animeTitle = item.preferredTitle,
                                                     posterUrl = item.posterUrl,
-                                                    mediaType = item.mediaCategory ?: "anime"
+                                                    mediaType = "MOVIE"
                                                 )
                                             )
                                             showAccountAuthDialog = true
@@ -737,21 +646,214 @@ fun DetailScreen(
                                         is com.example.data.firebase.DownloadEligibility.Eligible -> {
                                             downloadManager.startOrResumeDownload(
                                                 animeId = item.id,
-                                                episodeId = ep.id,
-                                                seasonNumber = ep.seasonNumber,
-                                                episodeNumber = ep.episodeNumber,
-                                                episodeTitle = ep.title,
+                                                episodeId = movieEpId,
+                                                seasonNumber = 0,
+                                                episodeNumber = 1,
+                                                episodeTitle = item.preferredTitle,
                                                 animeTitle = item.preferredTitle,
                                                 posterUrl = item.posterUrl,
-                                                mediaType = item.mediaCategory ?: "anime"
+                                                mediaType = "MOVIE"
                                             )
                                         }
                                     }
                                 }
                             )
                         }
-                    }
-                    if (!isMovie) {
+                    } else {
+                        // Episodes List (Series only)
+                        if (episodes.isEmpty()) {
+                            item {
+                                if (isLoading) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(32.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Column(
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(28.dp))
+                                            Text(
+                                                text = "Loading episodes from AniList...",
+                                                color = TextSecondary,
+                                                fontSize = 13.sp
+                                            )
+                                        }
+                                    }
+                                } else if (syncError != null) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 20.dp, vertical = 24.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Card(
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(20.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Text("Metadata sync failed", color = TextPrimary, fontWeight = FontWeight.Bold)
+                                                Text(syncError ?: "Unable to load episodes.", color = TextMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
+                                                Button(
+                                                    onClick = { viewModel.refreshDetails() },
+                                                    colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+                                                    shape = RoundedCornerShape(8.dp)
+                                                ) {
+                                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text("Retry", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    val emptyTitle = when {
+                                        selectedSeasonEpisodeCount > 0 -> "No episodes in this page"
+                                        item.status.equals("NOT_YET_RELEASED", ignoreCase = true) -> "Not yet aired"
+                                        catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes listed on AniList"
+                                        catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE -> "No episodes in this season"
+                                        catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.FAILED -> "Episode metadata could not be refreshed"
+                                        else -> "Episode count not yet available"
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 20.dp, vertical = 24.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Card(
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(20.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Info,
+                                                    contentDescription = null,
+                                                    tint = AccentCoral,
+                                                    modifier = Modifier.size(32.dp)
+                                                )
+                                                Text(
+                                                    text = emptyTitle,
+                                                    color = TextPrimary,
+                                                    fontSize = 15.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    textAlign = TextAlign.Center
+                                                )
+                                                Text(
+                                                    text = when {
+                                                        selectedSeasonEpisodeCount > 0 -> "No records are in the current page."
+                                                        item.status.equals("NOT_YET_RELEASED", ignoreCase = true) ->
+                                                            "AniList lists this anime as upcoming (not yet aired)."
+                                                        else ->
+                                                            catalogRefreshStatus.errorMessage ?: "AniList has not published a confirmed episode count or aired schedule for this title yet."
+                                                    },
+                                                    color = TextMuted,
+                                                    fontSize = 12.sp,
+                                                    textAlign = TextAlign.Center,
+                                                    lineHeight = 17.sp
+                                                )
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                Button(
+                                                    onClick = { viewModel.refreshDetails() },
+                                                    colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+                                                    shape = RoundedCornerShape(8.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Refresh,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text("Refresh AniList Metadata", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            items(episodes, key = { it.id }) { ep ->
+                                val downloadEntry = downloadsByEpisode[ep.id]
+                                EpisodeRow(
+                                    episode = ep,
+                                    isMovie = false,
+                                    isPlayed = lastPlayed?.episodeId == ep.id,
+                                    downloadEntry = downloadEntry,
+                                    onPlayClick = {
+                                        viewModel.focusEpisodeWindow(ep)
+                                        onPlayEpisode(item.id, ep.id, null)
+                                    },
+                                    onSourcesClick = {
+                                        viewModel.focusEpisodeWindow(ep)
+                                        viewModel.openSourceChooser(ep)
+                                    },
+                                    sourceStateLabel = episodeSourceStates[ep.id]?.let { state ->
+                                        when (state) {
+                                            DetailViewModel.EpisodeSourceState.NOT_LOADED -> null
+                                            DetailViewModel.EpisodeSourceState.LOADING -> "Sources · loading"
+                                            DetailViewModel.EpisodeSourceState.AVAILABLE -> "Sources · available"
+                                            DetailViewModel.EpisodeSourceState.EMPTY -> "Sources · none"
+                                            DetailViewModel.EpisodeSourceState.PARTIAL -> "Sources · partial"
+                                            DetailViewModel.EpisodeSourceState.FAILED -> "Sources · retry"
+                                            DetailViewModel.EpisodeSourceState.TIMEOUT -> "Sources · timed out"
+                                            DetailViewModel.EpisodeSourceState.UNKNOWN -> "Sources · unchecked"
+                                            DetailViewModel.EpisodeSourceState.STALE -> "Sources · stale"
+                                        }
+                                    },
+                                    onDownloadClick = {
+                                        val eligibility = authManager.checkDownloadEligibility()
+                                        when (eligibility) {
+                                            is com.example.data.firebase.DownloadEligibility.RequiresLogin -> {
+                                                authManager.setPendingDownload(
+                                                    com.example.data.firebase.PendingDownload(
+                                                        animeId = item.id,
+                                                        episodeId = ep.id,
+                                                        seasonNumber = ep.seasonNumber,
+                                                        episodeNumber = ep.episodeNumber,
+                                                        episodeTitle = ep.title,
+                                                        animeTitle = item.preferredTitle,
+                                                        posterUrl = item.posterUrl,
+                                                        mediaType = item.mediaCategory ?: "anime"
+                                                    )
+                                                )
+                                                showAccountAuthDialog = true
+                                            }
+                                            is com.example.data.firebase.DownloadEligibility.Suspended -> {
+                                                android.widget.Toast.makeText(
+                                                    context,
+                                                    "Downloads disabled: ${eligibility.reason}",
+                                                    android.widget.Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            is com.example.data.firebase.DownloadEligibility.Eligible -> {
+                                                downloadManager.startOrResumeDownload(
+                                                    animeId = item.id,
+                                                    episodeId = ep.id,
+                                                    seasonNumber = ep.seasonNumber,
+                                                    episodeNumber = ep.episodeNumber,
+                                                    episodeTitle = ep.title,
+                                                    animeTitle = item.preferredTitle,
+                                                    posterUrl = item.posterUrl,
+                                                    mediaType = item.mediaCategory ?: "anime"
+                                                )
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                        }
                         item {
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
@@ -785,30 +887,6 @@ fun DetailScreen(
                                 ) {
                                     Text("Next episodes", color = if (canLoadNextEpisodePage) AccentCyan else TextMuted)
                                 }
-                            }
-                        }
-                    }
-                } else {
-                    item {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = SurfaceVariantDark,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp)
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Text(
-                                    text = "Catalog Metadata Only",
-                                    fontWeight = FontWeight.Bold,
-                                    color = TextPrimary
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "This title is currently listed for metadata and discovery only. Playable video sources are not yet authorized or linked in the ProphecyVerse catalog.",
-                                    color = TextSecondary,
-                                    fontSize = 13.sp
-                                )
                             }
                         }
                     }

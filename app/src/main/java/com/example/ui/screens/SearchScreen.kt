@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
@@ -24,6 +25,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -67,6 +70,8 @@ fun SearchScreen(
     val query by viewModel.searchQuery.collectAsStateWithLifecycle()
     val results by viewModel.searchResults.collectAsStateWithLifecycle()
     val isSearching by viewModel.isSearching.collectAsStateWithLifecycle()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsStateWithLifecycle()
+    val hasNextPage by viewModel.hasNextPage.collectAsStateWithLifecycle()
     val selectedGenre by viewModel.selectedGenre.collectAsStateWithLifecycle()
     val selectedFormat by viewModel.selectedFormat.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
@@ -202,12 +207,12 @@ fun SearchScreen(
             if (query.isNotBlank()) {
                 EmptyState(
                     title = "No anime found",
-                    message = if (isSearching) "Synchronizing with catalog..." else "Try searching for alternate titles or keywords."
+                    message = if (isSearching) "Searching AniList catalog..." else "Try searching for alternate titles or keywords."
                 )
             } else {
                 EmptyState(
-                    title = "Discover Anime",
-                    message = "Search titles above. All matches are loaded and cached locally."
+                    title = "Discover Anime & Movies",
+                    message = "Search AniList titles above. Results are cached locally in Room."
                 )
             }
         } else {
@@ -225,6 +230,36 @@ fun SearchScreen(
                         anime = anime,
                         onClick = { onAnimeClick(anime.id) }
                     )
+                }
+                if (hasNextPage && query.isNotBlank()) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Button(
+                                onClick = { viewModel.loadNextPage() },
+                                enabled = !isLoadingMore,
+                                colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.testTag("search_load_more_button")
+                            ) {
+                                if (isLoadingMore) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        color = Color.White,
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Loading more...", color = Color.White, fontSize = 13.sp)
+                                } else {
+                                    Text("Load More Results", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

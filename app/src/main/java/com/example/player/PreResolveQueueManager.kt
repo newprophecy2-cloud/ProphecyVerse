@@ -18,6 +18,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
@@ -58,14 +59,27 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     @Volatile private var lastWindowSignature: String? = null
     private val queueDispatcher = Dispatchers.IO.limitedParallelism(3)
 
-    /** Queue the next 17 canonical episodes after the current episode in the same season. */
-    fun slideWindow(backendAnimeId: String, currentEpisode: EpisodeEntry, allEpisodes: List<EpisodeEntry>) {
+    /**
+     * Queue the next 11 canonical episodes after the current episode in the same season
+     * (Ep 1 -> Eps 1..12, Ep 2 -> Ep 13, Ep 3 -> Ep 14).
+     * Movies are excluded. Checks Room/Firestore caches before calling Backend Resolve.
+     */
+    fun slideWindow(
+        animeId: String,
+        currentEpisode: EpisodeEntry,
+        allEpisodes: List<EpisodeEntry>,
+        isMovie: Boolean = false
+    ) {
+        if (isMovie || currentEpisode.seasonNumber == 0 || currentEpisode.id.startsWith("movie_")) {
+            clear()
+            return
+        }
         val upcoming = PreResolvePlan.upcoming(currentEpisode, allEpisodes)
         val previous = PreResolvePlan.previous(currentEpisode, allEpisodes)
         val signature = buildString {
-            append(backendAnimeId).append('|').append(identity(backendAnimeId, currentEpisode)).append('|')
-            append(upcoming.joinToString(",") { identity(backendAnimeId, it) }).append('|')
-            append(previous.joinToString(",") { identity(backendAnimeId, it) })
+            append(animeId).append('|').append(identity(animeId, currentEpisode)).append('|')
+            append(upcoming.joinToString(",") { identity(animeId, it) }).append('|')
+            append(previous.joinToString(",") { identity(animeId, it) })
         }
         if (signature == lastWindowSignature && workerJob?.isActive == true) return
         lastWindowSignature = signature
@@ -79,8 +93,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
             return
         }
         workerJob?.cancel()
-        val priorityEpisodes = (upcoming + previous).distinctBy { identity(backendAnimeId, it) }
-        val targetKeys = priorityEpisodes.associateBy { identity(backendAnimeId, it) }
+        val priorityEpisodes = (upcoming + previous).distinctBy { identity(animeId, it) }
+        val targetKeys = priorityEpisodes.associateBy { identity(animeId, it) }
         updateStatuses { prior ->
             val next = prior.mapValues { (_, state) ->
                 if (state == ResolutionStatus.RESOLVING || state == ResolutionStatus.QUEUED) ResolutionStatus.RETRY_PENDING else state
@@ -97,8 +111,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
         workerJob = scope.launch(queueDispatcher) {
             try {
-                // Process priority tiers in order, while resolving at most three episodes at once.
-                // This keeps the immediate next-seven responsive without creating an unbounded burst.
+                // Bounded sequential window (concurrency = 3): fast upcoming -> remaining upcoming -> previous
                 val tiers = listOf(
                     upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE),
                     upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE),
@@ -106,10 +119,10 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                 )
                 for (tier in tiers) {
                     if (!isActive) return@launch
-                    tier.distinctBy { identity(backendAnimeId, it) }
+                    tier.distinctBy { identity(animeId, it) }
                         .map { episode ->
                             async {
-                                val key = identity(backendAnimeId, episode)
+                                val key = identity(animeId, episode)
                                 val cached = preparedCache[key]
                                 if (cached != null && !cached.isExpired()) {
                                     updateStatusFor(key, ResolutionStatus.VERIFIED_PLAYABLE)
@@ -125,7 +138,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                                     updateStatusFor(key, if (attempt == 1) ResolutionStatus.RESOLVING else ResolutionStatus.RETRY_PENDING)
                                     if (attempt > 1) delay(RETRY_DELAY_MS)
                                     if (!isActive) return@async
-                                    resolved = preResolveEpisode(backendAnimeId, episode)
+                                    resolved = preResolveEpisode(animeId, episode)
                                     if (resolved) break
                                 }
                                 updateStatusFor(key, completionStatus(resolved))
@@ -143,11 +156,12 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
     }
 
-    private suspend fun preResolveEpisode(backendAnimeId: String, episode: EpisodeEntry): Boolean {
-        val key = identity(backendAnimeId, episode)
+    private suspend fun preResolveEpisode(animeId: String, episode: EpisodeEntry): Boolean {
+        val key = identity(animeId, episode)
         return try {
-            withTimeout(12_000L) {
-                val verified = repository.resolveVerifiedPlaybackForEpisode(backendAnimeId, episode).getOrNull()
+            withTimeout(15_000L) {
+                // Delegates through cache-first Room -> Firestore -> Backend discovery/resolve with distributed lease
+                val verified = repository.resolveVerifiedPlaybackForEpisode(animeId, episode).getOrNull()
                     ?: return@withTimeout false
                 updateStatusFor(key, ResolutionStatus.RESOLVED)
                 val direct = verified.directData
@@ -155,15 +169,21 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                 if (direct.sourceId != verified.source.id || url.isBlank() ||
                     !(url.startsWith("https://") || url.startsWith("http://") || url.startsWith("file://")) ||
                     SourceExpiryTime.isExpired(direct.expiresAt)) return@withTimeout false
-                preparedCache[key] = PreparedEpisode(backendAnimeId, episode.id, episode.seasonNumber,
-                    verified.source, direct, System.currentTimeMillis())
-                Log.i(TAG, "Verified playback resolution for S${episode.seasonNumber} episode ${episode.id}")
+                preparedCache[key] = PreparedEpisode(
+                    backendAnimeId = animeId,
+                    episodeId = episode.id,
+                    seasonNumber = episode.seasonNumber,
+                    source = verified.source,
+                    directData = direct,
+                    resolvedAtMs = System.currentTimeMillis()
+                )
+                Log.i(TAG, "Prepared (${verified.cacheTier}) S${episode.seasonNumber} E${episode.episodeNumber}")
                 true
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            Log.w(TAG, "Pre-resolve failed for S${episode.seasonNumber} episode ${episode.id}: ${error.message}")
+            Log.w(TAG, "Pre-resolve failed for S${episode.seasonNumber} E${episode.episodeNumber}: ${error.message}")
             false
         }
     }
@@ -189,7 +209,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     }
 
     private fun updateStatuses(transform: (Map<String, ResolutionStatus>) -> Map<String, ResolutionStatus>) {
-        _queueStatus.value = transform(_queueStatus.value)
+        _queueStatus.update(transform)
     }
 
     fun clear() {

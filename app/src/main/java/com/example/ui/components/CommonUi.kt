@@ -143,50 +143,26 @@ fun AnimeCard(
                     )
                 }
 
-                // Playable / Catalog Badge
+                // Format / Media badge at TopEnd
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(6.dp)
                 ) {
-                    if (anime.isPlayable) {
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = PlayableGreen.copy(alpha = 0.92f)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = "Playable",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(11.dp)
-                                )
-                                Spacer(modifier = Modifier.width(2.dp))
-                                Text(
-                                    text = "Play",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                            }
-                        }
-                    } else {
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = SurfaceDark.copy(alpha = 0.85f),
-                            border = BorderStroke(0.5.dp, SurfaceHighlight)
-                        ) {
-                            Text(
-                                text = "Info",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = TextSecondary,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
+                    val isFilm = anime.format?.equals("MOVIE", ignoreCase = true) == true ||
+                        anime.mediaCategory?.equals("MOVIE", ignoreCase = true) == true
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (isFilm) AccentIndigo.copy(alpha = 0.90f) else SurfaceDark.copy(alpha = 0.85f),
+                        border = BorderStroke(0.5.dp, if (isFilm) AccentCyan.copy(alpha = 0.6f) else SurfaceHighlight)
+                    ) {
+                        Text(
+                            text = if (isFilm) "MOVIE" else (anime.format ?: "ANIME"),
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isFilm) Color.White else AccentCyan,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
                     }
                 }
 
@@ -239,10 +215,16 @@ fun AnimeCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(modifier = Modifier.height(3.dp))
+                val isFilmCard = anime.format?.equals("MOVIE", ignoreCase = true) == true ||
+                    anime.mediaCategory?.equals("MOVIE", ignoreCase = true) == true
                 val formatStr = anime.format ?: "ANIME"
-                val yearStr = anime.year ?: ""
+                val yearStr = anime.year.orEmpty().trim()
+                val epCountStr = if (!isFilmCard && (anime.episodeCount ?: 0) > 0) "${anime.episodeCount} Eps" else ""
+                val subtitleLine = listOf(formatStr, yearStr, epCountStr)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" • ")
                 Text(
-                    text = if (yearStr.isNotBlank()) "$formatStr • $yearStr" else formatStr,
+                    text = subtitleLine,
                     style = MaterialTheme.typography.bodySmall,
                     color = TextMuted,
                     fontSize = 11.sp
@@ -353,7 +335,7 @@ fun PlayableBadge(isPlayable: Boolean, modifier: Modifier = Modifier) {
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Available in catalog",
+                    text = "AniList Catalog",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = PlayableGreen

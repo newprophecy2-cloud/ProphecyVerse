@@ -19,13 +19,13 @@ interface AnimeDao {
     @Query("SELECT * FROM anime_entries WHERE isPopular = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
     fun observePopular(): Flow<List<AnimeEntry>>
 
-    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'KDRAMA' OR genres LIKE '%Drama%') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'KDRAMA' OR genres LIKE '%Drama%') ORDER BY score DESC, updatedAt DESC LIMIT 20")
     fun observeKDramas(): Flow<List<AnimeEntry>>
 
-    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'MOVIE' OR format = 'MOVIE' OR format = 'movie') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'MOVIE' OR UPPER(format) = 'MOVIE' OR UPPER(format) = 'FILM') ORDER BY isPopular DESC, score DESC, updatedAt DESC LIMIT 20")
     fun observeMovies(): Flow<List<AnimeEntry>>
 
-    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'SERIES' OR format = 'series' OR format = 'SERIES') AND isPlayable = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'SERIES' OR LOWER(format) = 'series') ORDER BY score DESC, updatedAt DESC LIMIT 20")
     fun observeWebSeries(): Flow<List<AnimeEntry>>
 
     @Query("SELECT * FROM anime_entries WHERE id = :id LIMIT 1")
@@ -59,6 +59,9 @@ interface AnimeDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAnimeList(list: List<AnimeEntry>)
 
+    @Query("UPDATE anime_entries SET backendAnimeId = :backendAnimeId, isPlayable = 1, updatedAt = :updatedAt WHERE id = :animeId")
+    suspend fun updateBackendMappingForEntry(animeId: String, backendAnimeId: String, updatedAt: Long = System.currentTimeMillis())
+
     @Query("UPDATE anime_entries SET isTrending = 0 WHERE isTrending = 1")
     suspend fun clearTrendingFlags()
 
@@ -89,6 +92,9 @@ interface AnimeDao {
 
     @Query("SELECT * FROM catalog_mappings WHERE aniListId = :aniListId LIMIT 1")
     suspend fun getMappingForAniList(aniListId: Int): CatalogMapping?
+
+    @Query("DELETE FROM catalog_mappings WHERE aniListId = :aniListId")
+    suspend fun deleteMappingForAniList(aniListId: Int)
 }
 
 @Dao
@@ -173,6 +179,12 @@ interface EpisodeDao {
 
     @Query("DELETE FROM season_entries WHERE animeId = :animeId")
     suspend fun deleteSeasonsForAnime(animeId: String)
+
+    @Query("DELETE FROM episode_entries WHERE animeId = :animeId AND seasonNumber != :targetSeasonNumber")
+    suspend fun deleteOtherSeasonEpisodes(animeId: String, targetSeasonNumber: Int)
+
+    @Query("DELETE FROM season_entries WHERE animeId = :animeId AND seasonNumber != :targetSeasonNumber")
+    suspend fun deleteOtherSeasons(animeId: String, targetSeasonNumber: Int)
 
     @Transaction
     suspend fun replaceEpisodeSnapshot(

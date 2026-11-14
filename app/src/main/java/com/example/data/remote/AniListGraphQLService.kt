@@ -18,39 +18,80 @@ interface AniListGraphQLService {
 }
 
 object AniListQueries {
-    const val SEARCH_ANIME = """
-        query (${'$'}search: String, ${'$'}page: Int, ${'$'}perPage: Int) {
-          Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-            media(search: ${'$'}search, type: ANIME, isAdult: false) {
+    private const val MEDIA_FIELDS = """
+        id
+        idMal
+        title {
+          romaji
+          english
+          native
+        }
+        synonyms
+        coverImage {
+          large
+          medium
+        }
+        bannerImage
+        description(asHtml: false)
+        format
+        status
+        season
+        seasonYear
+        startDate {
+          year
+        }
+        episodes
+        duration
+        genres
+        averageScore
+        nextAiringEpisode {
+          episode
+          airingAt
+          timeUntilAiring
+        }
+        studios(isMain: true) {
+          nodes {
+            name
+          }
+        }
+        relations {
+          edges {
+            relationType
+            node {
               id
+              type
               title {
                 romaji
                 english
                 native
               }
-              synonyms
-              coverImage {
-                large
-                medium
-              }
-              bannerImage
-              description(asHtml: false)
               format
               status
-              season
               seasonYear
               startDate {
                 year
               }
               episodes
-              duration
-              genres
-              averageScore
-              studios(isMain: true) {
-                nodes {
-                  name
-                }
+              nextAiringEpisode {
+                episode
               }
+            }
+          }
+        }
+    """
+
+    const val SEARCH_ANIME = """
+        query (${'$'}search: String, ${'$'}page: Int, ${'$'}perPage: Int) {
+          Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+            pageInfo {
+              total
+              perPage
+              currentPage
+              lastPage
+              hasNextPage
+            }
+            media(search: ${'$'}search, type: ANIME, isAdult: false, sort: [SEARCH_MATCH, POPULARITY_DESC]) {
+              $MEDIA_FIELDS
             }
           }
         }
@@ -60,101 +101,22 @@ object AniListQueries {
         query (${'$'}season: MediaSeason, ${'$'}seasonYear: Int) {
           trending: Page(page: 1, perPage: 15) {
             media(sort: TRENDING_DESC, type: ANIME, isAdult: false) {
-              id
-              title {
-                romaji
-                english
-                native
-              }
-              synonyms
-              coverImage {
-                large
-                medium
-              }
-              bannerImage
-              description(asHtml: false)
-              format
-              status
-              season
-              seasonYear
-              startDate {
-                year
-              }
-              episodes
-              duration
-              genres
-              averageScore
-              studios(isMain: true) {
-                nodes {
-                  name
-                }
-              }
+              $MEDIA_FIELDS
             }
           }
           seasonal: Page(page: 1, perPage: 15) {
             media(season: ${'$'}season, seasonYear: ${'$'}seasonYear, sort: POPULARITY_DESC, type: ANIME, isAdult: false) {
-              id
-              title {
-                romaji
-                english
-                native
-              }
-              synonyms
-              coverImage {
-                large
-                medium
-              }
-              bannerImage
-              description(asHtml: false)
-              format
-              status
-              season
-              seasonYear
-              startDate {
-                year
-              }
-              episodes
-              duration
-              genres
-              averageScore
-              studios(isMain: true) {
-                nodes {
-                  name
-                }
-              }
+              $MEDIA_FIELDS
             }
           }
           popular: Page(page: 1, perPage: 15) {
             media(sort: POPULARITY_DESC, type: ANIME, isAdult: false) {
-              id
-              title {
-                romaji
-                english
-                native
-              }
-              synonyms
-              coverImage {
-                large
-                medium
-              }
-              bannerImage
-              description(asHtml: false)
-              format
-              status
-              season
-              seasonYear
-              startDate {
-                year
-              }
-              episodes
-              duration
-              genres
-              averageScore
-              studios(isMain: true) {
-                nodes {
-                  name
-                }
-              }
+              $MEDIA_FIELDS
+            }
+          }
+          movies: Page(page: 1, perPage: 15) {
+            media(sort: POPULARITY_DESC, type: ANIME, format: MOVIE, isAdult: false) {
+              $MEDIA_FIELDS
             }
           }
         }
@@ -163,34 +125,12 @@ object AniListQueries {
     const val MEDIA_DETAILS = """
         query (${'$'}id: Int) {
           Media(id: ${'$'}id, type: ANIME) {
-            id
-            title {
-              romaji
-              english
-              native
-            }
-            synonyms
-            coverImage {
-              large
-              medium
-            }
-            bannerImage
-            description(asHtml: false)
-            format
-            status
-            season
-            seasonYear
-            startDate {
-              year
-            }
-            episodes
-            duration
-            genres
-            averageScore
-            studios(isMain: true) {
-              nodes {
-                name
-              }
+            $MEDIA_FIELDS
+            streamingEpisodes {
+              title
+              thumbnail
+              url
+              site
             }
           }
         }

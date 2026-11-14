@@ -301,8 +301,10 @@ fun DownloadsScreen(
             onDismissRequest = { itemToDelete = null },
             title = { Text("Delete Download?", fontWeight = FontWeight.Bold, color = TextPrimary) },
             text = {
+                val isDelMovie = toDel.mediaType.equals("movie", ignoreCase = true) || toDel.seasonNumber == 0
+                val descriptor = if (isDelMovie) "Movie" else "S${toDel.seasonNumber} : E${toDel.episodeNumber}"
                 Text(
-                    "Delete downloaded file for ${toDel.animeTitle} (S${toDel.seasonNumber} : E${toDel.episodeNumber}) from device storage?",
+                    "Delete downloaded file for ${toDel.animeTitle} ($descriptor) from device storage?",
                     color = TextSecondary
                 )
             },
@@ -731,8 +733,13 @@ fun DownloadedItemCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(modifier = Modifier.height(2.dp))
+                val isCardMovie = item.mediaType.equals("movie", ignoreCase = true) || item.seasonNumber == 0
                 Text(
-                    text = "S${item.seasonNumber} • Ep ${item.episodeNumber}   ${item.episodeTitle ?: ""}",
+                    text = if (isCardMovie) {
+                        listOfNotNull("Movie", item.episodeTitle?.takeIf { it.isNotBlank() && it != item.animeTitle }).joinToString(" • ")
+                    } else {
+                        "S${item.seasonNumber} • Ep ${item.episodeNumber}   ${item.episodeTitle ?: ""}"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = AccentCyan,
                     fontWeight = FontWeight.Medium,
@@ -831,8 +838,9 @@ fun DownloadingItemCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    val isDownloadingMovie = item.mediaType.equals("movie", ignoreCase = true) || item.seasonNumber == 0
                     Text(
-                        text = "Season ${item.seasonNumber} • Episode ${item.episodeNumber}",
+                        text = if (isDownloadingMovie) "Movie" else "Season ${item.seasonNumber} • Episode ${item.episodeNumber}",
                         style = MaterialTheme.typography.bodySmall,
                         color = AccentCyan,
                         fontSize = 11.sp

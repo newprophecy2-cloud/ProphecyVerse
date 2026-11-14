@@ -42,6 +42,12 @@ data class AnimeEntry(
     val isPopular: Boolean = false,
     @ColumnInfo(defaultValue = "'ANIME'")
     val mediaCategory: String = "ANIME", // "ANIME", "KDRAMA", "MOVIE", "SERIES"
+    @ColumnInfo(defaultValue = "'UNKNOWN'")
+    val metadataCompleteness: String = "UNKNOWN", // "COMPLETE", "PARTIAL", "MISSING_EPISODES", "NOT_APPLICABLE", "UNKNOWN"
+    val canonicalAnimeId: Int? = null,
+    val canonicalTitle: String? = null,
+    val canonicalSeasonNumber: Int? = null,
+    val cumulativeEpisodeOffset: Int? = null,
     val updatedAt: Long = System.currentTimeMillis()
 )
 
@@ -94,7 +100,7 @@ data class SeasonEntry(
     ]
 )
 data class EpisodeEntry(
-    @PrimaryKey val id: String, // backend episode ID
+    @PrimaryKey val id: String, // backend episode ID or deterministic AniList catalog ID
     val animeId: String,
     val seasonNumber: Int,
     val episodeNumber: Int,
@@ -109,6 +115,10 @@ data class EpisodeEntry(
 data class SearchQuery(
     @PrimaryKey val query: String,
     val totalResults: Int,
+    @ColumnInfo(defaultValue = "1")
+    val currentPage: Int = 1,
+    @ColumnInfo(defaultValue = "0")
+    val hasNextPage: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
 )
 

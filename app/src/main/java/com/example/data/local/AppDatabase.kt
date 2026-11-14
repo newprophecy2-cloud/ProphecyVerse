@@ -24,9 +24,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         EpisodeSourceSnapshotRecord::class,
         EpisodeSourceCandidateRecord::class,
         SharedCatalogCacheEntry::class,
-        SharedCatalogPendingEntry::class
+        SharedCatalogPendingEntry::class,
+        StreamContainerEntity::class,
+        StreamSeasonEntity::class,
+        StreamEpisodeEntity::class,
+        StreamProviderEntity::class,
+        StreamSourceEntity::class
     ],
-    version = 9,
+    version = 11,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -39,6 +44,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun downloadDao(): DownloadDao
     abstract fun localProfileDao(): LocalProfileDao
     abstract fun sharedCatalogDao(): SharedCatalogDao
+    abstract fun streamCacheDao(): StreamCacheDao
 
     companion object {
         @Volatile
@@ -224,6 +230,138 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE `episode_entries` ADD COLUMN `sourceEpisodeIds` TEXT")
             }
         }
+
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `anime_entries` ADD COLUMN `metadataCompleteness` TEXT NOT NULL DEFAULT 'UNKNOWN'")
+                db.execSQL("ALTER TABLE `search_queries` ADD COLUMN `currentPage` INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE `search_queries` ADD COLUMN `hasNextPage` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_containers` (
+                        `scopeKey` TEXT NOT NULL,
+                        `contentKey` TEXT NOT NULL,
+                        `anilistId` INTEGER,
+                        `contentType` TEXT NOT NULL,
+                        `backendId` TEXT,
+                        `seasonCount` INTEGER,
+                        `totalEpisodeCount` INTEGER,
+                        `providerCount` INTEGER NOT NULL,
+                        `sourceCount` INTEGER NOT NULL,
+                        `discoveryStatus` TEXT NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`scopeKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_containers_contentKey` ON `stream_containers` (`contentKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_containers_anilistId` ON `stream_containers` (`anilistId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_containers_backendId` ON `stream_containers` (`backendId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_containers_contentType` ON `stream_containers` (`contentType`)")
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_seasons` (
+                        `seasonDocKey` TEXT NOT NULL,
+                        `contentKey` TEXT NOT NULL,
+                        `seasonId` TEXT NOT NULL,
+                        `seasonNumber` INTEGER NOT NULL,
+                        `backendSeasonId` TEXT,
+                        `episodeCount` INTEGER NOT NULL,
+                        `discoveryStatus` TEXT NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`seasonDocKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_seasons_contentKey` ON `stream_seasons` (`contentKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_seasons_contentKey_seasonNumber` ON `stream_seasons` (`contentKey`, `seasonNumber`)")
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_episodes` (
+                        `episodeDocKey` TEXT NOT NULL,
+                        `contentKey` TEXT NOT NULL,
+                        `seasonId` TEXT NOT NULL,
+                        `episodeId` TEXT NOT NULL,
+                        `catalogEpisodeId` TEXT,
+                        `seasonNumber` INTEGER NOT NULL,
+                        `episodeNumber` INTEGER NOT NULL,
+                        `backendEpisodeId` TEXT,
+                        `backendSourceEpisodeIds` TEXT,
+                        `providerCount` INTEGER NOT NULL,
+                        `sourceCount` INTEGER NOT NULL,
+                        `discoveryStatus` TEXT NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`episodeDocKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_episodes_contentKey` ON `stream_episodes` (`contentKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_episodes_contentKey_seasonNumber_episodeNumber` ON `stream_episodes` (`contentKey`, `seasonNumber`, `episodeNumber`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_episodes_catalogEpisodeId` ON `stream_episodes` (`catalogEpisodeId`)")
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_providers` (
+                        `providerDocKey` TEXT NOT NULL,
+                        `scopeKey` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `providerName` TEXT NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `sourceCount` INTEGER NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`providerDocKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_providers_scopeKey` ON `stream_providers` (`scopeKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_providers_providerId` ON `stream_providers` (`providerId`)")
+
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_sources` (
+                        `sourceDocKey` TEXT NOT NULL,
+                        `scopeKey` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `sourceId` TEXT NOT NULL,
+                        `sourceName` TEXT NOT NULL,
+                        `backendEpisodeId` TEXT,
+                        `streamUrl` TEXT,
+                        `urlType` TEXT NOT NULL,
+                        `contentType` TEXT,
+                        `quality` TEXT,
+                        `codec` TEXT,
+                        `audioLanguage` TEXT,
+                        `downloadable` INTEGER,
+                        `sizeBytes` INTEGER,
+                        `safeHeadersJson` TEXT,
+                        `expiresAt` TEXT,
+                        `status` TEXT NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `lastVerifiedAt` INTEGER,
+                        `lastPlaybackSuccessAt` INTEGER,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`sourceDocKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_scopeKey` ON `stream_sources` (`scopeKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_providerId` ON `stream_sources` (`providerId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_sourceId` ON `stream_sources` (`sourceId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_status` ON `stream_sources` (`status`)")
+            }
+        }
+
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `anime_entries` ADD COLUMN `canonicalAnimeId` INTEGER DEFAULT NULL")
+                db.execSQL("ALTER TABLE `anime_entries` ADD COLUMN `canonicalTitle` TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE `anime_entries` ADD COLUMN `canonicalSeasonNumber` INTEGER DEFAULT NULL")
+                db.execSQL("ALTER TABLE `anime_entries` ADD COLUMN `cumulativeEpisodeOffset` INTEGER DEFAULT NULL")
+                db.execSQL("ALTER TABLE `stream_containers` ADD COLUMN `canonicalTitle` TEXT DEFAULT NULL")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -239,7 +377,9 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_5_6,
                         MIGRATION_6_7,
                         MIGRATION_7_8,
-                        MIGRATION_8_9
+                        MIGRATION_8_9,
+                        MIGRATION_9_10,
+                        MIGRATION_10_11
                     )
                     .build()
                 INSTANCE = instance
