@@ -9,6 +9,8 @@ import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.Timestamp
+import com.google.firebase.firestore.Source
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
@@ -235,12 +237,25 @@ class SharedCatalogRepository(
                     }
                     true
                 }.await()
+                // A completed transaction acknowledges the write, but the sync marker is only
+                // advanced after an explicit server read-back (never from the local cache).
+                val serverSnapshot = firestore.collection(item.collectionName)
+                    .document(item.documentId)
+                    .get(Source.SERVER)
+                    .await()
+                if (!serverSnapshot.exists() ||
+                    serverSnapshot.getString("documentId") != item.documentId ||
+                    serverSnapshot.getString("metadataHash") != item.metadataHash ||
+                    serverSnapshot.getLong("schemaVersion")?.toInt() != SharedCatalogMetadata.SCHEMA_VERSION) {
+                    throw IOException("Firestore server read-back did not match shared catalog write")
+                }
                 dao.deletePending(item.documentId)
                 dao.putCache(dao.getCache(item.documentId)?.copy(lastSyncedAt = now()) ?: continue)
                 completed++
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (e: Exception) {
                 val firestoreError = e as? FirebaseFirestoreException
+                Log.w(TAG, "Shared catalog sync failed (${firestoreError?.code?.name ?: e::class.simpleName}): ${e.message?.take(240)}")
                 val category = when (firestoreError?.code) {
                     FirebaseFirestoreException.Code.PERMISSION_DENIED, FirebaseFirestoreException.Code.UNAUTHENTICATED -> "PERMISSION_DENIED"
                     FirebaseFirestoreException.Code.INVALID_ARGUMENT, FirebaseFirestoreException.Code.FAILED_PRECONDITION -> "PERMANENT_FAILURE"
@@ -259,6 +274,9 @@ class SharedCatalogRepository(
         return completed
     }
 
+    private companion object {
+        const val TAG = "SharedCatalogRepository"
+    }
     private fun JSONObject.toMap(): Map<String, Any> {
         val result = HashMap<String, Any>()
         keys().forEach { key ->

@@ -62,6 +62,9 @@ interface AnimeDao {
     @Query("UPDATE anime_entries SET backendAnimeId = :backendAnimeId, isPlayable = 1, updatedAt = :updatedAt WHERE id = :animeId")
     suspend fun updateBackendMappingForEntry(animeId: String, backendAnimeId: String, updatedAt: Long = System.currentTimeMillis())
 
+    @Query("UPDATE anime_entries SET backendAnimeId = NULL, updatedAt = :updatedAt WHERE id = :animeId")
+    suspend fun clearBackendMappingForEntry(animeId: String, updatedAt: Long = System.currentTimeMillis())
+
     @Query("UPDATE anime_entries SET isTrending = 0 WHERE isTrending = 1")
     suspend fun clearTrendingFlags()
 
@@ -78,6 +81,9 @@ interface AnimeDao {
           AND isTrending = 0 AND isSeasonal = 0 AND isPopular = 0
     """)
     suspend fun clearUnsavedCache()
+
+    @Query("UPDATE anime_entries SET isTrending = 0, isSeasonal = 0, isPopular = 0, updatedAt = :updatedAt WHERE id = :animeId")
+    suspend fun demoteCanonicalAlias(animeId: String, updatedAt: Long = System.currentTimeMillis())
 
     // Aliases
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -225,6 +231,18 @@ interface EpisodeDao {
         if (mergedSeasons.isNotEmpty()) upsertSeasons(mergedSeasons)
         if (mergedEpisodes.isNotEmpty()) upsertEpisodes(mergedEpisodes)
     }
+
+    @Transaction
+    suspend fun rekeyAnime(fromAnimeId: String, toAnimeId: String) {
+        if (fromAnimeId == toAnimeId) return
+        val seasons = getSeasonsForAnime(fromAnimeId)
+            .map { it.copy(animeId = toAnimeId, id = "${toAnimeId}_s${it.seasonNumber}") }
+        val episodes = getEpisodesForAnime(fromAnimeId).map { it.copy(animeId = toAnimeId) }
+        if (seasons.isNotEmpty()) upsertSeasons(seasons)
+        if (episodes.isNotEmpty()) upsertEpisodes(episodes)
+        deleteEpisodesForAnime(fromAnimeId)
+        deleteSeasonsForAnime(fromAnimeId)
+    }
 }
 
 @Dao
@@ -331,6 +349,9 @@ interface PlaybackHistoryDao {
 
     @Query("DELETE FROM playback_history")
     suspend fun clearAllHistory()
+
+    @Query("DELETE FROM playback_history WHERE animeId = :animeId")
+    suspend fun deleteHistoryForAnime(animeId: String)
 }
 
 @Dao

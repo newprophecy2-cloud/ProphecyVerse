@@ -85,7 +85,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             viewModelScope.launch {
-                // When internet connectivity returns, automatically refresh AniList feeds in background
+                // When internet connectivity returns, flush queued Firestore writes and refresh feeds
+                launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { repository.streamingRepository.flushPendingOutbox() }
+                    runCatching { repository.processPendingSharedCatalogQueue() }
+                }
                 repository.refreshHomeDiscovery(force = false)
             }
         }
@@ -234,7 +238,8 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
 
 class DetailViewModel(
     application: Application,
-    val animeId: String
+    val animeId: String,
+    initialSeason: Int? = null
 ) : AndroidViewModel(application) {
     private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
 
@@ -247,7 +252,7 @@ class DetailViewModel(
     private val firstEpisode: StateFlow<EpisodeEntry?> = repository.observeFirstEpisode(animeId)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    private val _selectedSeason = MutableStateFlow(1)
+    private val _selectedSeason = MutableStateFlow(initialSeason?.takeIf { it > 0 } ?: 1)
     val selectedSeason: StateFlow<Int> = _selectedSeason.asStateFlow()
 
     private val _episodeWindowStart = MutableStateFlow(0)
@@ -681,6 +686,7 @@ class PlayerViewModel(
 ) : AndroidViewModel(application) {
     private val repository = AnimeRepository(AppDatabase.getInstance(application), applicationContext = application)
     val playerManager = PlayerManager(application, viewModelScope)
+    val playbackDiagnostics: StateFlow<PlayerManager.PlaybackDiagnostics> = playerManager.playbackDiagnostics
     val preResolveManager = PreResolveQueueManager(repository, viewModelScope)
 
     val animeEntry: StateFlow<AnimeEntry?> = repository.observeAnimeById(animeId)
@@ -914,7 +920,7 @@ class PlayerViewModel(
             (preferredSourceId == null || preferredSourceId == activeSourceId) &&
             playbackResolutionJob?.isActive == true) return
         if (_currentEpisode.value?.id == episode.id &&
-            preferredSourceId == null &&
+            (preferredSourceId == null || preferredSourceId == activeSourceId) &&
             !_isResolving.value &&
             playerManager.errorMessage.value == null &&
             !playerManager.isPlaybackEnded.value &&
@@ -1066,7 +1072,9 @@ class PlayerViewModel(
                             }
                         },
                         providerName = prepared.source.displayProviderName,
-                        sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
+                        sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L),
+                        sourceQuality = prepared.source.quality,
+                        resolveDurationMs = 0L
                     )
                     return@launch
                 }
@@ -1186,7 +1194,9 @@ class PlayerViewModel(
             activeSourceId = source.id
             _activeSource.value = source
 
+            var resolvedDurationMs = 0L
             var playRes = if (i == 0 && !forceFresh && preResolved?.source?.id == source.id) {
+                resolvedDurationMs = preResolved.resolveDurationMs
                 Result.success(preResolved.directData)
             } else {
                 repository.resolveVerifiedPlaybackForEpisode(
@@ -1194,7 +1204,10 @@ class PlayerViewModel(
                     episode,
                     preferredSourceId = source.id,
                     forceResolveFresh = forceFresh
-                ).map { it.directData }
+                ).map {
+                    resolvedDurationMs = it.resolveDurationMs
+                    it.directData
+                }
             }
             if (playRes.isFailure && isTransientNetworkFailure(playRes.exceptionOrNull())) {
                 _isResolving.value = true
@@ -1271,7 +1284,9 @@ class PlayerViewModel(
                         }
                     },
                     providerName = source.displayProviderName,
-                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(targetAnimeId, episode.seasonNumber, episode.id, 0L)
+                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(targetAnimeId, episode.seasonNumber, episode.id, 0L),
+                    sourceQuality = source.quality,
+                    resolveDurationMs = resolvedDurationMs
                 )
 
                 return

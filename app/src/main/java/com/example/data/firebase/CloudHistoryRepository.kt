@@ -6,6 +6,7 @@ import androidx.room.withTransaction
 import com.example.data.local.AppDatabase
 import com.example.data.local.PlaybackHistory
 import com.example.data.local.WatchlistEntry
+import com.example.data.repository.AnimeRepository
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.CoroutineScope
@@ -18,6 +19,7 @@ import kotlinx.coroutines.sync.withLock
 class CloudHistoryRepository private constructor(private val context: Context) {
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val database: AppDatabase by lazy { AppDatabase.getInstance(context) }
+    private val animeRepository: AnimeRepository by lazy { AnimeRepository(database, applicationContext = context) }
     private val scope = CoroutineScope(Dispatchers.IO)
     private val pullMutex = Mutex()
     private val syncPreferences by lazy {
@@ -34,25 +36,28 @@ class CloudHistoryRepository private constructor(private val context: Context) {
         durationMs: Long,
         completed: Boolean
     ) {
-        val history = PlaybackHistory(
-            id = "history_${animeId}_$episodeId",
-            animeId = animeId,
-            episodeId = episodeId,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-            episodeTitle = episodeTitle,
-            positionMs = positionMs,
-            durationMs = durationMs,
-            completed = completed,
-            lastPlayedAt = System.currentTimeMillis()
-        )
-
         scope.launch {
             try {
+                // Resolve only from locally stored, proven AniList relation metadata.
+                val canonicalId = animeRepository.resolveCanonicalRoute(animeId).animeId
+                val canonicalHistoryId = "history_${canonicalId}_$episodeId"
+                val history = PlaybackHistory(
+                    id = canonicalHistoryId,
+                    animeId = canonicalId,
+                    episodeId = episodeId,
+                    seasonNumber = seasonNumber,
+                    episodeNumber = episodeNumber,
+                    episodeTitle = episodeTitle,
+                    positionMs = positionMs,
+                    durationMs = durationMs,
+                    completed = completed,
+                    lastPlayedAt = System.currentTimeMillis()
+                )
+
                 // 1. Save locally only if this progress is not older than the stored episode state.
                 database.withTransaction {
                     val dao = database.playbackHistoryDao()
-                    val local = dao.getHistoryForEpisode(animeId, episodeId)
+                    val local = dao.getHistoryForEpisode(canonicalId, episodeId)
                     if (local == null || history.lastPlayedAt >= local.lastPlayedAt) {
                         dao.upsertHistory(history.copy(completed = history.completed || (local?.completed == true)))
                     }
@@ -63,7 +68,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 val ownerKey = currentUser.uid
                 val docData = hashMapOf<String, Any>(
                     "id" to history.id,
-                    "anime_id" to animeId,
+                    "anime_id" to canonicalId,
                     "episode_id" to episodeId,
                     "season_number" to seasonNumber,
                     "episode_number" to episodeNumber,
@@ -102,8 +107,9 @@ class CloudHistoryRepository private constructor(private val context: Context) {
     fun syncWatchlistStatus(animeId: String, status: String, isFavorite: Boolean) {
         scope.launch {
             try {
+                val canonicalId = animeRepository.resolveCanonicalRoute(animeId).animeId
                 val entry = WatchlistEntry(
-                    animeId = animeId,
+                    animeId = canonicalId,
                     status = status,
                     isFavorite = isFavorite,
                     updatedAt = System.currentTimeMillis()
@@ -113,7 +119,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
                 val ownerKey = currentUser.uid
                 val docData = hashMapOf<String, Any>(
-                    "anime_id" to animeId,
+                    "anime_id" to canonicalId,
                     "status" to status,
                     "is_favorite" to isFavorite,
                     "updated_at" to entry.updatedAt,
@@ -124,7 +130,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                     firestore.collection("watchlist")
                         .document(ownerKey)
                         .collection("items")
-                        .document(animeId)
+                        .document(canonicalId)
                         .set(docData, SetOptions.merge())
                 }
             } catch (cancelled: CancellationException) {
@@ -152,30 +158,25 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .get()
                 }
 
-                val cloudHistories = historyDocs.documents.mapNotNull { doc ->
-                    val id = doc.getString("id") ?: return@mapNotNull null
-                    val animeId = doc.getString("anime_id") ?: return@mapNotNull null
-                    val episodeId = doc.getString("episode_id") ?: return@mapNotNull null
-                    val seasonNumber = doc.getLong("season_number")?.toInt() ?: 1
-                    val episodeNumber = doc.getLong("episode_number")?.toInt() ?: 1
-                    val episodeTitle = doc.getString("episode_title")
-                    val positionMs = doc.getLong("position_ms") ?: 0L
-                    val durationMs = doc.getLong("duration_ms") ?: 0L
-                    val completed = doc.getBoolean("completed") ?: false
-                    val lastPlayedAt = doc.getLong("last_played_at") ?: System.currentTimeMillis()
-
-                    PlaybackHistory(
-                        id = id,
-                        animeId = animeId,
-                        episodeId = episodeId,
-                        seasonNumber = seasonNumber,
-                        episodeNumber = episodeNumber,
-                        episodeTitle = episodeTitle,
-                        positionMs = positionMs,
-                        durationMs = durationMs,
-                        completed = completed,
-                        lastPlayedAt = lastPlayedAt
-                    )
+                val cloudHistories = buildList {
+                    for (doc in historyDocs.documents) {
+                        val id = doc.getString("id") ?: continue
+                        val rawAnimeId = doc.getString("anime_id") ?: continue
+                        val animeId = animeRepository.resolveCanonicalRoute(rawAnimeId).animeId
+                        val episodeId = doc.getString("episode_id") ?: continue
+                        add(PlaybackHistory(
+                            id = id,
+                            animeId = animeId,
+                            episodeId = episodeId,
+                            seasonNumber = doc.getLong("season_number")?.toInt() ?: 1,
+                            episodeNumber = doc.getLong("episode_number")?.toInt() ?: 1,
+                            episodeTitle = doc.getString("episode_title"),
+                            positionMs = doc.getLong("position_ms") ?: 0L,
+                            durationMs = doc.getLong("duration_ms") ?: 0L,
+                            completed = doc.getBoolean("completed") ?: false,
+                            lastPlayedAt = doc.getLong("last_played_at") ?: System.currentTimeMillis()
+                        ))
+                    }
                 }
 
                 if (cloudHistories.isNotEmpty()) {
@@ -201,18 +202,17 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .get()
                 }
 
-                val cloudWatchlist = watchlistDocs.documents.mapNotNull { doc ->
-                    val animeId = doc.getString("anime_id") ?: return@mapNotNull null
-                    val status = doc.getString("status") ?: "WATCHING"
-                    val isFavorite = doc.getBoolean("is_favorite") ?: false
-                    val updatedAt = doc.getLong("updated_at") ?: System.currentTimeMillis()
-
-                    WatchlistEntry(
-                        animeId = animeId,
-                        status = status,
-                        isFavorite = isFavorite,
-                        updatedAt = updatedAt
-                    )
+                val cloudWatchlist = buildList {
+                    for (doc in watchlistDocs.documents) {
+                        val rawAnimeId = doc.getString("anime_id") ?: continue
+                        val animeId = animeRepository.resolveCanonicalRoute(rawAnimeId).animeId
+                        add(WatchlistEntry(
+                            animeId = animeId,
+                            status = doc.getString("status") ?: "WATCHING",
+                            isFavorite = doc.getBoolean("is_favorite") ?: false,
+                            updatedAt = doc.getLong("updated_at") ?: System.currentTimeMillis()
+                        ))
+                    }
                 }
 
                 if (cloudWatchlist.isNotEmpty()) {

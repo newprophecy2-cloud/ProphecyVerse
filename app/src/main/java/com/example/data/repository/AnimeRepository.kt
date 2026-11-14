@@ -2,8 +2,12 @@ package com.example.data.repository
 
 import android.content.Context
 import android.util.Log
+import com.example.data.firebase.SharedCatalogMetadata
+import com.example.data.firebase.SharedCatalogRepository
 import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.identity.EpisodeSourceEpisodeIds
+import com.example.data.identity.CanonicalAnimeIdentity
+import com.example.data.identity.CanonicalAnimeRoute
 import com.example.data.local.AnimeAlias
 import com.example.data.local.AnimeDao
 import com.example.data.local.AnimeEntry
@@ -45,15 +49,19 @@ import com.example.data.streaming.ResolvedStreamPlayback
 import com.example.data.streaming.SafePlaybackHeaders
 import com.example.data.streaming.StreamRecordStatus
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import androidx.room.withTransaction
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 
@@ -107,6 +115,30 @@ class AnimeRepository(
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
     private val streamCacheDao: StreamCacheDao = database.streamCacheDao()
+    private val sharedCatalogRepository = SharedCatalogRepository(database.sharedCatalogDao())
+    private val sharedCatalogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    suspend fun processPendingSharedCatalogQueue(): Int = sharedCatalogRepository.processPendingQueue()
+    private fun queueBackendCatalogMetadata(details: ProphecyAnimeDetailsResponse) {
+        sharedCatalogScope.launch {
+            runCatching {
+                SharedCatalogMetadata.fromDetail(details)?.let { sharedCatalogRepository.acceptBackendMetadata(it) }
+                if (details.mediaType?.equals("movie", ignoreCase = true) != true) {
+                    details.seasons.orEmpty().forEach { season ->
+                    SharedCatalogMetadata.fromSeason(details.id, details.canonicalId, season)?.let { sharedCatalogRepository.acceptBackendMetadata(it) }
+                    season.episodes.orEmpty().forEach { episode ->
+                        val normalized = episode.copy(season = episode.season ?: season.number)
+                        SharedCatalogMetadata.fromEpisode(details.id, details.canonicalId, season.number, normalized)?.let { sharedCatalogRepository.acceptBackendMetadata(it) }
+                    }
+                    }
+                }
+                details.genres.orEmpty().forEach { genre ->
+                    SharedCatalogMetadata.fromGenre(genre)?.let { sharedCatalogRepository.acceptBackendMetadata(it) }
+                }
+            }.onFailure { error ->
+                Log.w("AnimeRepository", "Shared catalog metadata queued locally but acceptance failed: ${error.message?.take(240)}")
+            }
+        }
+    }
 
     data class SearchPageResult(
         val totalReturnedInPage: Int,
@@ -187,6 +219,58 @@ class AnimeRepository(
     fun observeLocalSearchFallback(query: String): Flow<List<AnimeEntry>> {
         val norm = TitleMatcher.normalize(query)
         return animeDao.searchLocal(norm)
+    }
+
+    /** Resolve only identities proven by AniList relation metadata; never guess from title text. */
+    suspend fun resolveCanonicalRoute(animeId: String, requestedSeason: Int? = null): CanonicalAnimeRoute =
+        withContext(Dispatchers.IO) {
+            val source = animeDao.getAnimeById(animeId)
+                ?: return@withContext CanonicalAnimeRoute(animeId, requestedSeason, false)
+            val route = CanonicalAnimeIdentity.routeFor(source, animeId, requestedSeason)
+            if (!route.resolved) return@withContext route
+            migrateAliasToCanonical(source, route.animeId)
+            route
+        }
+
+    private suspend fun migrateAliasToCanonical(source: AnimeEntry, canonicalId: String) {
+        if (source.id == canonicalId) return
+        database.withTransaction {
+            if (animeDao.getAnimeById(canonicalId) == null) {
+                val title = source.canonicalTitle?.takeIf { it.isNotBlank() } ?: source.preferredTitle
+                animeDao.upsertAnime(source.copy(
+                    id = canonicalId,
+                    aniListId = canonicalId.removePrefix("anilist_").toIntOrNull() ?: source.aniListId,
+                    preferredTitle = title,
+                    titleEnglish = source.canonicalTitle ?: source.titleEnglish,
+                    titleRomaji = source.canonicalTitle ?: source.titleRomaji,
+                    canonicalAnimeId = null,
+                    canonicalTitle = null,
+                    canonicalSeasonNumber = null,
+                    cumulativeEpisodeOffset = null,
+                    isTrending = false,
+                    isSeasonal = false,
+                    isPopular = false,
+                    updatedAt = System.currentTimeMillis()
+                ))
+            }
+            episodeDao.rekeyAnime(source.id, canonicalId)
+            val aliasWatchlist = watchlistDao.getWatchlistEntry(source.id)
+            val canonicalWatchlist = watchlistDao.getWatchlistEntry(canonicalId)
+            if (aliasWatchlist != null && (canonicalWatchlist == null || aliasWatchlist.updatedAt >= canonicalWatchlist.updatedAt)) {
+                watchlistDao.upsertWatchlistEntry(aliasWatchlist.copy(animeId = canonicalId))
+            }
+            if (aliasWatchlist != null) watchlistDao.deleteWatchlistEntry(source.id)
+            val aliasHistory = historyDao.getHistoryForAnime(source.id)
+            val canonicalHistory = historyDao.getHistoryForAnime(canonicalId)
+            if (aliasHistory != null && (canonicalHistory == null || aliasHistory.lastPlayedAt >= canonicalHistory.lastPlayedAt)) {
+                historyDao.upsertHistory(aliasHistory.copy(
+                    id = "history_${canonicalId}_${aliasHistory.episodeId}",
+                    animeId = canonicalId
+                ))
+            }
+            if (aliasHistory != null) historyDao.deleteHistoryForAnime(source.id)
+            animeDao.demoteCanonicalAlias(source.id)
+        }
     }
 
     fun observeWatchlist(): Flow<List<WatchlistEntry>> = watchlistDao.observeAllWatchlist()
@@ -814,10 +898,10 @@ class AnimeRepository(
                 val updatedEntry = (entry ?: AnimeEntry(id = animeId, preferredTitle = preferredTitle)).copy(
                     aniListId = media.id,
                     backendAnimeId = resolvedBackendId,
-                    canonicalAnimeId = canonicalInfo.canonicalAnimeId,
-                    canonicalTitle = canonicalInfo.canonicalTitle,
-                    canonicalSeasonNumber = canonicalInfo.canonicalSeasonNumber,
-                    cumulativeEpisodeOffset = canonicalInfo.cumulativeEpisodeOffset,
+                    canonicalAnimeId = if (isMovie) null else (canonicalInfo.canonicalAnimeId ?: entry?.canonicalAnimeId),
+                    canonicalTitle = if (isMovie) null else (canonicalInfo.canonicalTitle ?: entry?.canonicalTitle),
+                    canonicalSeasonNumber = if (isMovie) null else (canonicalInfo.canonicalSeasonNumber ?: entry?.canonicalSeasonNumber),
+                    cumulativeEpisodeOffset = if (isMovie) null else (canonicalInfo.cumulativeEpisodeOffset ?: entry?.cumulativeEpisodeOffset),
                     titleRomaji = media.title?.romaji ?: entry?.titleRomaji,
                     titleEnglish = media.title?.english ?: entry?.titleEnglish,
                     titleNative = media.title?.native ?: entry?.titleNative,
@@ -951,7 +1035,7 @@ class AnimeRepository(
             }
 
             // Tier 2: Firestore shared cache (reuse without repeating backend discovery)
-            val firestoreData = streamingRepository.fetchAndSyncScope(
+            val readOutcome = streamingRepository.fetchAndSyncScopeWithOutcome(
                 contentKey = contentKey,
                 isMovie = isMovie,
                 seasonNumber = effectiveSeason,
@@ -959,6 +1043,7 @@ class AnimeRepository(
                 catalogEpisodeId = catalogEpisodeId,
                 preferServer = forceRefresh
             )
+            val firestoreData = readOutcome.data
             if (!forceRefresh && firestoreData != null &&
                 (firestoreData.discoveryStatus == DiscoveryStatus.COMPLETED.name ||
                     firestoreData.sources.any { it.status != "REMOVED" && it.deletedAt == null })
@@ -967,6 +1052,18 @@ class AnimeRepository(
                 if (synced != null && synced.sources.isNotEmpty()) {
                     MonotonicMetrics.recordDuration("source_discovery_ms", discoveryStarted, "tier=FIRESTORE count=${synced.sources.size}")
                     return@withContext Result.success(synced)
+                }
+            }
+            if (!forceRefresh && readOutcome.isHardError) {
+                val fallbackRoom = readRoomScopeSnapshot(scopeKey, animeId, isMovie, effectiveSeason, effectiveEpisode)
+                if (fallbackRoom != null && fallbackRoom.sources.isNotEmpty()) {
+                    Log.w("AnimeRepository", "Firestore read failed (${readOutcome.status}); returning cached Room scope cleanly.")
+                    return@withContext Result.success(
+                        fallbackRoom.copy(
+                            state = EpisodeSourceResponseState.STALE,
+                            errorMessage = readOutcome.message
+                        )
+                    )
                 }
             }
 
@@ -1000,12 +1097,13 @@ class AnimeRepository(
                 allowCachedIds = !forceRefresh
             )
 
-            // Self-heal stale/duplicate single-provider backend mapping on multi-season canonical entries
-            val canSelfHealBackend = !isMovie && anime != null && (
-                effectiveSeason > 1 ||
-                    anime.canonicalAnimeId != null ||
-                    anime.canonicalTitle != null ||
-                    TitleMatcher.hasSequelMarker(listOfNotNull(anime.preferredTitle, anime.titleEnglish, anime.titleRomaji))
+            val canSelfHealBackend = animeId.startsWith("anilist_") || (
+                !isMovie && anime != null && (
+                    effectiveSeason > 1 ||
+                        anime.canonicalAnimeId != null ||
+                        anime.canonicalTitle != null ||
+                        TitleMatcher.hasSequelMarker(listOfNotNull(anime.preferredTitle, anime.titleEnglish, anime.titleRomaji))
+                    )
                 )
 
             if (backendEpisodeIds.isEmpty() && canSelfHealBackend) {
@@ -1107,7 +1205,7 @@ class AnimeRepository(
 
             if (aggregatedCandidates.isEmpty() && hadHttpOrNetworkError) {
                 // Temporary failure MUST NOT delete cached records or mark permanently unavailable
-                streamingRepository.publishDiscoveryAndSyncRoom(
+                val syncedTemp = streamingRepository.publishDiscoveryAndSyncRoom(
                     contentKey = contentKey,
                     anilistId = identity.anilistAnimeId,
                     isMovie = isMovie,
@@ -1121,6 +1219,9 @@ class AnimeRepository(
                     discoveryStatus = DiscoveryStatus.TEMPORARY_FAILURE,
                     canonicalTitle = identity.canonicalTitle
                 )
+                if (!syncedTemp) {
+                    Log.w("AnimeRepository", "Temporary discovery state queued for retry: ${streamingRepository.lastWriteRejectionReason ?: "queued"}")
+                }
                 return@withContext staleRoomOrFailure(
                     scopeKey, animeId, isMovie, effectiveSeason, effectiveEpisode,
                     lastErrorMsg ?: "Temporary provider outage"
@@ -1131,14 +1232,19 @@ class AnimeRepository(
             val backendEpMap = aggregatedCandidates.associate { it.second.id to it.first }
             val now = System.currentTimeMillis()
 
-            val existingSources = streamCacheDao.getAllSources(scopeKey).associateBy { it.sourceId }
+            val allExistingSources = streamCacheDao.getAllSources(scopeKey)
+            val existingByComposite = allExistingSources.associateBy { "${it.providerId}|${it.sourceId}" }
+            val existingBySourceIdGroups = allExistingSources.groupBy { it.sourceId }
             val sourceEntities = mutableListOf<StreamSourceEntity>()
             val providersMap = linkedMapOf<String, MutableList<StreamSourceEntity>>()
 
             for (dto in dedupedDtos.sources) {
                 if (!dto.hasUsableSourceId) continue
                 val providerId = ContentIdentityHelper.deterministicProviderId(dto.label)
-                val prev = existingSources[dto.id]
+                val prev = existingByComposite["$providerId|${dto.id}"]
+                    ?: existingBySourceIdGroups[dto.id]?.singleOrNull()
+                val effectiveExpiresAt = dto.expiresAt ?: prev?.expiresAt
+                val validUrl = prev?.streamUrl?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) }
                 val sEntity = StreamSourceEntity(
                     sourceDocKey = "$scopeKey|p|$providerId|s|${ContentIdentityHelper.sanitizeDocId(dto.id)}",
                     scopeKey = scopeKey,
@@ -1146,7 +1252,7 @@ class AnimeRepository(
                     sourceId = dto.id,
                     sourceName = dto.displayProviderName,
                     backendEpisodeId = backendEpMap[dto.id] ?: prev?.backendEpisodeId,
-                    streamUrl = prev?.streamUrl?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) },
+                    streamUrl = validUrl,
                     urlType = prev?.urlType ?: "direct",
                     contentType = prev?.contentType,
                     quality = dto.quality ?: prev?.quality,
@@ -1155,9 +1261,11 @@ class AnimeRepository(
                     downloadable = dto.downloadable ?: prev?.downloadable,
                     sizeBytes = dto.sizeBytes ?: prev?.sizeBytes,
                     safeHeadersJson = prev?.safeHeadersJson,
-                    expiresAt = dto.expiresAt ?: prev?.expiresAt,
-                    status = if (prev?.streamUrl != null && !SourceExpiryTime.isExpired(dto.expiresAt ?: prev.expiresAt)) {
+                    expiresAt = effectiveExpiresAt,
+                    status = if (validUrl != null && !SourceExpiryTime.isExpiredOrInvalid(effectiveExpiresAt)) {
                         StreamRecordStatus.AVAILABLE.name
+                    } else if (validUrl != null && SourceExpiryTime.evaluateExpiry(effectiveExpiresAt) == ExpiryState.EXPIRED) {
+                        StreamRecordStatus.EXPIRED.name
                     } else {
                         StreamRecordStatus.MISSING_URL.name
                     },
@@ -1194,7 +1302,7 @@ class AnimeRepository(
             val totalEps = if (isMovie) null else (anime?.episodeCount ?: episodeDao.getEpisodesForAnime(animeId).size)
             val seasonEpCount = if (isMovie) 0 else episodeDao.getEpisodesForAnime(animeId).count { it.seasonNumber == effectiveSeason }
 
-            streamingRepository.publishDiscoveryAndSyncRoom(
+            val discoveryPublished = streamingRepository.publishDiscoveryAndSyncRoom(
                 contentKey = contentKey,
                 anilistId = identity.anilistAnimeId,
                 isMovie = isMovie,
@@ -1211,6 +1319,12 @@ class AnimeRepository(
                 discoveryStatus = discoveryStatus,
                 canonicalTitle = identity.canonicalTitle
             )
+            if (!discoveryPublished) {
+                Log.w(
+                    "AnimeRepository",
+                    "Discovery persisted in Room; Firestore publish deferred/failed (${streamingRepository.lastWriteOutcome?.state}: ${streamingRepository.lastWriteRejectionReason ?: "queued"})"
+                )
+            }
 
             MonotonicMetrics.recordDuration("source_discovery_ms", discoveryStarted, "tier=BACKEND count=${dedupedDtos.sources.size}")
             Result.success(
@@ -1367,7 +1481,20 @@ class AnimeRepository(
             d.await() to e.await()
         }
 
+        if (detailResp?.code() in listOf(404, 410)) {
+            Log.w("AnimeRepository", "Cached backendId=$backendId returned HTTP ${detailResp?.code()}; clearing stale mapping.")
+            invalidateStaleBackendMapping(animeId, anime, backendId)
+            return emptyList()
+        }
+
         val backendDetails = detailResp?.takeIf { it.isSuccessful }?.body()
+        if (backendDetails != null) queueBackendCatalogMetadata(backendDetails)
+        if (backendDetails != null && !isValidBackendDetailsForEntry(animeId, anime, backendDetails)) {
+            Log.w("AnimeRepository", "Cached backendId=$backendId failed entry validation for $animeId; clearing stale mapping.")
+            invalidateStaleBackendMapping(animeId, anime, backendId)
+            return emptyList()
+        }
+
         val backendEpisodes = mutableListOf<ProphecyEpisodeDto>()
         backendDetails?.seasons.orEmpty().forEach { s ->
             s.episodes.orEmpty().forEach { ep ->
@@ -1629,7 +1756,7 @@ class AnimeRepository(
             roomSources = streamCacheDao.getActiveSources(scopeKey)
             hydratedFromFirestore = roomSources.any {
                 SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
-                    !SourceExpiryTime.isExpired(it.expiresAt) &&
+                    !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) &&
                     it.status !in setOf("REMOVED", "EXPIRED", "FAILED")
             }
         }
@@ -1641,34 +1768,37 @@ class AnimeRepository(
             for (cachedSource in orderedRoomSources) {
                 val url = cachedSource.streamUrl
                 if (SafePlaybackHeaders.isValidStreamUrl(url) &&
-                    !SourceExpiryTime.isExpired(cachedSource.expiresAt) &&
+                    !SourceExpiryTime.isExpiredOrInvalid(cachedSource.expiresAt) &&
                     cachedSource.status !in setOf("REMOVED", "EXPIRED", "FAILED")
                 ) {
                     val data = cachedSource.toDirectPlayData()
                     val resolvedTier = if (hydratedFromFirestore) "FIRESTORE" else "ROOM"
                     val metricTag = if (hydratedFromFirestore) "tier=FIRESTORE" else "tier=ROOM"
-                    MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, metricTag)
+                    val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, metricTag)
                     return@withContext Result.success(
                         ResolvedStreamPlayback(
                             source = cachedSource.toProphecyDto(),
                             directData = data,
                             candidates = candidatesDto,
                             fromCache = true,
-                            cacheTier = resolvedTier
+                            cacheTier = resolvedTier,
+                            resolveDurationMs = elapsed
                         )
                     )
                 }
             }
 
             // 2. Check Firestore shared cache before calling Resolve
-            val firestoreData = streamingRepository.fetchAndSyncScope(
+            val firestoreOutcome = streamingRepository.fetchAndSyncScopeWithOutcome(
                 contentKey = contentKey,
                 isMovie = isMovie,
                 seasonNumber = effectiveSeason,
                 episodeNumber = effectiveEpisode,
                 catalogEpisodeId = catalogEpisodeId,
-                preferServer = true
+                preferServer = true,
+                requirePlayableUrl = true
             )
+            val firestoreData = firestoreOutcome.data
             if (firestoreData != null) {
                 val orderedFs = orderSourcesForPlayback(
                     firestoreData.sources.filter { it.status != "REMOVED" && it.deletedAt == null },
@@ -1676,16 +1806,17 @@ class AnimeRepository(
                 )
                 for (fsSource in orderedFs) {
                     if (SafePlaybackHeaders.isValidStreamUrl(fsSource.streamUrl) &&
-                        !SourceExpiryTime.isExpired(fsSource.expiresAt)
+                        !SourceExpiryTime.isExpiredOrInvalid(fsSource.expiresAt)
                     ) {
-                        MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=FIRESTORE")
+                        val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=FIRESTORE")
                         return@withContext Result.success(
                             ResolvedStreamPlayback(
                                 source = fsSource.toProphecyDto(),
                                 directData = fsSource.toDirectPlayData(),
                                 candidates = orderedFs.map { it.toProphecyDto() },
                                 fromCache = true,
-                                cacheTier = "FIRESTORE"
+                                cacheTier = "FIRESTORE",
+                                resolveDurationMs = elapsed
                             )
                         )
                     }
@@ -1701,7 +1832,7 @@ class AnimeRepository(
         var lastError: Throwable? = null
         for (sourceEntity in refreshedRoomSources) {
             if (sourceEntity.sourceId.isBlank()) continue
-            val lease = streamingRepository.acquireResolveLease(
+            var lease = streamingRepository.acquireResolveLease(
                 contentKey = contentKey,
                 isMovie = isMovie,
                 providerId = sourceEntity.providerId,
@@ -1710,31 +1841,48 @@ class AnimeRepository(
                 episodeNumber = if (isMovie) 0 else effectiveEpisode
             )
 
-            // If another device currently holds an active resolve lease for this exact source, wait briefly and check Firestore
+            // If another device/coroutine holds an active resolve lease for this exact source, wait cleanly and check Firestore
             if (lease == null) {
                 delay(700L)
-                val peerSync = streamingRepository.fetchAndSyncScope(
-                    contentKey, isMovie, effectiveSeason, effectiveEpisode, catalogEpisodeId, preferServer = true
-                )
+                val peerSync = streamingRepository.fetchAndSyncScopeWithOutcome(
+                    contentKey, isMovie, effectiveSeason, effectiveEpisode, catalogEpisodeId,
+                    preferServer = true, requirePlayableUrl = true
+                ).data
                 val peerHit = peerSync?.sources?.firstOrNull {
                     it.sourceId == sourceEntity.sourceId &&
                         it.status != "REMOVED" &&
                         SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
-                        !SourceExpiryTime.isExpired(it.expiresAt)
+                        !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
                 }
                 if (peerHit != null) {
+                    val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=FIRESTORE")
                     return@withContext Result.success(
                         ResolvedStreamPlayback(
                             source = peerHit.toProphecyDto(),
                             directData = peerHit.toDirectPlayData(),
                             candidates = allCandidates,
                             fromCache = true,
-                            cacheTier = "FIRESTORE"
+                            cacheTier = "FIRESTORE",
+                            resolveDurationMs = elapsed
                         )
                     )
                 }
+                // Re-attempt lease acquisition if previous holder finished without a cached hit
+                lease = streamingRepository.acquireResolveLease(
+                    contentKey = contentKey,
+                    isMovie = isMovie,
+                    providerId = sourceEntity.providerId,
+                    sourceId = sourceEntity.sourceId,
+                    seasonNumber = if (isMovie) 0 else effectiveSeason,
+                    episodeNumber = if (isMovie) 0 else effectiveEpisode
+                )
+                if (lease == null) {
+                    lastError = IllegalStateException("Source resolution currently in progress on another worker.")
+                    continue
+                }
             }
 
+            var finalLeaseStatus = "FAILED"
             try {
                 val res = resolveDirectPlayback(sourceEntity.sourceId, forceRefresh = forceResolveFresh)
                 val playData = res.getOrNull()
@@ -1742,12 +1890,12 @@ class AnimeRepository(
                     val validateStarted = MonotonicMetrics.nowMs()
                     val safeHeaders = SafePlaybackHeaders.sanitize(playData.headers)
                     val isUrlValid = SafePlaybackHeaders.isValidStreamUrl(playData.playbackUrl) &&
-                        !SourceExpiryTime.isExpired(playData.expiresAt)
+                        !SourceExpiryTime.isExpiredOrInvalid(playData.expiresAt)
                     MonotonicMetrics.recordDuration("url_validation_ms", validateStarted, "valid=$isUrlValid")
 
                     if (isUrlValid) {
                         val sanitizedData = playData.copy(headers = safeHeaders)
-                        streamingRepository.publishResolvedStreamUrl(
+                        val published = streamingRepository.publishResolvedStreamUrl(
                             sourceEntity = sourceEntity,
                             contentKey = contentKey,
                             isMovie = isMovie,
@@ -1762,28 +1910,40 @@ class AnimeRepository(
                             backendId = identity.backendAnimeId ?: anime?.backendAnimeId,
                             canonicalTitle = identity.canonicalTitle
                         )
-                        lease?.let { streamingRepository.releaseResolveLease(it, "COMPLETED") }
-                        MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=BACKEND_RESOLVE")
+                        if (!published) {
+                            Log.w("AnimeRepository", "Resolved stream URL persisted to Room; cloud sync deferred (${streamingRepository.lastWriteRejectionReason ?: "queued"})")
+                        }
+                        finalLeaseStatus = "COMPLETED"
+                        val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=BACKEND_RESOLVE")
                         return@withContext Result.success(
                             ResolvedStreamPlayback(
                                 source = sourceEntity.toProphecyDto(),
                                 directData = sanitizedData,
                                 candidates = allCandidates,
                                 fromCache = false,
-                                cacheTier = "BACKEND_RESOLVE"
+                                cacheTier = "BACKEND_RESOLVE",
+                                resolveDurationMs = elapsed
                             )
                         )
+                    } else {
+                        lastError = IllegalStateException("Resolved playback URL was invalid or expired.")
                     }
                 } else {
                     lastError = res.exceptionOrNull()
                 }
-                lease?.let { streamingRepository.releaseResolveLease(it, "FAILED") }
             } catch (cancelled: CancellationException) {
-                lease?.let { streamingRepository.releaseResolveLease(it, "CANCELLED") }
+                finalLeaseStatus = "CANCELLED"
                 throw cancelled
             } catch (e: Exception) {
-                lease?.let { streamingRepository.releaseResolveLease(it, "FAILED") }
                 lastError = e
+            } finally {
+                lease.let { heldLease ->
+                    runCatching {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                            streamingRepository.releaseResolveLease(heldLease, finalLeaseStatus)
+                        }
+                    }
+                }
             }
         }
 
@@ -1801,14 +1961,69 @@ class AnimeRepository(
         val identity = ContentIdentityHelper.resolveCanonicalIdentity(animeId, anime, seasonNumber, episodeNumber)
         val scopeKey = ContentIdentityHelper.scopeKey(identity.contentKey, identity.isMovie, identity.seasonNumber, identity.episodeNumber)
         val entity = streamCacheDao.getActiveSources(scopeKey).firstOrNull { it.sourceId == sourceId } ?: return@withContext
-        streamingRepository.recordPlaybackSuccess(
+        val ok = streamingRepository.recordPlaybackSuccess(
             sourceEntity = entity,
             contentKey = identity.contentKey,
             isMovie = identity.isMovie,
             seasonNumber = identity.seasonNumber,
             episodeNumber = identity.episodeNumber,
-            canonicalTitle = identity.canonicalTitle
+            canonicalTitle = identity.canonicalTitle,
+            backendId = identity.backendAnimeId ?: anime?.backendAnimeId
         )
+        if (!ok) {
+            Log.w("AnimeRepository", "Playback success queued for retry (${streamingRepository.lastWriteRejectionReason ?: "deferred"})")
+        }
+    }
+
+    private suspend fun isValidBackendDetailsForEntry(
+        animeId: String,
+        entry: AnimeEntry?,
+        details: ProphecyAnimeDetailsResponse
+    ): Boolean {
+        if (entry == null) return true
+        val entryIsMovie = ContentIdentityHelper.isMovie(entry)
+        val detailMedia = details.mediaType?.trim()?.lowercase()
+        if (!entry.format.isNullOrBlank() && detailMedia in setOf("movie", "film", "anime", "tv", "series", "kdrama")) {
+            val detailIsMovie = detailMedia == "movie" || detailMedia == "film"
+            if (entryIsMovie != detailIsMovie) return false
+        }
+        val detailTitle = details.title.trim()
+        if (detailTitle.isBlank()) return true
+        val aliases = runCatching { animeDao.getAliasesForAnime(animeId) }.getOrDefault(emptyList())
+            .map { it.originalAlias }
+            .filter { it.isNotBlank() }
+        val syntheticItem = com.example.data.remote.ProphecySearchResultItem(
+            id = details.id,
+            title = detailTitle,
+            titleEnglish = details.titleEnglish,
+            titleRomaji = details.titleRomaji,
+            year = details.year,
+            mediaType = details.mediaType,
+            seasonCount = details.seasonCount
+        )
+        val confidence = TitleMatcher.computeMatchConfidenceForEntry(entry, syntheticItem, aliases)
+        return confidence >= 0.45f
+    }
+
+    private suspend fun invalidateStaleBackendMapping(
+        animeId: String,
+        entry: AnimeEntry?,
+        staleBackendId: String
+    ) {
+        runCatching { animeDao.clearBackendMappingForEntry(animeId) }
+        val idsToCheck = listOfNotNull(
+            entry?.aniListId,
+            entry?.canonicalAnimeId,
+            animeId.removePrefix("anilist_").toIntOrNull()
+        ).distinct()
+        for (id in idsToCheck) {
+            runCatching {
+                val mapping = animeDao.getMappingForAniList(id)
+                if (mapping?.backendAnimeId == staleBackendId) {
+                    animeDao.deleteMappingForAniList(id)
+                }
+            }
+        }
     }
 
     private fun orderSourcesForPlayback(
@@ -1819,12 +2034,12 @@ class AnimeRepository(
         if (!preferredSourceId.isNullOrBlank()) {
             return active.sortedWith(
                 compareBy<StreamSourceEntity> { if (it.sourceId == preferredSourceId) 0 else 1 }
-                    .thenByDescending { SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) && !SourceExpiryTime.isExpired(it.expiresAt) }
+                    .thenByDescending { SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) && !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) }
                     .thenByDescending { it.lastPlaybackSuccessAt ?: 0L }
             )
         }
         return active.sortedWith(
-            compareByDescending<StreamSourceEntity> { SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) && !SourceExpiryTime.isExpired(it.expiresAt) }
+            compareByDescending<StreamSourceEntity> { SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) && !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) }
                 .thenByDescending { it.lastPlaybackSuccessAt ?: 0L }
                 .thenByDescending { it.downloadable == true }
         )
@@ -2055,7 +2270,7 @@ class AnimeRepository(
         if (sourceId.isBlank()) return@withContext Result.failure(Exception("Source ID is blank"))
         resolveMutexes.computeIfAbsent(sourceId) { Mutex() }.withLock {
             val cached = resolvedPlaybackCache[sourceId]
-            if (!forceRefresh && cached != null && !isExpired(cached.data.expiresAt) &&
+            if (!forceRefresh && cached != null && !SourceExpiryTime.isExpiredOrInvalid(cached.data.expiresAt) &&
                 System.currentTimeMillis() - cached.cachedAtMs <= 20 * 60 * 1000L
             ) {
                 return@withContext Result.success(cached.data)
@@ -2063,7 +2278,7 @@ class AnimeRepository(
             if (!forceRefresh) {
                 streamCacheDao.getLatestActiveSourceBySourceId(sourceId)?.let { roomSource ->
                     if (SafePlaybackHeaders.isValidStreamUrl(roomSource.streamUrl) &&
-                        !isExpired(roomSource.expiresAt)
+                        !SourceExpiryTime.isExpiredOrInvalid(roomSource.expiresAt)
                     ) {
                         val playData = roomSource.toDirectPlayData()
                         resolvedPlaybackCache[sourceId] = ResolvedCacheEntry(playData, System.currentTimeMillis())
@@ -2096,7 +2311,9 @@ class AnimeRepository(
                 }
                 val raw = body.data
                 val sanitized = raw.copy(headers = SafePlaybackHeaders.sanitize(raw.headers))
-                if (sanitized.sourceId != sourceId || !isValidPlaybackUrl(sanitized.playbackUrl) || isExpired(sanitized.expiresAt)) {
+                if (sanitized.sourceId != sourceId || !isValidPlaybackUrl(sanitized.playbackUrl) ||
+                    SourceExpiryTime.isExpiredOrInvalid(sanitized.expiresAt)
+                ) {
                     return@withContext Result.failure(Exception("Resolved playback data is invalid or expired"))
                 }
                 resolvedPlaybackCache[sourceId] = ResolvedCacheEntry(sanitized, System.currentTimeMillis())
@@ -2123,13 +2340,14 @@ class AnimeRepository(
     // Watchlist & History (Preserved completely intact)
     suspend fun toggleWatchlist(animeId: String, status: String = "WATCHING") {
         withContext(Dispatchers.IO) {
-            val existing = watchlistDao.getWatchlistEntry(animeId)
+            val identity = resolveCanonicalRoute(animeId).animeId
+            val existing = watchlistDao.getWatchlistEntry(identity)
             if (existing != null && existing.status == status) {
-                watchlistDao.deleteWatchlistEntry(animeId)
+                watchlistDao.deleteWatchlistEntry(identity)
             } else {
                 watchlistDao.upsertWatchlistEntry(
                     WatchlistEntry(
-                        animeId = animeId,
+                        animeId = identity,
                         status = status,
                         isFavorite = existing?.isFavorite ?: false
                     )
@@ -2140,12 +2358,13 @@ class AnimeRepository(
 
     suspend fun toggleFavorite(animeId: String) {
         withContext(Dispatchers.IO) {
-            val existing = watchlistDao.getWatchlistEntry(animeId)
+            val identity = resolveCanonicalRoute(animeId).animeId
+            val existing = watchlistDao.getWatchlistEntry(identity)
             if (existing != null) {
                 watchlistDao.upsertWatchlistEntry(existing.copy(isFavorite = !existing.isFavorite))
             } else {
                 watchlistDao.upsertWatchlistEntry(
-                    WatchlistEntry(animeId = animeId, status = "PLANNING", isFavorite = true)
+                    WatchlistEntry(animeId = identity, status = "PLANNING", isFavorite = true)
                 )
             }
         }
@@ -2165,19 +2384,22 @@ class AnimeRepository(
     ) {
         withContext(Dispatchers.IO) {
             if (positionMs <= 0L && durationMs <= 0L) return@withContext
+            val route = resolveCanonicalRoute(animeId, seasonNumber)
+            val identity = route.animeId
+            val effectiveSeason = route.seasonNumber ?: seasonNumber
             val isCompleted = durationMs > 0 && positionMs >= (durationMs * 0.9)
-            val anime = animeDao.getAnimeById(animeId)
+            val anime = animeDao.getAnimeById(identity)
             val resolvedTitle = animeTitle ?: anime?.preferredTitle ?: anime?.titleEnglish ?: "Anime"
             val resolvedPoster = posterUrl ?: anime?.posterUrl
             val resolvedType = mediaType ?: anime?.format ?: "ANIME"
-            val historyId = "history_${animeId}_${episodeId}"
+            val historyId = "history_${identity}_${episodeId}"
 
             historyDao.upsertHistory(
                 PlaybackHistory(
                     id = historyId,
-                    animeId = animeId,
+                    animeId = identity,
                     episodeId = episodeId,
-                    seasonNumber = seasonNumber,
+                    seasonNumber = effectiveSeason,
                     episodeNumber = episodeNumber,
                     episodeTitle = episodeTitle,
                     positionMs = positionMs,

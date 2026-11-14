@@ -75,6 +75,7 @@ import com.example.ui.viewmodels.SearchViewModel
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import com.example.data.notice.NoticeManager
 import com.example.ui.components.BilingualNoticeDialog
 import kotlinx.coroutines.launch
@@ -99,6 +100,15 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
             com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
+            if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
+                launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        val dao = com.example.data.local.AppDatabase.getInstance(applicationContext).streamCacheDao()
+                        com.example.data.streaming.FirestoreStreamingRepository(dao).flushPendingOutbox()
+                        com.example.data.repository.AnimeRepository(com.example.data.local.AppDatabase.getInstance(applicationContext), applicationContext = applicationContext).processPendingSharedCatalogQueue()
+                    }
+                }
+            }
             com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
             com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
@@ -143,6 +153,15 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         com.example.data.firebase.InstallationManager.getInstance(applicationContext).recordHeartbeat()
         com.example.data.firebase.VersionControlManager.getInstance(applicationContext).checkForUpdates()
+        if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
+            lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val dao = com.example.data.local.AppDatabase.getInstance(applicationContext).streamCacheDao()
+                    com.example.data.streaming.FirestoreStreamingRepository(dao).flushPendingOutbox()
+                        com.example.data.repository.AnimeRepository(com.example.data.local.AppDatabase.getInstance(applicationContext), applicationContext = applicationContext).processPendingSharedCatalogQueue()
+                }
+            }
+        }
     }
 
     override fun onPictureInPictureModeChanged(
@@ -206,6 +225,21 @@ fun MainAppNav(
     }
     val context = LocalContext.current
     val app = context.applicationContext as Application
+    val canonicalRepository = remember {
+        com.example.data.repository.AnimeRepository(
+            com.example.data.local.AppDatabase.getInstance(context),
+            applicationContext = context
+        )
+    }
+    val navigationScope = rememberCoroutineScope()
+    fun navigateToAnime(animeId: String) {
+        navigationScope.launch {
+            val route = canonicalRepository.resolveCanonicalRoute(animeId)
+            navController.navigate(
+                Screen.Detail.createRoute(android.net.Uri.encode(route.animeId), route.seasonNumber)
+            ) { launchSingleTop = true }
+        }
+    }
     val noticeManager = remember { NoticeManager.getInstance(context) }
     val isNoticeVisible by noticeManager.isNoticeVisible.collectAsStateWithLifecycle()
     val noticeContent by noticeManager.noticeContent.collectAsStateWithLifecycle()
@@ -289,7 +323,7 @@ fun MainAppNav(
                 HomeScreen(
                     viewModel = homeViewModel,
                     onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
+                        navigateToAnime(animeId)
                     },
                     onPlayHistoryClick = { animeId, episodeId ->
                         navController.navigate(Screen.Player.createRoute(animeId, episodeId))
@@ -302,7 +336,7 @@ fun MainAppNav(
                 SearchScreen(
                     viewModel = searchViewModel,
                     onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
+                        navigateToAnime(animeId)
                     }
                 )
             }
@@ -315,7 +349,7 @@ fun MainAppNav(
                         navController.navigate(Screen.Player.createRoute(aId, eId))
                     },
                     onAnimeClick = { aId ->
-                        navController.navigate(Screen.Detail.createRoute(aId))
+                        navigateToAnime(aId)
                     }
                 )
             }
@@ -325,7 +359,7 @@ fun MainAppNav(
                 LibraryScreen(
                     viewModel = libraryViewModel,
                     onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
+                        navigateToAnime(animeId)
                     },
                     onPlayHistoryClick = { animeId, episodeId ->
                         navController.navigate(Screen.Player.createRoute(animeId, episodeId))
@@ -338,7 +372,7 @@ fun MainAppNav(
                 HistoryScreen(
                     viewModel = libraryViewModel,
                     onAnimeClick = { animeId ->
-                        navController.navigate(Screen.Detail.createRoute(animeId))
+                        navigateToAnime(animeId)
                     },
                     onPlayHistoryClick = { animeId, episodeId ->
                         navController.navigate(Screen.Player.createRoute(animeId, episodeId))
@@ -367,15 +401,28 @@ fun MainAppNav(
 
             composable(
                 route = Screen.Detail.route,
-                arguments = listOf(navArgument("animeId") { type = NavType.StringType })
+                arguments = listOf(
+                    navArgument("animeId") { type = NavType.StringType },
+                    navArgument("seasonNumber") { type = NavType.IntType; nullable = true; defaultValue = null }
+                )
             ) { backStackEntry ->
                 val animeId = backStackEntry.arguments?.getString("animeId") ?: return@composable
+                val requestedSeason = backStackEntry.arguments?.getInt("seasonNumber")
+                androidx.compose.runtime.LaunchedEffect(animeId) {
+                    val route = canonicalRepository.resolveCanonicalRoute(animeId, requestedSeason)
+                    if (route.animeId != animeId) {
+                        navController.navigate(Screen.Detail.createRoute(android.net.Uri.encode(route.animeId), route.seasonNumber)) {
+                            popUpTo("detail/$animeId") { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
+                }
                 val detailViewModel = viewModel<DetailViewModel>(
                     key = "detail_$animeId",
                     factory = object : androidx.lifecycle.ViewModelProvider.Factory {
                         @Suppress("UNCHECKED_CAST")
                         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
-                            return DetailViewModel(app, animeId) as T
+                            return DetailViewModel(app, animeId, requestedSeason) as T
                         }
                     }
                 )
@@ -420,7 +467,7 @@ fun MainAppNav(
                     onPlayerStateChanged = onPlayerStateChanged,
                     onBackClick = { navController.popBackStack() },
                     onNavigateToDetail = { targetAnimeId ->
-                        navController.navigate(Screen.Detail.createRoute(targetAnimeId))
+                        navigateToAnime(targetAnimeId)
                     }
                 )
             }

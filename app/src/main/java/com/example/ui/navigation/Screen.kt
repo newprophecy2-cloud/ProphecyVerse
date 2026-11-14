@@ -9,8 +9,9 @@ sealed class Screen(val route: String, val title: String) {
     data object Profile : Screen("profile", "Profile")
     data object Settings : Screen("settings", "Settings")
 
-    data object Detail : Screen("detail/{animeId}", "Detail") {
-        fun createRoute(animeId: String) = "detail/$animeId"
+    data object Detail : Screen("detail/{animeId}?seasonNumber={seasonNumber}", "Detail") {
+        fun createRoute(animeId: String, seasonNumber: Int? = null): String =
+            "detail/$animeId" + (seasonNumber?.let { "?seasonNumber=$it" } ?: "")
     }
 
     data object Player : Screen("player/{animeId}/{episodeId}?preferredSourceId={preferredSourceId}", "Player") {
