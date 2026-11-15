@@ -191,7 +191,7 @@ object NetworkModule {
                                 reader.nextNull<String?>()
                                 ""
                             } else {
-                                stringAdapter.fromJson(reader).orEmpty()
+                                stringAdapter.fromJson(reader)?.trim().orEmpty()
                             }
                             1 -> label = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
                             2 -> quality = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
@@ -242,15 +242,38 @@ object NetworkModule {
     val moshi: Moshi by lazy {
         Moshi.Builder()
             .add(prophecyResponseAdapterFactory)
+            .add(com.example.data.d1.D1BooleanAdapterFactory)
             .addLast(KotlinJsonAdapterFactory())
             .build()
     }
 
+    private val sharedConnectionPool: okhttp3.ConnectionPool by lazy {
+        okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES)
+    }
+
+    @Volatile
+    private var diskHttpCache: okhttp3.Cache? = null
+
+    fun initializeHttpCache(context: android.content.Context) {
+        if (diskHttpCache != null) return
+        synchronized(this) {
+            if (diskHttpCache == null) {
+                val cacheDir = java.io.File(context.applicationContext.cacheDir, "prophecy_http_cache")
+                diskHttpCache = okhttp3.Cache(cacheDir, 10L * 1024L * 1024L)
+            }
+        }
+    }
+
+    private const val D1_BASE_URL = "https://prophecy-verse-db.newprophecy4.workers.dev/v1/"
+
     val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .writeTimeout(25, TimeUnit.SECONDS)
+            .connectionPool(sharedConnectionPool)
+            .apply { diskHttpCache?.let { cache(it) } }
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(14, TimeUnit.SECONDS)
+            .writeTimeout(14, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
                     .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME} (Android)")
@@ -258,8 +281,26 @@ object NetworkModule {
                 chain.proceed(request)
             }
             .addInterceptor(HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BASIC
+                // Keep BASIC without headers/bodies so transient URLs or tokens are never logged
+                level = HttpLoggingInterceptor.Level.NONE
             })
+            .build()
+    }
+
+    val d1OkHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectionPool(sharedConnectionPool)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(12, TimeUnit.SECONDS)
+            .callTimeout(18, TimeUnit.SECONDS)
+            .addInterceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME} (Android)")
+                    .header("Accept", "application/json")
+                    .build()
+                chain.proceed(request)
+            }
             .build()
     }
 
@@ -279,5 +320,18 @@ object NetworkModule {
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(AniListGraphQLService::class.java)
+    }
+
+    val d1Api: com.example.data.d1.CloudflareD1ApiService by lazy {
+        Retrofit.Builder()
+            .baseUrl(D1_BASE_URL)
+            .client(d1OkHttpClient)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+            .create(com.example.data.d1.CloudflareD1ApiService::class.java)
+    }
+
+    val d1DataSource: com.example.data.d1.CloudflareD1DataSource by lazy {
+        com.example.data.d1.CloudflareD1DataSource(d1Api)
     }
 }

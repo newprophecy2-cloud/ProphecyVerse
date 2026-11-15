@@ -31,7 +31,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         StreamProviderEntity::class,
         StreamSourceEntity::class
     ],
-    version = 11,
+    version = 12,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -362,6 +362,41 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    DELETE FROM `episode_entries`
+                    WHERE EXISTS (
+                        SELECT 1 FROM `episode_entries` AS `better`
+                        WHERE `better`.`animeId` = `episode_entries`.`animeId`
+                          AND `better`.`seasonNumber` = `episode_entries`.`seasonNumber`
+                          AND `better`.`episodeNumber` = `episode_entries`.`episodeNumber`
+                          AND (
+                              (CASE WHEN `better`.`sourceEpisodeIds` IS NOT NULL AND TRIM(`better`.`sourceEpisodeIds`) != '' THEN 1 ELSE 0 END)
+                              > (CASE WHEN `episode_entries`.`sourceEpisodeIds` IS NOT NULL AND TRIM(`episode_entries`.`sourceEpisodeIds`) != '' THEN 1 ELSE 0 END)
+                              OR (
+                                  (CASE WHEN `better`.`sourceEpisodeIds` IS NOT NULL AND TRIM(`better`.`sourceEpisodeIds`) != '' THEN 1 ELSE 0 END)
+                                  = (CASE WHEN `episode_entries`.`sourceEpisodeIds` IS NOT NULL AND TRIM(`episode_entries`.`sourceEpisodeIds`) != '' THEN 1 ELSE 0 END)
+                                  AND (
+                                      (CASE WHEN `better`.`title` IS NOT NULL AND TRIM(`better`.`title`) != '' AND `better`.`title` NOT LIKE 'Episode %' THEN 1 ELSE 0 END)
+                                      > (CASE WHEN `episode_entries`.`title` IS NOT NULL AND TRIM(`episode_entries`.`title`) != '' AND `episode_entries`.`title` NOT LIKE 'Episode %' THEN 1 ELSE 0 END)
+                                      OR (
+                                          (CASE WHEN `better`.`title` IS NOT NULL AND TRIM(`better`.`title`) != '' AND `better`.`title` NOT LIKE 'Episode %' THEN 1 ELSE 0 END)
+                                          = (CASE WHEN `episode_entries`.`title` IS NOT NULL AND TRIM(`episode_entries`.`title`) != '' AND `episode_entries`.`title` NOT LIKE 'Episode %' THEN 1 ELSE 0 END)
+                                          AND `better`.`rowid` < `episode_entries`.`rowid`
+                                      )
+                                  )
+                              )
+                          )
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_episode_entries_animeId_seasonNumber_episodeNumber`
+                    ON `episode_entries` (`animeId`, `seasonNumber`, `episodeNumber`)
+                """.trimIndent())
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -379,7 +414,8 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_7_8,
                         MIGRATION_8_9,
                         MIGRATION_9_10,
-                        MIGRATION_10_11
+                        MIGRATION_10_11,
+                        MIGRATION_11_12
                     )
                     .build()
                 INSTANCE = instance

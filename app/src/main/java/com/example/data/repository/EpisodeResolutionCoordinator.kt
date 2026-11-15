@@ -12,11 +12,23 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Process-wide single-flight registry shared by repository instances. */
 object EpisodeResolutionCoordinator {
     private val scope = kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlight = ConcurrentHashMap<String, Deferred<Any?>>()
+    private val activeForegroundCount = AtomicInteger(0)
+
+    fun beginForegroundResolution() {
+        activeForegroundCount.incrementAndGet()
+    }
+
+    fun endForegroundResolution() {
+        activeForegroundCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    }
+
+    fun isForegroundResolutionActive(): Boolean = activeForegroundCount.get() > 0
 
     @Suppress("UNCHECKED_CAST")
     suspend fun <T> resolve(key: String, block: suspend () -> T): T {
@@ -26,6 +38,7 @@ object EpisodeResolutionCoordinator {
         if (existing == null) {
             created.invokeOnCompletion { inFlight.remove(key, created as Deferred<Any?>) }
         } else {
+            com.example.data.metrics.DatabaseMetricsTracker.getInstance().recordDuplicateRequestPrevented()
             created.cancel()
         }
         return selected.await()
@@ -50,12 +63,13 @@ suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
     if (targetAnimeId.isBlank() || episode.id.isBlank()) {
         return Result.failure(IllegalArgumentException("Episode identity is incomplete"))
     }
+    val normPreferred = SourceIdentityValidator.normalizeId(preferredSourceId)
     val key = buildString {
-        append(targetAnimeId).append('|')
+        append(targetAnimeId.trim()).append('|')
             .append(episode.seasonNumber).append('|')
             .append(episode.episodeNumber).append('|')
-            .append(episode.id).append('|')
-            .append(preferredSourceId.orEmpty()).append('|')
+            .append(episode.id.trim()).append('|')
+            .append(normPreferred).append('|')
             .append(forceResolveFresh)
     }
     return EpisodeResolutionCoordinator.resolve("verified:$key") {
@@ -67,7 +81,7 @@ suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
                     seasonNumber = episode.seasonNumber,
                     episodeNumber = episode.episodeNumber,
                     catalogEpisodeId = episode.id,
-                    preferredSourceId = preferredSourceId,
+                    preferredSourceId = normPreferred.takeIf { it.isNotEmpty() },
                     forceResolveFresh = forceResolveFresh
                 ).getOrElse { return@withTimeout Result.failure(it) }
 

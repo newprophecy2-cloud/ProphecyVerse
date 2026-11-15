@@ -16,12 +16,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+import com.example.data.metrics.DatabaseMetricsTracker
+import java.util.concurrent.ConcurrentHashMap
+
 class CloudHistoryRepository private constructor(private val context: Context) {
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val database: AppDatabase by lazy { AppDatabase.getInstance(context) }
-    private val animeRepository: AnimeRepository by lazy { AnimeRepository(database, applicationContext = context) }
+    private val animeRepository: AnimeRepository by lazy { AnimeRepository.getInstance(context) }
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
     private val scope = CoroutineScope(Dispatchers.IO)
     private val pullMutex = Mutex()
+    private val lastSyncedHistoryFingerprint = ConcurrentHashMap<String, String>()
+    private val lastSyncedWatchlistFingerprint = ConcurrentHashMap<String, String>()
     private val syncPreferences by lazy {
         context.getSharedPreferences("cloud_history_sync", Context.MODE_PRIVATE)
     }
@@ -93,6 +99,11 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 // 2. Sync to Firestore if authenticated
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
                 val ownerKey = currentUser.uid
+                val historyFingerprint = "$ownerKey|${saved.positionMs}|${saved.durationMs}|${saved.completed}|${saved.animeTitle.orEmpty()}|${saved.posterUrl.orEmpty()}|${saved.episodeTitle.orEmpty()}"
+                if (lastSyncedHistoryFingerprint[saved.id] == historyFingerprint) {
+                    metricsTracker.recordFirestoreWriteSkipped()
+                    return@launch
+                }
                 val docData = buildHistoryDocMap(saved, ownerKey)
 
                 val historyRef = firestore.collection("watch_history")
@@ -102,6 +113,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 FirestoreRequestGuard.execute("sync playback history") {
                     firestore.runTransaction { transaction ->
                         val remote = transaction.get(historyRef)
+                        metricsTracker.recordFirestoreRead()
                         val remoteTimestamp = remote.getLong("last_played_at") ?: Long.MIN_VALUE
                         if (!remote.exists() || saved.lastPlayedAt >= remoteTimestamp) {
                             val merged = docData.toMutableMap()
@@ -116,13 +128,18 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                                 remote.getString("media_type")?.takeIf { it.isNotBlank() }?.let { merged["media_type"] = it }
                             }
                             transaction.set(historyRef, merged, SetOptions.merge())
+                            metricsTracker.recordFirestoreWrite()
+                        } else {
+                            metricsTracker.recordFirestoreWriteSkipped()
                         }
                         null
                     }
                 }
+                lastSyncedHistoryFingerprint[saved.id] = historyFingerprint
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
+                metricsTracker.recordFirestoreError()
                 Log.w("CloudHistoryRepository", "Failed to sync progress to cloud: ${e.message}")
             }
         }
@@ -133,18 +150,28 @@ class CloudHistoryRepository private constructor(private val context: Context) {
             try {
                 val canonicalId = animeRepository.resolveCanonicalRoute(animeId).animeId
                 val existing = database.watchlistDao().getWatchlistEntry(canonicalId)
-                val entry = WatchlistEntry(
-                    animeId = canonicalId,
-                    status = status,
-                    isFavorite = isFavorite,
-                    userScore = existing?.userScore,
-                    addedAt = existing?.addedAt ?: System.currentTimeMillis(),
-                    updatedAt = System.currentTimeMillis()
-                )
-                database.watchlistDao().upsertWatchlistEntry(entry)
+                val localChanged = existing == null || existing.status != status || existing.isFavorite != isFavorite
+                val entry = if (localChanged) {
+                    WatchlistEntry(
+                        animeId = canonicalId,
+                        status = status,
+                        isFavorite = isFavorite,
+                        userScore = existing?.userScore,
+                        addedAt = existing?.addedAt ?: System.currentTimeMillis(),
+                        updatedAt = System.currentTimeMillis()
+                    ).also { database.watchlistDao().upsertWatchlistEntry(it) }
+                } else {
+                    existing!!
+                }
 
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
                 val ownerKey = currentUser.uid
+                val syncKey = "$ownerKey|$canonicalId"
+                val syncFingerprint = "$status|$isFavorite"
+                if (lastSyncedWatchlistFingerprint[syncKey] == syncFingerprint) {
+                    metricsTracker.recordFirestoreWriteSkipped()
+                    return@launch
+                }
                 val docData = buildWatchlistDocMap(entry, ownerKey)
 
                 FirestoreRequestGuard.execute("sync watchlist") {
@@ -154,9 +181,12 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .document(canonicalId)
                         .set(docData, SetOptions.merge())
                 }
+                metricsTracker.recordFirestoreWrite()
+                lastSyncedWatchlistFingerprint[syncKey] = syncFingerprint
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
+                metricsTracker.recordFirestoreError()
                 Log.w("CloudHistoryRepository", "Failed to sync watchlist to cloud: ${e.message}")
             }
         }
@@ -170,6 +200,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
 
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@launch
                 val ownerKey = currentUser.uid
+                lastSyncedWatchlistFingerprint.remove("$ownerKey|$canonicalId")
                 FirestoreRequestGuard.execute("delete watchlist") {
                     firestore.collection("watchlist")
                         .document(ownerKey)
@@ -177,9 +208,11 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .document(canonicalId)
                         .delete()
                 }
+                metricsTracker.recordFirestoreWrite()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
+                metricsTracker.recordFirestoreError()
                 Log.w("CloudHistoryRepository", "Failed to delete watchlist from cloud: ${e.message}")
             }
         }
@@ -203,6 +236,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .collection("episodes")
                         .get()
                 }
+                metricsTracker.recordFirestoreRead(historyDocs.size().coerceAtLeast(1).toLong())
 
                 val cloudHistories = buildList {
                     for (doc in historyDocs.documents) {
@@ -285,6 +319,7 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                         .collection("items")
                         .get()
                 }
+                metricsTracker.recordFirestoreRead(watchlistDocs.size().coerceAtLeast(1).toLong())
 
                 val cloudWatchlist = buildList {
                     for (doc in watchlistDocs.documents) {

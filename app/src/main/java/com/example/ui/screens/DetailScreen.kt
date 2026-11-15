@@ -702,7 +702,7 @@ fun DetailScreen(
                                                 Text("Metadata sync failed", color = TextPrimary, fontWeight = FontWeight.Bold)
                                                 Text(syncError ?: "Unable to load episodes.", color = TextMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
                                                 Button(
-                                                    onClick = { viewModel.refreshDetails() },
+                                                    onClick = { viewModel.refreshDetails(forceRefresh = true) },
                                                     colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
                                                     shape = RoundedCornerShape(8.dp)
                                                 ) {
@@ -766,7 +766,7 @@ fun DetailScreen(
                                                 )
                                                 Spacer(modifier = Modifier.height(4.dp))
                                                 Button(
-                                                    onClick = { viewModel.refreshDetails() },
+                                                    onClick = { viewModel.refreshDetails(forceRefresh = true) },
                                                     colors = ButtonDefaults.buttonColors(containerColor = AccentIndigo),
                                                     shape = RoundedCornerShape(8.dp)
                                                 ) {

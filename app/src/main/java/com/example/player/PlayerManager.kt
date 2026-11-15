@@ -102,6 +102,12 @@ class PlayerManager(
         )
     }
 
+    fun clearErrorState() {
+        _errorMessage.value = null
+        _isBuffering.value = false
+        _isPlaybackEnded.value = false
+    }
+
     private val _videoResolution = MutableStateFlow<String?>(null)
     val videoResolution: StateFlow<String?> = _videoResolution.asStateFlow()
 

@@ -49,8 +49,12 @@ class FirestoreStreamingRepository(
         runCatching { FirebaseAuth.getInstance().currentUser != null }.getOrDefault(false)
     },
     val ownerId: String = "apk_${UUID.randomUUID().toString().take(8)}",
-    private val cloudStoreProvider: (() -> StreamingCloudStore?)? = null
+    private val cloudStoreProvider: (() -> StreamingCloudStore?)? = null,
+    private val d1DataSource: com.example.data.d1.CloudflareD1DataSource? = null,
+    private val metricsTracker: com.example.data.metrics.DatabaseMetricsTracker = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
 ) {
+    val usesD1Primary: Boolean
+        get() = d1DataSource != null && cloudStoreProvider == null
     companion object {
         private const val TAG = "FirestoreStreamingRepo"
         private const val AUDIT_TAG = "FirestoreWriteAudit"
@@ -271,6 +275,16 @@ class FirestoreStreamingRepository(
         preferServer: Boolean = false,
         requirePlayableUrl: Boolean = false
     ): ScopeReadOutcome {
+        if (usesD1Primary) {
+            return fetchAndSyncScopeFromD1(
+                contentKey = contentKey,
+                isMovie = isMovie,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                catalogEpisodeId = catalogEpisodeId,
+                requirePlayableUrl = requirePlayableUrl
+            )
+        }
         val store = resolveCloudStore() ?: return ScopeReadOutcome(
             data = null,
             status = ScopeReadStatus.UNAVAILABLE,
@@ -310,6 +324,7 @@ class FirestoreStreamingRepository(
         // 2. Firestore server fetch (bounded timeout so unresponsive Firestore never stalls source discovery)
         val serverStarted = MonotonicMetrics.nowMs()
         return try {
+            metricsTracker.recordFirestoreRead()
             val data = kotlinx.coroutines.withTimeout(4_000L) {
                 readScopeSnapshot(
                     store, scopeDocPath, scopeKey, contentKey, isMovie, seasonNumber, episodeNumber, catalogEpisodeId, preferCache = false
@@ -433,6 +448,10 @@ class FirestoreStreamingRepository(
         episodeNumber: Int = 1,
         catalogEpisodeId: String? = null
     ): Flow<ScopeStreamingData> = callbackFlow {
+        if (usesD1Primary) {
+            awaitClose { }
+            return@callbackFlow
+        }
         val store = resolveCloudStore()
         if (store == null) {
             awaitClose { }
@@ -565,14 +584,21 @@ class FirestoreStreamingRepository(
         discoveryStatus: DiscoveryStatus,
         canonicalTitle: String? = null
     ): Boolean {
+        val dedupedProviders = providers.distinctBy { it.providerDocKey }
+        val dedupedSources = sources
+            .map { src ->
+                val trimmed = src.sourceId.trim()
+                if (trimmed == src.sourceId) src else src.copy(sourceId = trimmed)
+            }
+            .distinctBy { it.providerId to it.sourceId }
+            .distinctBy { it.sourceDocKey }
+
         val existingContainer = streamCacheDao.getContainer(ContentIdentityHelper.containerScopeKey(contentKey, isMovie))
         val isUpdateOp = existingContainer != null && existingContainer.discoveryStatus != DiscoveryStatus.NOT_DISCOVERED.name
-        val nextVersion = (existingContainer?.version ?: 0L) + 1L
-        val now = System.currentTimeMillis()
         val resolvedTitle = canonicalTitle?.takeIf { it.isNotBlank() } ?: existingContainer?.canonicalTitle
 
-        // 1. Always update local Room cache transactionally first for instant UI / offline readiness
-        persistScopeToRoom(
+        // 1. Diff-checked local Room update: only bumps version or writes rows when meaningful state changed
+        val persisted = persistScopeToRoom(
             contentKey = contentKey,
             canonicalTitle = resolvedTitle,
             isMovie = isMovie,
@@ -586,25 +612,60 @@ class FirestoreStreamingRepository(
             totalEpisodeCount = if (isMovie) null else totalEpisodeCount,
             seasonEpisodeCount = seasonEpisodeCount,
             discoveryStatus = discoveryStatus.name,
-            version = nextVersion,
-            providers = providers,
-            sources = sources,
+            version = (existingContainer?.version ?: 0L) + 1L,
+            providers = dedupedProviders,
+            sources = dedupedSources,
             authoritativeComplete = discoveryStatus == DiscoveryStatus.COMPLETED
         )
 
-        // 2. Shared Firestore publish via authorized path only
+        // 2. Shared publish: Cloudflare D1 primary (zero Firestore shared catalog/stream writes),
+        // or Firestore/InMemoryCloudStore when D1 is absent or explicit cloudStoreProvider test double is active.
         val op = if (isUpdateOp) FirestoreWriteOperation.UPDATE else FirestoreWriteOperation.ADD
         val contentType = if (isMovie) "MOVIE" else "ANIME"
         val seasonIdStr = if (isMovie) null else ContentIdentityHelper.seasonId(seasonNumber)
         val episodeIdStr = if (isMovie) null else ContentIdentityHelper.episodeId(episodeNumber)
-        val primaryTargetPath = sources.firstOrNull()?.let {
+        val primaryTargetPath = dedupedSources.firstOrNull()?.let {
             sourceDocumentPath(contentKey, isMovie, seasonNumber, episodeNumber, it.providerId, it.sourceId)
-        } ?: providers.firstOrNull()?.let {
+        } ?: dedupedProviders.firstOrNull()?.let {
             if (isMovie) movieProviderPath(contentKey, it.providerId) else animeProviderPath(contentKey, seasonNumber, episodeNumber, it.providerId)
         } ?: scopePath(contentKey, isMovie, seasonNumber, episodeNumber)
 
         val discoveryOutboxKey = "discovery:${ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)}"
+        if (!persisted.anyChanged && existingContainer != null &&
+            existingContainer.discoveryStatus != DiscoveryStatus.NOT_DISCOVERED.name &&
+            !outboxMap().containsKey(discoveryOutboxKey)
+        ) {
+            if (usesD1Primary) {
+                metricsTracker.recordD1WriteSkipped()
+            } else {
+                metricsTracker.recordFirestoreWriteSkipped()
+            }
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            return true
+        }
+
+        val now = persisted.now
+        val effectiveVersion = persisted.container.version
         val startedAt = System.currentTimeMillis()
+        if (usesD1Primary) {
+            listenerSyncScope.launch {
+                runCatching {
+                    d1DataSource!!.publishScopedStreamingIfChanged(
+                        container = persisted.container,
+                        season = persisted.season,
+                        episode = persisted.episode,
+                        providers = persisted.providers,
+                        sources = persisted.sources
+                    )
+                }.onFailure { err ->
+                    Log.w(TAG, "Background D1 stream discovery publish deferred: ${err.message}")
+                }
+            }
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            return true
+        }
         val store = resolveCloudStore()
         if (store == null) {
             val reason = "Firestore instance unavailable."
@@ -615,7 +676,7 @@ class FirestoreStreamingRepository(
                 backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
                 catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
                 seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
-                seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                seasonEpisodeCount = seasonEpisodeCount, providers = dedupedProviders, sources = dedupedSources,
                 discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
             )
             recordWriteAudit(
@@ -626,8 +687,8 @@ class FirestoreStreamingRepository(
                 backendId = backendId,
                 seasonId = seasonIdStr,
                 episodeId = episodeIdStr,
-                providerId = providers.firstOrNull()?.providerId,
-                sourceId = sources.firstOrNull()?.sourceId,
+                providerId = dedupedProviders.firstOrNull()?.providerId,
+                sourceId = dedupedSources.firstOrNull()?.sourceId,
                 targetPath = primaryTargetPath,
                 startedAtMs = startedAt,
                 success = false,
@@ -645,7 +706,7 @@ class FirestoreStreamingRepository(
                 backendId = backendId, seasonNumber = seasonNumber, episodeNumber = episodeNumber,
                 catalogEpisodeId = catalogEpisodeId, backendEpisodeId = backendEpisodeId,
                 seasonCount = seasonCount, totalEpisodeCount = totalEpisodeCount,
-                seasonEpisodeCount = seasonEpisodeCount, providers = providers, sources = sources,
+                seasonEpisodeCount = seasonEpisodeCount, providers = dedupedProviders, sources = dedupedSources,
                 discoveryStatus = discoveryStatus, canonicalTitle = resolvedTitle
             )
             recordWriteAudit(
@@ -656,8 +717,8 @@ class FirestoreStreamingRepository(
                 backendId = backendId,
                 seasonId = seasonIdStr,
                 episodeId = episodeIdStr,
-                providerId = providers.firstOrNull()?.providerId,
-                sourceId = sources.firstOrNull()?.sourceId,
+                providerId = dedupedProviders.firstOrNull()?.providerId,
+                sourceId = dedupedSources.firstOrNull()?.sourceId,
                 targetPath = primaryTargetPath,
                 startedAtMs = startedAt,
                 success = false,
@@ -667,7 +728,7 @@ class FirestoreStreamingRepository(
             return false
         }
 
-        val providerNamesById = providers.associate { it.providerId to it.providerName }
+        val providerNamesById = persisted.providers.associate { it.providerId to it.providerName }
         val writes = buildDiscoveryWrites(
             contentKey = contentKey,
             anilistId = anilistId,
@@ -680,11 +741,11 @@ class FirestoreStreamingRepository(
             seasonCount = seasonCount,
             totalEpisodeCount = totalEpisodeCount,
             seasonEpisodeCount = seasonEpisodeCount,
-            providers = providers,
-            sources = sources,
+            providers = persisted.providers,
+            sources = persisted.sources,
             providerNamesById = providerNamesById,
             discoveryStatus = discoveryStatus,
-            version = nextVersion,
+            version = effectiveVersion,
             now = now
         )
 
@@ -839,20 +900,47 @@ class FirestoreStreamingRepository(
         }
         val existing = streamCacheDao.getAllSources(sourceEntity.scopeKey)
             .firstOrNull { it.sourceDocKey == sourceEntity.sourceDocKey }
-        val nextVersion = maxOf(sourceEntity.version, existing?.version ?: 0L) + 1L
+        val resolvedContentType = contentType ?: sourceEntity.contentType
+        val resolvedExpiresAt = expiresAt ?: sourceEntity.expiresAt
         val sanitizedJson = SafePlaybackHeaders.toJson(safeHeaders)
-        val updatedEntity = sourceEntity.copy(
-            streamUrl = normalizedStreamUrl,
-            urlType = urlType,
-            contentType = contentType ?: sourceEntity.contentType,
-            safeHeadersJson = sanitizedJson,
-            expiresAt = expiresAt ?: sourceEntity.expiresAt,
-            status = StreamRecordStatus.AVAILABLE.name,
-            version = nextVersion,
-            lastVerifiedAt = verifiedAt,
-            updatedAt = verifiedAt
-        )
-        streamCacheDao.upsertSource(updatedEntity)
+        val urlChanged = existing == null ||
+            existing.streamUrl != normalizedStreamUrl ||
+            existing.urlType != urlType ||
+            existing.contentType != resolvedContentType ||
+            existing.safeHeadersJson != sanitizedJson ||
+            existing.expiresAt != resolvedExpiresAt ||
+            existing.status != StreamRecordStatus.AVAILABLE.name
+
+        val updatedEntity = if (!urlChanged && existing != null) {
+            metricsTracker.recordRoomWriteSkipped()
+            existing
+        } else {
+            val nextVersion = maxOf(sourceEntity.version, existing?.version ?: 0L) + 1L
+            sourceEntity.copy(
+                streamUrl = normalizedStreamUrl,
+                urlType = urlType,
+                contentType = resolvedContentType,
+                safeHeadersJson = sanitizedJson,
+                expiresAt = resolvedExpiresAt,
+                status = StreamRecordStatus.AVAILABLE.name,
+                version = nextVersion,
+                lastVerifiedAt = verifiedAt,
+                updatedAt = verifiedAt
+            ).also {
+                streamCacheDao.upsertSource(it)
+                metricsTracker.recordRoomWrite()
+            }
+        }
+        val nextVersion = updatedEntity.version
+
+        if (usesD1Primary) {
+            // Temporary playback URLs and headers live strictly in Memory LRU & local Room.
+            // Never push null-URL writes or speculative playback timestamps to D1 on resolve/pre-resolve;
+            // actual playback verification is reported via recordPlaybackSuccess when ExoPlayer starts playing.
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            return true
+        }
 
         val existingContainer = streamCacheDao.getContainer(ContentIdentityHelper.containerScopeKey(contentKey, isMovie))
         val resolvedTitle = canonicalTitle?.takeIf { it.isNotBlank() } ?: existingContainer?.canonicalTitle
@@ -1057,14 +1145,22 @@ class FirestoreStreamingRepository(
             return false
         }
         val now = System.currentTimeMillis()
-        streamCacheDao.upsertSource(
-            sourceEntity.copy(
-                lastPlaybackSuccessAt = now,
-                lastVerifiedAt = now,
-                status = StreamRecordStatus.AVAILABLE.name,
-                updatedAt = now
+        val recentlyVerified = sourceEntity.status == StreamRecordStatus.AVAILABLE.name &&
+            sourceEntity.lastPlaybackSuccessAt != null &&
+            (now - sourceEntity.lastPlaybackSuccessAt < 60_000L)
+        if (!recentlyVerified) {
+            streamCacheDao.upsertSource(
+                sourceEntity.copy(
+                    lastPlaybackSuccessAt = now,
+                    lastVerifiedAt = now,
+                    status = StreamRecordStatus.AVAILABLE.name,
+                    updatedAt = now
+                )
             )
-        )
+            metricsTracker.recordRoomWrite()
+        } else {
+            metricsTracker.recordRoomWriteSkipped()
+        }
         val contentTypeLabel = if (isMovie) "MOVIE" else "ANIME"
         val targetPath = sourceDocumentPath(contentKey, isMovie, seasonNumber, episodeNumber, sourceEntity.providerId, sourceEntity.sourceId)
         val seasonIdStr = if (isMovie) null else ContentIdentityHelper.seasonId(seasonNumber)
@@ -1081,6 +1177,13 @@ class FirestoreStreamingRepository(
             canonicalTitle = canonicalTitle,
             backendId = backendId
         )
+
+        if (usesD1Primary) {
+            val ok = runCatching { d1DataSource!!.reportPlaybackSuccessMetadata(sourceEntity) }.getOrDefault(false)
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            return ok
+        }
 
         val store = resolveCloudStore()
         if (store == null) {
@@ -1230,6 +1333,13 @@ class FirestoreStreamingRepository(
             backendId = backendId
         )
 
+        if (usesD1Primary) {
+            val ok = runCatching { d1DataSource!!.softDeleteSourceMetadata(sourceEntity) }.getOrDefault(false)
+            lastWriteRejectionReason = null
+            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
+            return ok
+        }
+
         val store = resolveCloudStore()
         if (store == null) {
             val reason = "Firestore instance unavailable."
@@ -1366,6 +1476,12 @@ class FirestoreStreamingRepository(
         val existingLocal = localLocks[lockKey]
         if (existingLocal != null && existingLocal.expiresAtMs > now && existingLocal.ownerId != ownerId) {
             return null
+        }
+
+        if (usesD1Primary) {
+            val lease = ResolveLease(lockKey, ownerId, acquiredRemote = false, expiresAtMs = expiresAt)
+            localLocks[lockKey] = lease
+            return lease
         }
 
         val store = resolveCloudStore()
@@ -1659,6 +1775,16 @@ class FirestoreStreamingRepository(
         return writes
     }
 
+    private data class PersistedScopeResult(
+        val anyChanged: Boolean,
+        val now: Long,
+        val container: StreamContainerEntity,
+        val season: StreamSeasonEntity?,
+        val episode: StreamEpisodeEntity?,
+        val providers: List<StreamProviderEntity>,
+        val sources: List<StreamSourceEntity>
+    )
+
     private suspend fun persistScopeToRoom(
         contentKey: String,
         canonicalTitle: String?,
@@ -1677,78 +1803,230 @@ class FirestoreStreamingRepository(
         providers: List<StreamProviderEntity>,
         sources: List<StreamSourceEntity>,
         authoritativeComplete: Boolean
-    ) {
+    ): PersistedScopeResult {
         val txStarted = MonotonicMetrics.nowMs()
         val now = System.currentTimeMillis()
+        val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
         val containerScopeKey = ContentIdentityHelper.containerScopeKey(contentKey, isMovie)
         val existingContainer = streamCacheDao.getContainer(containerScopeKey)
         val activeProvidersCount = providers.count { it.status != "REMOVED" && it.deletedAt == null }
         val activeSourcesCount = sources.count { it.status != "REMOVED" && it.deletedAt == null }
 
-        streamCacheDao.upsertContainer(
+        val resolvedAnilistId = anilistId ?: existingContainer?.anilistId
+        val resolvedContentType = if (isMovie) "MOVIE" else "ANIME"
+        val resolvedBackendId = backendId ?: existingContainer?.backendId
+        val resolvedTitle = canonicalTitle ?: existingContainer?.canonicalTitle
+        val resolvedSeasonCount = if (isMovie) null else (seasonCount ?: existingContainer?.seasonCount)
+        val resolvedTotalEps = if (isMovie) null else (totalEpisodeCount ?: existingContainer?.totalEpisodeCount)
+        val resolvedProviderCount = if (isMovie) activeProvidersCount else maxOf(activeProvidersCount, existingContainer?.providerCount ?: 0)
+        val resolvedSourceCount = if (isMovie) activeSourcesCount else maxOf(activeSourcesCount, existingContainer?.sourceCount ?: 0)
+        val containerChanged = existingContainer == null ||
+            existingContainer.anilistId != resolvedAnilistId ||
+            existingContainer.contentType != resolvedContentType ||
+            existingContainer.backendId != resolvedBackendId ||
+            existingContainer.canonicalTitle != resolvedTitle ||
+            existingContainer.seasonCount != resolvedSeasonCount ||
+            existingContainer.totalEpisodeCount != resolvedTotalEps ||
+            existingContainer.providerCount != resolvedProviderCount ||
+            existingContainer.sourceCount != resolvedSourceCount ||
+            existingContainer.discoveryStatus != discoveryStatus ||
+            existingContainer.deletedAt != null
+
+        val persistedContainer = if (!containerChanged && existingContainer != null) {
+            metricsTracker.recordRoomWriteSkipped()
+            existingContainer
+        } else {
             StreamContainerEntity(
                 scopeKey = containerScopeKey,
                 contentKey = contentKey,
-                anilistId = anilistId ?: existingContainer?.anilistId,
-                contentType = if (isMovie) "MOVIE" else "ANIME",
-                backendId = backendId ?: existingContainer?.backendId,
-                canonicalTitle = canonicalTitle ?: existingContainer?.canonicalTitle,
-                seasonCount = if (isMovie) null else (seasonCount ?: existingContainer?.seasonCount),
-                totalEpisodeCount = if (isMovie) null else (totalEpisodeCount ?: existingContainer?.totalEpisodeCount),
-                providerCount = if (isMovie) activeProvidersCount else maxOf(activeProvidersCount, existingContainer?.providerCount ?: 0),
-                sourceCount = if (isMovie) activeSourcesCount else maxOf(activeSourcesCount, existingContainer?.sourceCount ?: 0),
+                anilistId = resolvedAnilistId,
+                contentType = resolvedContentType,
+                backendId = resolvedBackendId,
+                canonicalTitle = resolvedTitle,
+                seasonCount = resolvedSeasonCount,
+                totalEpisodeCount = resolvedTotalEps,
+                providerCount = resolvedProviderCount,
+                sourceCount = resolvedSourceCount,
                 discoveryStatus = discoveryStatus,
-                version = maxOf(version, existingContainer?.version ?: 1L),
+                version = maxOf(version, (existingContainer?.version ?: 0L) + 1L),
                 updatedAt = now
-            )
-        )
+            ).also {
+                streamCacheDao.upsertContainer(it)
+                metricsTracker.recordRoomWrite()
+            }
+        }
+
+        var persistedSeason: StreamSeasonEntity? = null
+        var persistedEpisode: StreamEpisodeEntity? = null
+        var seasonChanged = false
+        var episodeChanged = false
 
         if (!isMovie) {
             val sDocKey = "$contentKey:s$seasonNumber"
             val existingSeason = streamCacheDao.getSeason(sDocKey)
-            streamCacheDao.upsertSeason(
+            val resolvedSeasonEpCount = if (seasonEpisodeCount > 0) seasonEpisodeCount else (existingSeason?.episodeCount ?: 0)
+            seasonChanged = existingSeason == null ||
+                existingSeason.episodeCount != resolvedSeasonEpCount ||
+                existingSeason.discoveryStatus != discoveryStatus ||
+                existingSeason.deletedAt != null
+            persistedSeason = if (!seasonChanged && existingSeason != null) {
+                metricsTracker.recordRoomWriteSkipped()
+                existingSeason
+            } else {
                 StreamSeasonEntity(
                     seasonDocKey = sDocKey,
                     contentKey = contentKey,
                     seasonId = ContentIdentityHelper.seasonId(seasonNumber),
                     seasonNumber = seasonNumber,
                     backendSeasonId = existingSeason?.backendSeasonId,
-                    episodeCount = if (seasonEpisodeCount > 0) seasonEpisodeCount else (existingSeason?.episodeCount ?: 0),
+                    episodeCount = resolvedSeasonEpCount,
                     discoveryStatus = discoveryStatus,
-                    version = maxOf(version, existingSeason?.version ?: 1L),
+                    version = maxOf(version, (existingSeason?.version ?: 0L) + 1L),
                     updatedAt = now
-                )
-            )
+                ).also {
+                    streamCacheDao.upsertSeason(it)
+                    metricsTracker.recordRoomWrite()
+                }
+            }
+
             val eDocKey = "$contentKey:s$seasonNumber:e$episodeNumber"
             val existingEpisode = streamCacheDao.getEpisode(eDocKey)
-            streamCacheDao.upsertEpisode(
+            val resolvedCatalogEpId = catalogEpisodeId ?: existingEpisode?.catalogEpisodeId
+            val resolvedBackendEpId = backendEpisodeId ?: existingEpisode?.backendEpisodeId
+            episodeChanged = existingEpisode == null ||
+                existingEpisode.catalogEpisodeId != resolvedCatalogEpId ||
+                existingEpisode.backendEpisodeId != resolvedBackendEpId ||
+                existingEpisode.providerCount != activeProvidersCount ||
+                existingEpisode.sourceCount != activeSourcesCount ||
+                existingEpisode.discoveryStatus != discoveryStatus ||
+                existingEpisode.deletedAt != null
+            persistedEpisode = if (!episodeChanged && existingEpisode != null) {
+                metricsTracker.recordRoomWriteSkipped()
+                existingEpisode
+            } else {
                 StreamEpisodeEntity(
                     episodeDocKey = eDocKey,
                     contentKey = contentKey,
                     seasonId = ContentIdentityHelper.seasonId(seasonNumber),
                     episodeId = ContentIdentityHelper.episodeId(episodeNumber),
-                    catalogEpisodeId = catalogEpisodeId ?: existingEpisode?.catalogEpisodeId,
+                    catalogEpisodeId = resolvedCatalogEpId,
                     seasonNumber = seasonNumber,
                     episodeNumber = episodeNumber,
-                    backendEpisodeId = backendEpisodeId ?: existingEpisode?.backendEpisodeId,
+                    backendEpisodeId = resolvedBackendEpId,
                     backendSourceEpisodeIds = existingEpisode?.backendSourceEpisodeIds,
                     providerCount = activeProvidersCount,
                     sourceCount = activeSourcesCount,
                     discoveryStatus = discoveryStatus,
-                    version = maxOf(version, existingEpisode?.version ?: 1L),
+                    version = maxOf(version, (existingEpisode?.version ?: 0L) + 1L),
                     updatedAt = now
-                )
-            )
+                ).also {
+                    streamCacheDao.upsertEpisode(it)
+                    metricsTracker.recordRoomWrite()
+                }
+            }
         }
 
-        val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
+        val globalMetrics = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
+        val globalWritesBefore = globalMetrics.snapshot().roomWrites
         streamCacheDao.syncScopeRecords(
             scopeKey = scopeKey,
             incomingProviders = providers,
             incomingSources = sources,
             authoritativeComplete = authoritativeComplete
         )
+        val globalWritesDelta = (globalMetrics.snapshot().roomWrites - globalWritesBefore).coerceAtLeast(0L)
+        if (globalWritesDelta > 0L && metricsTracker !== globalMetrics) {
+            metricsTracker.recordRoomWrite(globalWritesDelta)
+        }
+        val recordsChanged = globalWritesDelta > 0L
+        val finalProviders = streamCacheDao.getAllProviders(scopeKey)
+        val finalSources = streamCacheDao.getAllSources(scopeKey)
         MonotonicMetrics.recordDuration("room_transaction_ms", txStarted, "scope=$scopeKey")
+        return PersistedScopeResult(
+            anyChanged = containerChanged || seasonChanged || episodeChanged || recordsChanged,
+            now = now,
+            container = persistedContainer,
+            season = persistedSeason,
+            episode = persistedEpisode,
+            providers = finalProviders,
+            sources = finalSources
+        )
+    }
+
+    private suspend fun fetchAndSyncScopeFromD1(
+        contentKey: String,
+        isMovie: Boolean,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        catalogEpisodeId: String?,
+        requirePlayableUrl: Boolean
+    ): ScopeReadOutcome {
+        val d1 = d1DataSource ?: return ScopeReadOutcome(null, ScopeReadStatus.UNAVAILABLE, "D1 unavailable", true)
+        val bundle = runCatching {
+            d1.fetchScopedStreaming(contentKey, isMovie, seasonNumber, episodeNumber)
+        }.getOrNull() ?: return ScopeReadOutcome(null, ScopeReadStatus.NOT_FOUND)
+
+        val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
+        val existingRoomSources = streamCacheDao.getAllSources(scopeKey).associateBy { it.sourceDocKey }
+        val mergedSources = bundle.sources.map { remote ->
+            val local = existingRoomSources[remote.sourceDocKey]
+            val localUrl = local?.streamUrl?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) }
+            val localExpired = SourceExpiryTime.isExpiredOrInvalid(local?.expiresAt)
+            remote.copy(
+                streamUrl = localUrl,
+                safeHeadersJson = local?.safeHeadersJson,
+                expiresAt = local?.expiresAt ?: remote.expiresAt,
+                status = when {
+                    remote.deletedAt != null || remote.status == StreamRecordStatus.REMOVED.name -> StreamRecordStatus.REMOVED.name
+                    localUrl != null && !localExpired -> StreamRecordStatus.AVAILABLE.name
+                    localUrl != null -> StreamRecordStatus.EXPIRED.name
+                    else -> StreamRecordStatus.MISSING_URL.name
+                }
+            )
+        }
+
+        val status = bundle.episode?.discoveryStatus ?: bundle.container?.discoveryStatus ?: DiscoveryStatus.COMPLETED.name
+        val version = maxOf(bundle.episode?.version ?: 1L, bundle.container?.version ?: 1L)
+        val updatedAt = bundle.episode?.updatedAt ?: bundle.container?.updatedAt ?: System.currentTimeMillis()
+        persistScopeToRoom(
+            contentKey = contentKey,
+            canonicalTitle = bundle.container?.canonicalTitle,
+            isMovie = isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            catalogEpisodeId = catalogEpisodeId ?: bundle.episode?.catalogEpisodeId,
+            backendId = bundle.container?.backendId,
+            backendEpisodeId = bundle.episode?.backendEpisodeId,
+            anilistId = bundle.container?.anilistId ?: contentKey.toIntOrNull(),
+            seasonCount = bundle.container?.seasonCount,
+            totalEpisodeCount = bundle.container?.totalEpisodeCount,
+            seasonEpisodeCount = bundle.season?.episodeCount ?: 0,
+            discoveryStatus = status,
+            version = version,
+            providers = bundle.providers,
+            sources = mergedSources,
+            authoritativeComplete = status == DiscoveryStatus.COMPLETED.name
+        )
+
+        val scopeData = ScopeStreamingData(
+            discoveryStatus = status,
+            backendId = bundle.container?.backendId ?: bundle.episode?.backendEpisodeId,
+            providers = bundle.providers,
+            sources = mergedSources,
+            version = version,
+            updatedAt = updatedAt,
+            fromFirestoreServer = false
+        )
+        if (requirePlayableUrl && mergedSources.none {
+                it.status != StreamRecordStatus.REMOVED.name &&
+                    it.deletedAt == null &&
+                    SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
+                    !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
+            }
+        ) {
+            return ScopeReadOutcome(scopeData, ScopeReadStatus.CACHE_MISS)
+        }
+        return ScopeReadOutcome(scopeData, ScopeReadStatus.HIT)
     }
 
     internal fun buildSourceFirestorePayload(

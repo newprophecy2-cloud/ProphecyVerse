@@ -1,0 +1,1174 @@
+PROPHECY VERSE — COMPLETE APK + CLOUDFLARE D1 INTEGRATION MASTER PROMPT
+
+1. ROLE AND OBJECTIVE
+
+Act as a Senior Android Engineer, Kotlin Architect, Database Engineer, Backend Integration Engineer, Performance Engineer, and QA Engineer.
+
+Your task is to clone, inspect, analyze, update, optimize, and fix the existing Prophecy Verse Android APK repository.
+
+The objective is to integrate the existing Cloudflare D1 database and Worker API into the APK while preserving every existing feature and business logic.
+
+This is a real repository engineering task, not a theoretical review.
+
+Follow this exact workflow:
+
+Repository Clone → Full Analysis → Architecture Audit → Implementation Plan → Update → Bug Fixes → Build → Testing → Final Report
+
+Do not skip stages.
+
+Do not modify anything before understanding the existing implementation.
+
+---
+
+2. REPOSITORIES AND DATABASE CONFIGURATION
+
+Android APK Repository
+
+GitHub repository:
+
+"https://github.com/newprophecy2-cloud/ProphecyVerse"
+
+Clone the repository and inspect its actual default branch, latest commit, Gradle configuration, source code, existing architecture, and current version.
+
+Do not assume the repository is up to date with previous conversations.
+
+Verify the actual source code before making any changes.
+
+Cloudflare Worker Repository
+
+GitHub repository:
+
+"https://github.com/newprophecy2-cloud/Prophecy-verse-DB"
+
+Worker URL:
+
+"https://prophecy-verse-db.newprophecy4.workers.dev/"
+
+API Base URL:
+
+"https://prophecy-verse-db.newprophecy4.workers.dev/v1/"
+
+D1 database name:
+
+"prophecyversedb"
+
+D1 database ID:
+
+"ba4462bf-00c9-46fb-ad1b-dcd4c62f8a7a"
+
+D1 binding:
+
+"DB"
+
+The Worker repository and its actual API implementation must be inspected before integration.
+
+Important:
+
+- Do not invent API endpoints.
+- Do not assume CRUD endpoints work because "/v1/tables" works.
+- Inspect actual Worker routes, request formats, response formats, validation, and error handling.
+- Test every required endpoint before using it in the APK.
+- API_TOKEN authentication has been requested to be removed. Verify the actual Worker implementation and ensure the APK does not depend on API_TOKEN.
+- Never invent an authentication mechanism.
+
+---
+
+3. ABSOLUTE PRESERVATION RULE — DO NOT REMOVE EXISTING LOGIC
+
+This is the highest-priority instruction.
+
+DO NOT REMOVE, DISABLE, REPLACE, REWRITE, OR SIMPLIFY ANY EXISTING FUNCTIONALITY UNLESS IT IS STRICTLY NECESSARY FOR THE REQUESTED D1 INTEGRATION AND THE CHANGE IS COMPATIBLE WITH THE EXISTING ARCHITECTURE.
+
+Preserve all existing:
+
+- Android UI and Compose screens.
+- Navigation and navigation arguments.
+- Home screen functionality.
+- Search functionality.
+- Anime details.
+- Season and episode handling.
+- Player functionality.
+- Media3 ExoPlayer.
+- Audio and subtitle selection.
+- Video quality selection.
+- EAC3 FFmpeg decoder.
+- Playback resume.
+- Watch history.
+- Watchlist.
+- User preferences.
+- Room database.
+- Firebase configuration.
+- Firestore features.
+- User authentication.
+- Installation tracking.
+- Notification system.
+- Admin-related integration.
+- Existing backend APIs.
+- Existing PostgreSQL integration.
+- Existing source resolution.
+- Existing playback fallback and retry logic.
+- Existing error handling.
+- Existing background workers.
+- Existing cache mechanisms.
+- Existing offline functionality.
+
+Do not remove dependencies simply because they appear unused without verifying their actual usage.
+
+Do not delete existing database entities, DAOs, repositories, services, API interfaces, or migrations.
+
+Do not rename packages, application IDs, or important classes unnecessarily.
+
+Do not change the UI design unless necessary to fix an existing issue.
+
+Do not introduce a new architecture that breaks existing functionality.
+
+Before changing any file:
+
+1. Inspect its existing implementation.
+2. Identify its callers and dependencies.
+3. Understand its current responsibilities.
+4. Make the smallest compatible change.
+5. Verify that existing behavior still works.
+
+If a component appears obsolete, document it instead of deleting it.
+
+---
+
+4. DATABASE RESPONSIBILITIES
+
+Use three distinct storage responsibilities.
+
+A. Firebase Firestore — User-Specific Data
+
+Firestore remains responsible for user-specific and Firebase-related information.
+
+Examples:
+
+- User profile.
+- Personalized anime suggestions.
+- User-specific curated recommendations.
+- Installation tracking.
+- Notification subscriptions.
+- Notification delivery tracking.
+- User-specific cloud settings, where already supported.
+- Other existing user-specific Firebase features.
+
+Rules:
+
+- Do not store the entire shared anime catalog in Firestore.
+- Do not duplicate all D1 metadata in Firestore.
+- Do not repeatedly write unchanged user data.
+- Preserve existing Firebase authentication and configuration.
+- Preserve existing notification and installation tracking logic.
+- Do not remove existing Firestore features.
+
+B. Cloudflare D1 — Shared Anime Catalog and Stream Discovery Database
+
+D1 stores shared data that can be used by all APK users.
+
+Examples:
+
+- Anime metadata.
+- Anime aliases.
+- AniList-to-backend mappings.
+- Seasons.
+- Episodes.
+- Episode availability.
+- Stream containers.
+- Stream seasons.
+- Stream episodes.
+- Stream providers.
+- Stream source records.
+- Source quality.
+- Video codec.
+- Audio language.
+- Source verification status.
+- Provider discovery status.
+- Source counts.
+- Relevant synchronization metadata.
+
+Rules:
+
+- D1 is the shared catalog and stream-discovery data store for this integration.
+- Read only the data needed by the currently opened page.
+- Do not download the entire database into the APK.
+- Do not write unchanged records.
+- Do not create duplicate records.
+- Use stable identifiers and unique constraints.
+- Use pagination where appropriate.
+- Preserve the existing backend integration until migration and compatibility are verified.
+
+C. Android Room — Local Persistent Storage
+
+Room remains essential.
+
+Preserve existing Room entities, DAOs, migrations, and local features.
+
+Use Room for:
+
+- Persistent anime metadata cache.
+- Cached anime details.
+- Cached season and episode information.
+- Cached search results where appropriate.
+- Cached shared catalog information.
+- Watch history.
+- Watchlist.
+- Playback position.
+- Resume information.
+- User preferences.
+- Offline data.
+- Other existing local application data.
+
+Do not replace Room with D1.
+
+Do not remove local functionality.
+
+D. Memory-Only Playback Information
+
+Keep sensitive or temporary playback information in memory when appropriate:
+
+- Temporary resolved playback URL.
+- Active playback session information.
+- Temporary playback headers.
+- Other short-lived playback credentials.
+
+Do not persist temporary playback URLs indefinitely.
+
+Never store actual video files in Firestore or D1.
+
+---
+
+5. CLOUDFLARE D1 DATABASE SCHEMA
+
+The existing D1 database contains the following application tables.
+
+The schema was created using "CREATE TABLE IF NOT EXISTS" and is based on the APK Room database structure.
+
+Before implementation, inspect the actual "schema.sql" in the Worker repository and verify the live D1 schema.
+
+Do not create a conflicting or duplicate schema.
+
+Do not drop existing tables or columns.
+
+Do not overwrite existing data.
+
+Table 1: anime_entries
+
+Purpose: Shared anime metadata.
+
+Known fields include:
+
+- id
+- anilistId
+- backendAnimeId
+- title
+- title variants
+- synopsis
+- year
+- season
+- format
+- status
+- genres
+- score
+- episodeCount
+- episodeDuration
+- studios
+- posterUrl
+- bannerUrl
+- playability flags
+- trending flags
+- seasonal flags
+- popular flags
+- mediaCategory
+- metadataCompleteness
+- canonical anime metadata
+- updatedAt
+
+Use this table for shared anime catalog metadata.
+
+Table 2: anime_aliases
+
+Purpose: Alternative anime titles.
+
+Known fields include:
+
+- animeId
+- alias
+- alias type or related alias metadata
+
+Use aliases for matching search queries and alternative titles.
+
+Table 3: catalog_mappings
+
+Purpose: Connect AniList IDs with backend anime IDs.
+
+Known fields include:
+
+- anilistId
+- backendAnimeId
+- confidence
+- mappedAt
+
+Use stable mappings to prevent duplicate anime records.
+
+Table 4: season_entries
+
+Purpose: Anime season metadata.
+
+Known fields include:
+
+- animeId
+- seasonNumber
+- backendSeasonId
+- title
+
+Load only the seasons required by the selected anime.
+
+Table 5: episode_entries
+
+Purpose: Anime episode metadata.
+
+Known fields include:
+
+- animeId
+- seasonNumber
+- episodeNumber
+- title
+- overview
+- availability
+- sourceEpisodeIds
+
+Load only the selected season's episodes when required.
+
+Table 6: stream_containers
+
+Purpose: Shared stream catalog container information.
+
+Known fields include:
+
+- contentKey
+- backendId
+- canonicalTitle
+- counts
+- discoveryStatus
+- version
+- updatedAt
+- deletedAt
+
+Table 7: stream_seasons
+
+Purpose: Stream discovery information by season.
+
+Known fields include:
+
+- contentKey
+- seasonId
+- seasonNumber
+- backendSeasonId
+- episodeCount
+- discoveryStatus
+- version
+- timestamps
+
+Table 8: stream_episodes
+
+Purpose: Stream discovery information by episode.
+
+Known fields include:
+
+- contentKey
+- seasonId
+- episodeId
+- catalogEpisodeId
+- seasonNumber
+- episodeNumber
+- backendEpisodeId
+- source IDs
+- providerCount
+- sourceCount
+- discoveryStatus
+- version
+- timestamps
+
+Table 9: stream_providers
+
+Purpose: Provider information.
+
+Known fields include:
+
+- scopeKey
+- providerId
+- providerName
+- status
+- sourceCount
+- version
+- timestamps
+
+Table 10: stream_sources
+
+Purpose: Shared source metadata and source discovery information.
+
+Known fields include:
+
+- scopeKey
+- providerId
+- sourceId
+- sourceName
+- backendEpisodeId
+- streamUrl
+- urlType
+- contentType
+- quality
+- codec
+- audioLanguage
+- downloadable
+- sizeBytes
+- safeHeadersJson
+- expiresAt
+- status
+- version
+- lastVerifiedAt
+- lastPlaybackSuccessAt
+- updatedAt
+- deletedAt
+
+Important:
+
+These are known schema fields, not permission to invent the exact SQL definitions.
+
+Retrieve the actual schema from the Worker repository and live D1 database.
+
+Verify:
+
+- Actual column names and types.
+- Primary keys.
+- Foreign keys.
+- Unique constraints.
+- Indexes.
+- Nullable fields.
+- Default values.
+- Timestamp formats.
+- JSON encoding.
+- Soft deletion behavior.
+
+If a required field is absent, create a safe additive migration only after verifying compatibility.
+
+Never use destructive schema migrations.
+
+Additional internal tables such as "_cf_KV" and "sqlite_sequence" must not be treated as application catalog tables.
+
+---
+
+6. PAGE-BASED LAZY LOADING
+
+Implement strict page-based loading.
+
+When a user opens a page, load only the data required by that page.
+
+Do not preload the entire application database.
+
+Home Page
+
+Load only:
+
+- Required shared home metadata.
+- Required trending/popular/seasonal content.
+- Personalized suggestions from Firestore, if already supported.
+- Only the currently needed pagination batch.
+
+Do not load all anime records.
+
+Search Page
+
+Load only:
+
+- The requested search query.
+- Matching results.
+- The required pagination batch.
+
+Use query-based caching.
+
+Different search queries must have separate cache keys.
+
+Do not download the full anime catalog to perform local-only searches unless that is an existing supported behavior.
+
+Anime Details Page
+
+Load only:
+
+- Selected anime metadata.
+- Required aliases if needed.
+- Required season information.
+
+Do not fetch every anime's metadata.
+
+Episodes Page
+
+Load only:
+
+- Selected anime.
+- Selected season.
+- Required episode records.
+
+Do not fetch every season's episodes unnecessarily.
+
+Use pagination if the existing API supports it.
+
+Episode Player Page
+
+Load only:
+
+- Selected episode information.
+- Required provider information.
+- Required source metadata.
+
+Do not load all sources for every anime or every episode.
+
+Keep existing playback resolution and fallback behavior.
+
+Watchlist and History
+
+Use existing Room storage and existing user-specific synchronization.
+
+Do not perform unnecessary D1 reads.
+
+Settings and Profile
+
+Load only the relevant local or user-specific data.
+
+Do not fetch shared anime data.
+
+---
+
+7. MULTI-LAYER CACHE ARCHITECTURE
+
+Implement or improve caching without replacing existing cache logic.
+
+Use:
+
+A. Memory Cache
+
+Purpose:
+
+- Fast access to currently active page data.
+- Avoid duplicate requests.
+- Share in-flight requests between consumers.
+- Reduce unnecessary page reloads.
+
+Requirements:
+
+- Bounded memory usage.
+- LRU or equivalent eviction.
+- Thread-safe access.
+- Correct invalidation.
+- No permanent storage of temporary playback credentials.
+
+B. Room Persistent Cache
+
+Purpose:
+
+- Survive app restarts.
+- Support offline access.
+- Reduce Firestore and D1 reads.
+- Display cached page content immediately.
+
+Requirements:
+
+- Store data using existing Room architecture.
+- Preserve all existing entities and migrations.
+- Update cache transactionally.
+- Use stable cache keys.
+- Track relevant freshness metadata.
+- Avoid unnecessary writes.
+- Do not overwrite newer data with older responses.
+
+C. HTTP Response Cache
+
+Use OkHttp HTTP cache only where appropriate.
+
+Requirements:
+
+- Respect server cache headers.
+- Do not cache unsafe or user-specific responses publicly.
+- Do not cache temporary playback URLs beyond their validity.
+- Respect ETag and Last-Modified when supported.
+- Avoid duplicate caching layers that cause stale data.
+
+D. Suggested Initial Cache TTL
+
+These are starting values, not hard-coded universal rules.
+
+Data| Suggested TTL
+Home data| 10 minutes
+Search results| 5 minutes
+Anime metadata| 24 hours
+Season metadata| 12 hours
+Episode metadata| 12 hours
+Stream source metadata| 5 minutes
+Personalized suggestions| 30 minutes
+User profile| 30 minutes
+
+Make TTL configurable where practical.
+
+The actual expiry policy must respect server-provided versions, update timestamps, expiry information, and source validity.
+
+E. Cache Behavior
+
+1. Check Memory Cache.
+2. If absent, check Room.
+3. If Room contains usable data, render it immediately.
+4. If the cache is stale, refresh only the required page data.
+5. If cache is missing, fetch only the required page data.
+6. Update Room transactionally.
+7. Update Memory Cache.
+8. Prevent duplicate requests.
+9. Cancel obsolete requests when the user leaves a page.
+10. Never display invalid or expired playback URLs as verified sources.
+
+---
+
+8. FIRESTORE AND D1 READ/WRITE LIMIT CONTROL
+
+This requirement is critical.
+
+Optimize both databases to avoid unnecessary reads and writes.
+
+Read Optimization
+
+- No page request before that page is opened.
+- No full-table reads.
+- Use indexed queries.
+- Use pagination.
+- Use cache-first loading.
+- Avoid repeated identical queries.
+- Deduplicate concurrent requests.
+- Request only required columns where supported.
+- Use batch reads only when justified.
+- Avoid repeated polling.
+- Avoid unnecessary background refreshes.
+
+Write Optimization
+
+- Do not write unchanged records.
+- Compare existing and incoming values.
+- Update only changed fields where supported.
+- Use batch writes where supported.
+- Avoid unnecessary timestamp updates.
+- Avoid duplicate installation tracking writes.
+- Avoid duplicate source records.
+- Use idempotent operations.
+- Use bounded retries with backoff.
+- Prevent concurrent duplicate writes.
+- Avoid continuous synchronization loops.
+
+Database Usage Monitoring
+
+Track, where possible:
+
+- Firestore reads.
+- Firestore writes.
+- D1 requests.
+- D1 rows returned.
+- D1 mutations.
+- Cache hit rate.
+- Cache miss rate.
+- API request count.
+- Response time.
+- Failed requests.
+- Duplicate requests prevented.
+
+Do not introduce a logging system that stores sensitive information.
+
+Never log full playback URLs, authorization headers, tokens, or private user data.
+
+---
+
+9. D1 API INTEGRATION
+
+Inspect the actual Worker API implementation.
+
+Identify all existing supported endpoints for:
+
+- Anime metadata.
+- Anime search.
+- Anime aliases.
+- Catalog mappings.
+- Seasons.
+- Episodes.
+- Stream containers.
+- Stream seasons.
+- Stream episodes.
+- Providers.
+- Sources.
+- Synchronization.
+- Health checks.
+
+Use only verified endpoints.
+
+Create or update the appropriate:
+
+- Retrofit API interfaces.
+- Request DTOs.
+- Response DTOs.
+- Serialization adapters.
+- OkHttp configuration.
+- Repository implementations.
+- Data source classes.
+- Error handling.
+- Dependency injection bindings.
+
+Preserve the existing backend API contracts.
+
+Do not assume that the Worker supports all these operations just because the corresponding D1 tables exist.
+
+If a required API endpoint is missing, document the gap and implement it in the Worker only if that repository is available and the existing behavior can be preserved.
+
+Do not make destructive API changes.
+
+---
+
+10. POSTGRESQL AND EXISTING BACKEND COMPATIBILITY
+
+The existing Prophecy Verse architecture may already use PostgreSQL-backed backend services.
+
+Before modifying it:
+
+1. Inspect the existing PostgreSQL integration.
+2. Identify which data is currently served from PostgreSQL.
+3. Inspect the current APK API contracts.
+4. Compare PostgreSQL data with D1 data.
+5. Identify duplicate and conflicting responsibilities.
+6. Verify whether D1 is fully populated.
+7. Verify whether all required D1 APIs work.
+
+Do not delete or disable PostgreSQL integration just because D1 has been introduced.
+
+Only migrate an existing responsibility after:
+
+- Data migration is verified.
+- Required endpoints work.
+- Existing features pass regression tests.
+- The new implementation provides equivalent functionality.
+- A rollback path exists.
+
+If D1 and PostgreSQL currently contain different data, do not silently select one and discard the other.
+
+Document the source-of-truth decision and obtain approval for any destructive or irreversible migration.
+
+---
+
+11. EXISTING PLAYBACK ARCHITECTURE MUST REMAIN INTACT
+
+Preserve the existing direct-play architecture.
+
+The APK's documented primary playback routes are:
+
+- GET "/api/v1/anime/search"
+- GET "/api/v1/anime/{id}"
+- GET "/api/v1/anime/{id}/episodes/{episode_id}/full"
+- POST "/api/v1/play/direct"
+
+The direct-play request uses:
+
+"{"source_id":"<selected_source_id>"}"
+
+The existing direct-play resolver returns the actual playback URL and request headers.
+
+Rules:
+
+- Do not introduce "/stream", "/remux", "/watch", or proxy playback routes.
+- Do not replace direct playback with video proxying.
+- Preserve Media3 ExoPlayer.
+- Preserve existing provider fallback.
+- Preserve source identity and episode matching.
+- Preserve source refresh and retry logic.
+- Preserve playback headers.
+- Preserve audio and subtitle selection.
+- Preserve EAC3 decoder integration.
+- Preserve playback resume.
+- Preserve error handling.
+
+D1 source records may assist source discovery and metadata lookup.
+
+A D1 source record must not be treated as proof that a temporary URL is still playable.
+
+When a source URL is missing, expired, invalid, or unavailable, use the existing supported backend resolution and refresh logic.
+
+Never invent playback URLs.
+
+Never persist temporary playback credentials indefinitely.
+
+---
+
+12. NETWORK AND PERFORMANCE OPTIMIZATION
+
+Optimize network usage and page rendering.
+
+Requirements:
+
+- Cache-first UI.
+- Background refresh only when needed.
+- Bounded request concurrency.
+- Request deduplication.
+- Pagination.
+- Request cancellation on page changes.
+- Connection reuse.
+- Appropriate request timeouts.
+- Retry only transient failures.
+- Exponential backoff with jitter.
+- No unlimited retry loops.
+- No duplicate network requests.
+- No blocking the main thread.
+- No unnecessary database work on the main thread.
+- Avoid large JSON responses.
+- Avoid loading unrelated page data.
+
+Use Kotlin coroutines and Flow consistently with the existing architecture.
+
+Preserve existing threading and lifecycle behavior.
+
+Do not add excessive background jobs.
+
+---
+
+13. BUG ANALYSIS AND FIXING
+
+After cloning, conduct a complete codebase audit.
+
+Inspect:
+
+- Gradle dependencies.
+- Kotlin source files.
+- Compose UI.
+- Navigation.
+- Room database.
+- DAO queries.
+- Repositories.
+- API clients.
+- Firebase integration.
+- D1 integration.
+- Existing backend integration.
+- Playback system.
+- Cache system.
+- Background workers.
+- Error handling.
+- Android manifest.
+- ProGuard/R8 configuration.
+- Build configuration.
+- Existing tests.
+
+Identify:
+
+- Compilation errors.
+- Runtime crashes.
+- Memory leaks.
+- Main-thread blocking.
+- Duplicate requests.
+- Excessive database reads.
+- Excessive database writes.
+- Cache invalidation bugs.
+- Stale data.
+- Pagination bugs.
+- Race conditions.
+- Incorrect episode/source mappings.
+- Playback regressions.
+- Firebase failures.
+- D1 API failures.
+- Offline failures.
+- Navigation regressions.
+
+Fix verified issues with the smallest compatible changes.
+
+Do not create fake test results.
+
+Do not claim a bug is fixed without reproducing or verifying the behavior.
+
+---
+
+14. BUILD AND VERSION REQUIREMENTS
+
+Inspect the actual current APK version first.
+
+Target version requirement for the next intended release:
+
+- Version Name: "3.0.1"
+- Android Version Code: "6"
+
+Verify the current repository values before changing them.
+
+Do not downgrade a newer version.
+
+Do not change the application ID.
+
+Preserve:
+
+"com.aistudio.prophecyverse.vykqtb"
+
+Do not change signing configuration or Firebase configuration without explicit authorization.
+
+Build using the existing project configuration.
+
+Do not silently change target SDK, minimum SDK, package names, or ABI support.
+
+---
+
+15. TESTING AND ACCEPTANCE CRITERIA
+
+Perform real tests wherever credentials and infrastructure access permit.
+
+A. Repository Tests
+
+- Clean Gradle build.
+- Kotlin compilation.
+- Unit tests.
+- Room database tests.
+- Migration tests.
+- Serialization tests.
+- Repository tests.
+
+B. D1 Worker Tests
+
+Verify:
+
+- Worker availability.
+- "/v1/tables".
+- Required read endpoints.
+- Required write endpoints, if supported.
+- Search and pagination.
+- Missing record handling.
+- Invalid input handling.
+- Duplicate write handling.
+- Database error handling.
+- Unauthenticated access, according to the actual Worker configuration.
+
+Do not assume an endpoint works based only on its existence.
+
+C. Firestore Tests
+
+Verify existing:
+
+- User-specific data reads.
+- User-specific data writes.
+- Personalized suggestions.
+- Installation tracking.
+- Notification features.
+
+Ensure D1 integration does not break Firebase functionality.
+
+D. Page-Based Loading Tests
+
+Verify:
+
+- Home opens without loading the entire catalog.
+- Search loads only matching results.
+- Anime details load only the selected anime.
+- Episodes load only the selected season.
+- Player loads only the selected episode's source information.
+- Watchlist uses existing local/user-specific logic.
+- History uses existing local/user-specific logic.
+- Settings do not trigger unnecessary catalog requests.
+
+E. Cache Tests
+
+Verify:
+
+- Memory cache hit.
+- Room cache hit.
+- Cache miss.
+- Cache expiry.
+- Background refresh.
+- Offline rendering.
+- App restart persistence.
+- Duplicate request prevention.
+- Correct cache invalidation.
+- Expired playback URL handling.
+
+F. Read/Write Optimization Tests
+
+Verify:
+
+- Reopening a cached page does not cause unnecessary database reads.
+- Unchanged records do not cause unnecessary writes.
+- Duplicate requests are deduplicated.
+- Pagination does not fetch unrelated records.
+- Background tasks remain bounded.
+- User-specific and shared data do not get duplicated across databases.
+
+G. Playback Regression Tests
+
+Verify:
+
+- Anime search.
+- Anime details.
+- Episode selection.
+- Source discovery.
+- Direct playback resolution.
+- Playback headers.
+- Provider fallback.
+- Expired URL refresh.
+- Audio tracks.
+- Subtitle tracks.
+- EAC3 playback.
+- Playback resume.
+- History updates.
+
+---
+
+16. IMPLEMENTATION RULES
+
+Follow these rules throughout the task:
+
+1. Clone the actual APK repository before editing.
+2. Record the branch and commit hash.
+3. Inspect the actual code before planning changes.
+4. Inspect the Worker repository and D1 schema.
+5. Inspect existing Firestore and PostgreSQL responsibilities.
+6. Create a complete dependency and data-flow map.
+7. Identify existing bugs.
+8. Prepare a file-by-file implementation plan.
+9. Make minimal, targeted changes.
+10. Preserve every unrelated feature.
+11. Add safe database migrations only when needed.
+12. Never delete existing data.
+13. Never invent API contracts.
+14. Never fake successful tests.
+15. Never commit secrets.
+16. Never log private credentials or playback URLs.
+17. Do not deploy the Worker or modify production infrastructure without authorization.
+18. Do not modify unrelated repositories.
+19. Do not create an APK release unless requested.
+20. Keep the project buildable after each meaningful change.
+
+If a required API, credential, or environment is unavailable, document the exact blocker and continue with work that can be completed safely.
+
+---
+
+17. REQUIRED FINAL REPORT
+
+After completing the work, provide a factual report.
+
+A. Repository Information
+
+- Repository URL.
+- Branch.
+- Starting commit.
+- Final commit, if committed.
+- Android version name.
+- Android version code.
+
+B. Architecture Changes
+
+Explain:
+
+- Firestore responsibilities.
+- D1 responsibilities.
+- Room responsibilities.
+- Memory cache responsibilities.
+- HTTP cache responsibilities.
+- Existing PostgreSQL responsibilities.
+- Page-based loading architecture.
+
+C. Files Changed
+
+For each file:
+
+- File path.
+- Previous responsibility.
+- What changed.
+- Why it changed.
+- Whether existing functionality was preserved.
+
+D. Files Not Changed
+
+List important existing systems deliberately preserved.
+
+E. Database Changes
+
+- D1 tables used.
+- Schema changes.
+- Indexes added.
+- API endpoints used.
+- Read/write optimization.
+- Firestore changes.
+- Room migrations.
+
+F. Bug Fixes
+
+List each verified bug and its actual fix.
+
+G. Performance Results
+
+Report measured results where available:
+
+- Page load time.
+- API response time.
+- Cache hit rate.
+- Cache miss rate.
+- Database read count.
+- Database write count.
+- Duplicate requests prevented.
+- Memory usage where measured.
+
+Do not invent performance improvements.
+
+H. Test Results
+
+For every test:
+
+- PASS.
+- FAIL.
+- BLOCKED.
+- NOT TESTED.
+
+Include the actual reason and relevant logs.
+
+I. Remaining Issues
+
+List every unresolved issue with severity and reason.
+
+J. Final Safety Confirmation
+
+Explicitly confirm:
+
+- No unrelated feature was removed.
+- Existing playback architecture was preserved.
+- Existing Firebase features were preserved.
+- Existing Room data was preserved.
+- Existing PostgreSQL integration was not removed without authorization.
+- No destructive database migration was performed.
+- No unverified API was assumed to work.
+
+---
+
+FINAL EXECUTION INSTRUCTION
+
+Start by cloning the APK repository and inspecting the actual source code.
+
+Then inspect the Worker repository and actual D1 schema.
+
+Produce the architecture audit and file-by-file update plan.
+
+After that, implement the D1 integration, page-based lazy loading, multi-layer cache, and read/write optimization.
+
+Fix verified bugs without removing unrelated logic.
+
+Build and test the APK.
+
+The priority order is:
+
+1. Preserve existing functionality.
+2. Ensure data correctness.
+3. Integrate D1 safely.
+4. Maintain Firestore user-specific features.
+5. Implement page-based lazy loading.
+6. Reduce Firestore/D1 reads and writes.
+7. Improve cache efficiency.
+8. Fix verified bugs.
+9. Verify playback and app stability.
+10. Produce an accurate final report.
+
+Do not stop after analysis if the repository and required tools are available. Continue through implementation, bug fixing, building, and testing.
+
+Do not ask for approval for ordinary, reversible code changes within this scope. However, stop and request explicit authorization before destructive migrations, deleting existing logic, changing production infrastructure, or removing an existing database integration.
+
+MOST IMPORTANT: UPDATE THE EXISTING APK. DO NOT REBUILD THE APP FROM SCRATCH. DO NOT REMOVE ANOTHER EXISTING LOGIC OR FEATURE.

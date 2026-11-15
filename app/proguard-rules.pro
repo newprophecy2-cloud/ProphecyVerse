@@ -19,3 +19,12 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-keep class kotlin.Metadata { *; }
+-keep @com.squareup.moshi.JsonClass class * { *; }
+-keep class com.example.data.d1.** { *; }
+-keep class com.example.data.remote.** { *; }
+-keepclasseswithmembers class * {
+    @retrofit2.http.* <methods>;
+}

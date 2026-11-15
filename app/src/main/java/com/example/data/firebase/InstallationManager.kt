@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
 import com.example.BuildConfig
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.notice.NoticeManager
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
@@ -24,6 +25,7 @@ class InstallationManager private constructor(private val context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("prophecy_install_prefs", Context.MODE_PRIVATE)
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val auth: FirebaseAuth by lazy { FirebaseAuth.getInstance() }
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
     private val scope = CoroutineScope(Dispatchers.IO)
     private val syncMutex = Mutex()
 
@@ -122,10 +124,12 @@ class InstallationManager private constructor(private val context: Context) {
                     .document(registrationDocumentId(ownerUid))
                     .set(docData, SetOptions.merge())
             }
+            metricsTracker.recordFirestoreWrite()
             syncedOwnerUidInSession = ownerUid
             prefs.edit().putBoolean(KEY_PENDING_SYNC, false).apply()
             true
         } catch (e: Exception) {
+            metricsTracker.recordFirestoreError()
             // Keep the pending marker so the next launch/heartbeat retries the same
             // stable installation record without creating a second identity.
             Log.w(TAG, "Failed to sync installation metadata: ${e.message}")
@@ -135,6 +139,11 @@ class InstallationManager private constructor(private val context: Context) {
 
     fun updateFcmToken(token: String) {
         if (token.isBlank()) return
+        val previousToken = prefs.getString("fcm_token", null)
+        if (token == previousToken && !needsSync()) {
+            metricsTracker.recordFirestoreWriteSkipped()
+            return
+        }
         prefs.edit().putString("fcm_token", token).apply()
         initializeAndSync()
     }
@@ -144,6 +153,16 @@ class InstallationManager private constructor(private val context: Context) {
             try {
                 val ownerUid = auth.currentUser?.uid ?: return@launch
                 val now = System.currentTimeMillis()
+                val lastHeartbeatAt = prefs.getLong(KEY_LAST_HEARTBEAT_AT, 0L)
+                val lastHeartbeatUid = prefs.getString(KEY_LAST_HEARTBEAT_UID, null)
+                val lastHeartbeatVersion = prefs.getInt(KEY_LAST_HEARTBEAT_VERSION, -1)
+                if (lastHeartbeatUid == ownerUid &&
+                    lastHeartbeatVersion == BuildConfig.VERSION_CODE &&
+                    (now - lastHeartbeatAt) in 0 until HEARTBEAT_COOLDOWN_MS
+                ) {
+                    metricsTracker.recordFirestoreWriteSkipped()
+                    return@launch
+                }
                 val cachedCountry = NoticeManager.getInstance(context).detectedCountry.value
                     ?: Locale.getDefault().country.takeIf { it.isNotBlank() } ?: "US"
 
@@ -164,7 +183,14 @@ class InstallationManager private constructor(private val context: Context) {
                             SetOptions.merge()
                         )
                 }
+                metricsTracker.recordFirestoreWrite()
+                prefs.edit()
+                    .putLong(KEY_LAST_HEARTBEAT_AT, now)
+                    .putString(KEY_LAST_HEARTBEAT_UID, ownerUid)
+                    .putInt(KEY_LAST_HEARTBEAT_VERSION, BuildConfig.VERSION_CODE)
+                    .apply()
             } catch (e: Exception) {
+                metricsTracker.recordFirestoreError()
                 Log.w(TAG, "Installation heartbeat failed: ${e.message}")
             }
         }
@@ -212,6 +238,10 @@ class InstallationManager private constructor(private val context: Context) {
     companion object {
         private const val TAG = "InstallationManager"
         private const val KEY_PENDING_SYNC = "pending_installation_sync"
+        private const val KEY_LAST_HEARTBEAT_AT = "last_heartbeat_at_ms"
+        private const val KEY_LAST_HEARTBEAT_UID = "last_heartbeat_uid"
+        private const val KEY_LAST_HEARTBEAT_VERSION = "last_heartbeat_version"
+        private const val HEARTBEAT_COOLDOWN_MS = 15 * 60 * 1000L
 
         @Volatile
         private var instance: InstallationManager? = null

@@ -35,7 +35,7 @@ class DownloadManager private constructor(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = AppDatabase.getInstance(context)
     private val downloadDao: DownloadDao = database.downloadDao()
-    private val repository = AnimeRepository(database, applicationContext = context)
+    private val repository = AnimeRepository.getInstance(context)
     private val okHttpClient = NetworkModule.okHttpClient
 
     // Track active jobs in memory

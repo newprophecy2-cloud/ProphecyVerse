@@ -28,6 +28,21 @@ interface AnimeDao {
     @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'SERIES' OR LOWER(format) = 'series') ORDER BY score DESC, updatedAt DESC LIMIT 20")
     fun observeWebSeries(): Flow<List<AnimeEntry>>
 
+    @Query("SELECT * FROM anime_entries WHERE isTrending = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    suspend fun getTrendingOnce(): List<AnimeEntry>
+
+    @Query("SELECT * FROM anime_entries WHERE isSeasonal = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    suspend fun getSeasonalOnce(): List<AnimeEntry>
+
+    @Query("SELECT * FROM anime_entries WHERE isPopular = 1 ORDER BY score DESC, updatedAt DESC LIMIT 20")
+    suspend fun getPopularOnce(): List<AnimeEntry>
+
+    @Query("SELECT * FROM anime_entries WHERE (mediaCategory = 'MOVIE' OR UPPER(format) = 'MOVIE' OR UPPER(format) = 'FILM') ORDER BY isPopular DESC, score DESC, updatedAt DESC LIMIT 20")
+    suspend fun getMoviesOnce(): List<AnimeEntry>
+
+    @Query("SELECT MAX(updatedAt) FROM anime_entries WHERE isTrending = 1 OR isSeasonal = 1 OR isPopular = 1")
+    suspend fun getLatestHomeUpdatedAt(): Long?
+
     @Query("SELECT * FROM anime_entries WHERE id = :id LIMIT 1")
     fun observeAnimeById(id: String): Flow<AnimeEntry?>
 
@@ -131,6 +146,9 @@ interface EpisodeDao {
     @Query("SELECT * FROM episode_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC, episodeNumber ASC, id ASC")
     suspend fun getEpisodesForAnime(animeId: String): List<EpisodeEntry>
 
+    @Query("SELECT * FROM episode_entries WHERE animeId = :animeId AND seasonNumber = :seasonNumber ORDER BY episodeNumber ASC, id ASC LIMIT :limit OFFSET :offset")
+    suspend fun getEpisodesPageOnce(animeId: String, seasonNumber: Int, limit: Int, offset: Int): List<EpisodeEntry>
+
     @Query("SELECT * FROM season_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC")
     suspend fun getSeasonsForAnime(animeId: String): List<SeasonEntry>
 
@@ -192,6 +210,9 @@ interface EpisodeDao {
     @Query("DELETE FROM season_entries WHERE animeId = :animeId AND seasonNumber != :targetSeasonNumber")
     suspend fun deleteOtherSeasons(animeId: String, targetSeasonNumber: Int)
 
+    @Query("DELETE FROM episode_entries WHERE id IN (:ids)")
+    suspend fun deleteEpisodesByIds(ids: List<String>)
+
     @Transaction
     suspend fun replaceEpisodeSnapshot(
         animeId: String,
@@ -200,11 +221,13 @@ interface EpisodeDao {
     ) {
         deleteEpisodesForAnime(animeId)
         deleteSeasonsForAnime(animeId)
-        upsertSeasons(seasons)
-        upsertEpisodes(EpisodeCanonicalizer.canonicalize(emptyList(), episodes))
+        val canonicalSeasons = seasons.distinctBy { it.animeId to it.seasonNumber }
+        val canonicalEpisodes = EpisodeCanonicalizer.canonicalize(emptyList(), episodes)
+        if (canonicalSeasons.isNotEmpty()) upsertSeasons(canonicalSeasons)
+        if (canonicalEpisodes.isNotEmpty()) upsertEpisodes(canonicalEpisodes)
     }
 
-    /** Merge a partial response and persist season/episode rows in one Room transaction. */
+    /** Merge a partial response and persist only new/changed season and episode rows in one Room transaction. */
     @Transaction
     suspend fun mergeEpisodeSnapshot(
         animeId: String,
@@ -217,19 +240,44 @@ interface EpisodeDao {
             .associateBy { it.id }
             .values
             .map { season ->
-                if (season.backendSeasonId == null) {
-                    season.copy(backendSeasonId = existingSeasonsById[season.id]?.backendSeasonId)
-                } else {
-                    season
-                }
+                val prev = existingSeasonsById[season.id]
+                season.copy(
+                    backendSeasonId = season.backendSeasonId ?: prev?.backendSeasonId,
+                    title = season.title?.takeIf { it.isNotBlank() } ?: prev?.title
+                )
             }
             .sortedBy { it.seasonNumber }
+
+        val existingEpisodes = getEpisodesForAnime(animeId)
+        val existingEpisodesById = existingEpisodes.associateBy { it.id }
         val mergedEpisodes = EpisodeCanonicalizer.canonicalize(
-            existing = getEpisodesForAnime(animeId),
+            existing = existingEpisodes,
             incoming = incomingEpisodes
         )
-        if (mergedSeasons.isNotEmpty()) upsertSeasons(mergedSeasons)
-        if (mergedEpisodes.isNotEmpty()) upsertEpisodes(mergedEpisodes)
+        val mergedIds = mergedEpisodes.mapTo(HashSet(mergedEpisodes.size)) { it.id }
+        val obsoleteIds = existingEpisodes.mapNotNull { ep -> ep.id.takeIf { it !in mergedIds } }
+        val metrics = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
+        if (obsoleteIds.isNotEmpty()) {
+            obsoleteIds.chunked(500).forEach { chunk -> deleteEpisodesByIds(chunk) }
+            metrics.recordRoomWrite(obsoleteIds.size.toLong())
+        }
+
+        val changedSeasons = mergedSeasons.filter { existingSeasonsById[it.id] != it }
+        val changedEpisodes = mergedEpisodes.filter { existingEpisodesById[it.id] != it }
+
+        if (changedSeasons.isNotEmpty()) {
+            upsertSeasons(changedSeasons)
+            metrics.recordRoomWrite(changedSeasons.size.toLong())
+        }
+        if (changedEpisodes.isNotEmpty()) {
+            upsertEpisodes(changedEpisodes)
+            metrics.recordRoomWrite(changedEpisodes.size.toLong())
+        }
+        if (changedSeasons.isEmpty() && changedEpisodes.isEmpty() && obsoleteIds.isEmpty() &&
+            (incomingSeasons.isNotEmpty() || incomingEpisodes.isNotEmpty())
+        ) {
+            metrics.recordRoomWriteSkipped()
+        }
     }
 
     @Transaction
@@ -253,6 +301,14 @@ interface SearchDao {
         ORDER BY r.rankIndex ASC
     """)
     fun observeSearchResults(query: String): Flow<List<AnimeEntry>>
+
+    @Query("""
+        SELECT a.* FROM anime_entries a
+        INNER JOIN search_result_refs r ON a.id = r.animeId
+        WHERE r.normalizedQuery = :query
+        ORDER BY r.rankIndex ASC
+    """)
+    suspend fun getSearchResultsOnce(query: String): List<AnimeEntry>
 
     @Query("SELECT * FROM search_queries WHERE query = :query LIMIT 1")
     suspend fun getSearchQuery(query: String): SearchQuery?

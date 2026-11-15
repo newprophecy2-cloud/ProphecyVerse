@@ -96,7 +96,8 @@ data class SeasonEntry(
     tableName = "episode_entries",
     indices = [
         Index(value = ["animeId"]),
-        Index(value = ["animeId", "seasonNumber"])
+        Index(value = ["animeId", "seasonNumber"]),
+        Index(value = ["animeId", "seasonNumber", "episodeNumber"], unique = true)
     ]
 )
 data class EpisodeEntry(

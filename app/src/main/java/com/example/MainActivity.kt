@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        com.example.data.remote.NetworkModule.initializeHttpCache(applicationContext)
         pendingNotificationRoute = notificationRouteFrom(intent)
         com.example.data.firebase.ProphecyMessagingService.ensureNotificationChannel(applicationContext)
 
@@ -103,9 +104,13 @@ class MainActivity : ComponentActivity() {
             if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
                 launch(kotlinx.coroutines.Dispatchers.IO) {
                     runCatching {
-                        val dao = com.example.data.local.AppDatabase.getInstance(applicationContext).streamCacheDao()
-                        com.example.data.streaming.FirestoreStreamingRepository(dao).flushPendingOutbox()
-                        com.example.data.repository.AnimeRepository(com.example.data.local.AppDatabase.getInstance(applicationContext), applicationContext = applicationContext).processPendingSharedCatalogQueue()
+                        val repo = com.example.data.repository.AnimeRepository.getInstance(applicationContext)
+                        if (repo.streamingRepository.pendingOutboxCount() > 0) {
+                            repo.streamingRepository.flushPendingOutbox()
+                        }
+                        if (repo.usesFirestoreStreamingRealtime) {
+                            repo.processPendingSharedCatalogQueue()
+                        }
                     }
                 }
             }
@@ -155,9 +160,13 @@ class MainActivity : ComponentActivity() {
         if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
             lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching {
-                    val dao = com.example.data.local.AppDatabase.getInstance(applicationContext).streamCacheDao()
-                    com.example.data.streaming.FirestoreStreamingRepository(dao).flushPendingOutbox()
-                        com.example.data.repository.AnimeRepository(com.example.data.local.AppDatabase.getInstance(applicationContext), applicationContext = applicationContext).processPendingSharedCatalogQueue()
+                    val repo = com.example.data.repository.AnimeRepository.getInstance(applicationContext)
+                    if (repo.streamingRepository.pendingOutboxCount() > 0) {
+                        repo.streamingRepository.flushPendingOutbox()
+                    }
+                    if (repo.usesFirestoreStreamingRealtime) {
+                        repo.processPendingSharedCatalogQueue()
+                    }
                 }
             }
         }
@@ -225,10 +234,7 @@ fun MainAppNav(
     val context = LocalContext.current
     val app = context.applicationContext as Application
     val canonicalRepository = remember {
-        com.example.data.repository.AnimeRepository(
-            com.example.data.local.AppDatabase.getInstance(context),
-            applicationContext = context
-        )
+        com.example.data.repository.AnimeRepository.getInstance(context)
     }
     val navigationScope = rememberCoroutineScope()
     fun navigateToAnime(animeId: String) {

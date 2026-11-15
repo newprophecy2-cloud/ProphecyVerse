@@ -152,6 +152,7 @@ fun PlayerScreen(
             anime?.format?.equals("MOVIE", ignoreCase = true) == true ||
             anime?.format?.equals("FILM", ignoreCase = true) == true
     val isResolving by viewModel.isResolving.collectAsStateWithLifecycle()
+    val resolutionStage by viewModel.resolutionStage.collectAsStateWithLifecycle()
     val resolutionError by viewModel.resolutionError.collectAsStateWithLifecycle()
 
     val isPlaying by viewModel.playerManager.isPlaying.collectAsStateWithLifecycle()
@@ -407,7 +408,8 @@ fun PlayerScreen(
             LoadingAndBufferingOverlay(
                 isResolving = isResolving,
                 isBuffering = isBuffering,
-                isInPipMode = isInPipMode
+                isInPipMode = isInPipMode,
+                resolvingMessage = resolutionStage.label
             )
 
             ErrorOverlay(
@@ -576,7 +578,8 @@ fun PlayerScreen(
                 LoadingAndBufferingOverlay(
                     isResolving = isResolving,
                     isBuffering = isBuffering,
-                    isInPipMode = isInPipMode
+                    isInPipMode = isInPipMode,
+                    resolvingMessage = resolutionStage.label
                 )
 
                 ErrorOverlay(
@@ -1200,7 +1203,8 @@ private fun VideoSurface(playerInstance: androidx.media3.exoplayer.ExoPlayer?) {
 private fun LoadingAndBufferingOverlay(
     isResolving: Boolean,
     isBuffering: Boolean,
-    isInPipMode: Boolean
+    isInPipMode: Boolean,
+    resolvingMessage: String = ""
 ) {
     if ((isResolving || isBuffering) && !isInPipMode) {
         Box(
@@ -1213,7 +1217,11 @@ private fun LoadingAndBufferingOverlay(
                 CircularProgressIndicator(color = AccentCyan, strokeWidth = 3.dp)
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = if (isResolving) "Resolving direct playback..." else "Buffering...",
+                    text = if (isResolving) {
+                        resolvingMessage.ifBlank { "Resolving playback..." }
+                    } else {
+                        "Buffering..."
+                    },
                     color = Color.White,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium

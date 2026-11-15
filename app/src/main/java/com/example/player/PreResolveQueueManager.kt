@@ -5,9 +5,11 @@ import com.example.data.local.EpisodeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
+import com.example.data.repository.EpisodeResolutionCoordinator
 import com.example.data.repository.resolveVerifiedPlaybackForEpisode
 import com.example.data.repository.EpisodeSourceCacheIdentity
 import com.example.data.repository.SourceExpiryTime
+import com.example.data.repository.SourceIdentityValidator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,7 +47,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         val seasonNumber: Int,
         val source: ProphecySourceDto,
         val directData: DirectPlayData,
-        val resolvedAtMs: Long
+        val resolvedAtMs: Long,
+        val candidates: List<ProphecySourceDto> = listOf(source)
     ) {
         fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean =
             nowMs - resolvedAtMs > CACHE_TTL_MS || SourceExpiryTime.isExpired(directData.expiresAt, nowMs)
@@ -160,23 +163,40 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     private suspend fun preResolveEpisode(animeId: String, episode: EpisodeEntry): Boolean {
         val key = identity(animeId, episode)
         return try {
+            var waitedMs = 0L
+            while (EpisodeResolutionCoordinator.isForegroundResolutionActive() && waitedMs < 3_500L) {
+                delay(100L)
+                waitedMs += 100L
+            }
             withTimeout(15_000L) {
                 // Delegates through cache-first Room -> Firestore -> Backend discovery/resolve with distributed lease
                 val verified = repository.resolveVerifiedPlaybackForEpisode(animeId, episode).getOrNull()
                     ?: return@withTimeout false
                 updateStatusFor(key, ResolutionStatus.RESOLVED)
                 val direct = verified.directData
-                val url = direct.playbackUrl
-                if (direct.sourceId != verified.source.id || url.isBlank() ||
-                    !(url.startsWith("https://") || url.startsWith("http://") || url.startsWith("file://")) ||
-                    SourceExpiryTime.isExpired(direct.expiresAt)) return@withTimeout false
+                val validation = SourceIdentityValidator.validateDirectPlayData(direct, verified.source.id)
+                if (!validation.isValid) {
+                    SourceIdentityValidator.recordDiagnostic(
+                        code = (validation as com.example.data.repository.SourceValidationResult.Invalid).code,
+                        scopeKey = key,
+                        sourceId = verified.source.id,
+                        providerLabel = verified.source.displayProviderName,
+                        detail = validation.reason
+                    )
+                    return@withTimeout false
+                }
+                val normDirect = direct.copy(sourceId = SourceIdentityValidator.normalizeId(direct.sourceId))
+                val normSource = SourceIdentityValidator.normalizeDto(verified.source)
+                val allCandidates = verified.candidates.map { SourceIdentityValidator.normalizeDto(it) }
+                    .ifEmpty { listOf(normSource) }
                 preparedCache[key] = PreparedEpisode(
                     backendAnimeId = animeId,
                     episodeId = episode.id,
                     seasonNumber = episode.seasonNumber,
-                    source = verified.source,
-                    directData = direct,
-                    resolvedAtMs = System.currentTimeMillis()
+                    source = normSource,
+                    directData = normDirect,
+                    resolvedAtMs = System.currentTimeMillis(),
+                    candidates = allCandidates
                 )
                 Log.i(TAG, "Prepared (${verified.cacheTier}) S${episode.seasonNumber} E${episode.episodeNumber}")
                 true
@@ -192,9 +212,15 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
     fun getPreparedSource(backendAnimeId: String, episode: EpisodeEntry): PreparedEpisode? {
         val key = identity(backendAnimeId, episode)
         val entry = preparedCache[key] ?: return null
-        return if (!entry.isExpired()) entry else {
+        val matchesIdentity = entry.backendAnimeId == backendAnimeId &&
+            entry.episodeId == episode.id &&
+            entry.seasonNumber == episode.seasonNumber &&
+            SourceIdentityValidator.validateDirectPlayData(entry.directData, entry.source.id).isValid
+        return if (matchesIdentity && !entry.isExpired()) {
+            entry
+        } else {
             preparedCache.remove(key)
-            updateStatusFor(key, ResolutionStatus.EXPIRED)
+            updateStatusFor(key, if (!matchesIdentity) ResolutionStatus.FAILED else ResolutionStatus.EXPIRED)
             null
         }
     }
