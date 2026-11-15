@@ -26,7 +26,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -36,14 +38,82 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 
+interface D1DigestStore {
+    fun get(key: String): String?
+    fun put(key: String, value: String)
+    fun getLong(key: String): Long?
+    fun putLong(key: String, value: Long)
+    fun remove(key: String)
+    fun clear()
+}
+
+class InMemoryD1DigestStore : D1DigestStore {
+    private val map = ConcurrentHashMap<String, String>()
+    override fun get(key: String): String? = map[key]
+    override fun put(key: String, value: String) {
+        map[key] = value
+    }
+    override fun getLong(key: String): Long? = map[key]?.toLongOrNull()
+    override fun putLong(key: String, value: Long) {
+        map[key] = value.toString()
+    }
+    override fun remove(key: String) {
+        map.remove(key)
+    }
+    override fun clear() {
+        map.clear()
+    }
+}
+
+class SharedPreferencesD1DigestStore(context: android.content.Context) : D1DigestStore {
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+
+    override fun get(key: String): String? = prefs.getString(key, null)
+
+    override fun put(key: String, value: String) {
+        if (prefs.getString(key, null) == value) return
+        val editor = prefs.edit()
+        val all = prefs.all
+        if (all.size >= MAX_PERSISTED_DIGESTS && !all.containsKey(key)) {
+            all.keys.take(PRUNE_BATCH).forEach { editor.remove(it) }
+        }
+        editor.putString(key, value).apply()
+    }
+
+    override fun getLong(key: String): Long? =
+        if (prefs.contains(key)) prefs.getLong(key, 0L) else null
+
+    override fun putLong(key: String, value: Long) {
+        if (prefs.contains(key) && prefs.getLong(key, 0L) == value) return
+        prefs.edit().putLong(key, value).apply()
+    }
+
+    override fun remove(key: String) {
+        if (prefs.contains(key)) {
+            prefs.edit().remove(key).apply()
+        }
+    }
+
+    override fun clear() {
+        prefs.edit().clear().apply()
+    }
+
+    companion object {
+        const val PREFS_NAME = "prophecy_d1_digests"
+        private const val MAX_PERSISTED_DIGESTS = 4000
+        private const val PRUNE_BATCH = 500
+    }
+}
+
 /**
  * Cloudflare D1 REST Data Source backed by the Prophecy-verse-DB Worker API.
  * Implements strict page-based indexed reads, single-flight coalescing, bounded retries
- * with exponential backoff + jitter, duplicate-alias prevention, and diff-checked writes.
+ * with exponential backoff + jitter, duplicate-alias prevention, and persistent diff-checked writes.
  */
 class CloudflareD1DataSource(
     private val api: CloudflareD1ApiService,
-    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance(),
+    @Volatile private var digestStore: D1DigestStore = InMemoryD1DigestStore()
 ) {
     data class D1ScopedStreamingBundle(
         val container: StreamContainerEntity?,
@@ -56,8 +126,36 @@ class CloudflareD1DataSource(
     private val singleFlightScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlightReads = ConcurrentHashMap<String, CompletableDeferred<Any?>>()
     private val writtenDigests = ConcurrentHashMap<String, String>()
+    private val writeMutexes = ConcurrentHashMap<String, Mutex>()
     private val knownAliasesByAnime = ConcurrentHashMap<String, MutableSet<String>>()
     private val lastSuccessReportAt = ConcurrentHashMap<String, Long>()
+
+    fun attachDigestStore(store: D1DigestStore) {
+        digestStore = store
+    }
+
+    private fun readDigest(key: String): String? =
+        writtenDigests[key] ?: digestStore.get(key)?.also { writtenDigests[key] = it }
+
+    private fun saveDigest(key: String, digest: String) {
+        writtenDigests[key] = digest
+        digestStore.put(key, digest)
+    }
+
+    private fun readSuccessAt(sourceDocKey: String): Long =
+        lastSuccessReportAt[sourceDocKey]
+            ?: digestStore.getLong("succ:$sourceDocKey")?.also { lastSuccessReportAt[sourceDocKey] = it }
+            ?: 0L
+
+    private fun saveSuccessAt(sourceDocKey: String, timestampMs: Long) {
+        lastSuccessReportAt[sourceDocKey] = timestampMs
+        digestStore.putLong("succ:$sourceDocKey", timestampMs)
+    }
+
+    private suspend fun <T> withWriteLock(key: String, block: suspend () -> T): T {
+        val mutex = writeMutexes.computeIfAbsent(key) { Mutex() }
+        return mutex.withLock { block() }
+    }
 
     @Suppress("UNCHECKED_CAST")
     private suspend fun <T> coalesceRead(key: String, block: suspend () -> T): T {
@@ -264,7 +362,7 @@ class CloudflareD1DataSource(
                 )
             }
             val rows = response?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            rows.forEach { writtenDigests["season:${it.id}"] = it.stableDigest() }
+            rows.forEach { saveDigest("season:${it.id}", it.stableDigest()) }
             rows
         }
     }
@@ -289,7 +387,7 @@ class CloudflareD1DataSource(
                 )
             }
             val rows = response?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            rows.forEach { writtenDigests["episode:${it.id}"] = it.stableDigest() }
+            rows.forEach { saveDigest("episode:${it.id}", it.stableDigest()) }
             rows
         }
     }
@@ -299,7 +397,7 @@ class CloudflareD1DataSource(
         return coalesceRead("mapping:$aniListId") {
             val response = executeWithRetry("get_mapping") { api.getCatalogMapping(aniListId) }
             val dto = response?.takeIf { it.isSuccessful }?.body()?.data
-            if (dto != null) writtenDigests["mapping:${dto.aniListId}"] = dto.stableDigest()
+            if (dto != null) saveDigest("mapping:${dto.aniListId}", dto.stableDigest())
             dto
         }
     }
@@ -365,11 +463,11 @@ class CloudflareD1DataSource(
                 val providerDtos = providersDeferred.await()
                 val sourceDtos = sourcesDeferred.await()
 
-                containerDto?.let { writtenDigests["sc:${it.scopeKey}"] = it.stableDigest() }
-                seasonDto?.let { writtenDigests["ss:${it.seasonDocKey}"] = it.stableDigest() }
-                episodeDto?.let { writtenDigests["se:${it.episodeDocKey}"] = it.stableDigest() }
-                providerDtos.forEach { writtenDigests["sp:${it.providerDocKey}"] = it.stableDigest() }
-                sourceDtos.forEach { writtenDigests["ssrc:${it.sourceDocKey}"] = it.stableDigest() }
+                containerDto?.let { saveDigest("sc:${it.scopeKey}", it.stableDigest()) }
+                seasonDto?.let { saveDigest("ss:${it.seasonDocKey}", it.stableDigest()) }
+                episodeDto?.let { saveDigest("se:${it.episodeDocKey}", it.stableDigest()) }
+                providerDtos.forEach { saveDigest("sp:${it.providerDocKey}", it.stableDigest()) }
+                sourceDtos.forEach { saveDigest("ssrc:${it.sourceDocKey}", it.stableDigest()) }
 
                 val activeProviders = providerDtos
                     .filter { it.deletedAt == null && it.status != StreamRecordStatus.REMOVED.name }
@@ -397,14 +495,20 @@ class CloudflareD1DataSource(
         val dto = entry.toD1Dto()
         val key = "anime:${dto.id}"
         val digest = dto.stableDigest()
-        if (writtenDigests[key] == digest) {
+        if (readDigest(key) == digest) {
             metricsTracker.recordD1WriteSkipped()
             return true
         }
-        val response = executeWithRetry("upsert_anime", isWrite = true) { api.upsertAnimeEntry(dto) }
-        val ok = response?.isSuccessful == true && response.body()?.success == true
-        if (ok) writtenDigests[key] = digest
-        return ok
+        return withWriteLock(key) {
+            if (readDigest(key) == digest) {
+                metricsTracker.recordD1WriteSkipped()
+                return@withWriteLock true
+            }
+            val response = executeWithRetry("upsert_anime", isWrite = true) { api.upsertAnimeEntry(dto) }
+            val ok = response?.isSuccessful == true && response.body()?.success == true
+            if (ok) saveDigest(key, digest)
+            ok
+        }
     }
 
     suspend fun upsertAnimeBatchIfChanged(entries: List<AnimeEntry>): Int {
@@ -417,51 +521,59 @@ class CloudflareD1DataSource(
 
     suspend fun insertMissingAliases(animeId: String, desiredAliases: List<AnimeAlias>): Int {
         if (animeId.isBlank() || desiredAliases.isEmpty()) return 0
-        val existingSet = knownAliasesByAnime[animeId] ?: run {
-            val remoteAliases = executeWithRetry("list_existing_aliases") {
-                api.listAnimeAliases(
-                    where = buildWhereJson("animeId" to animeId),
-                    limit = 200
-                )
-            }?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            ConcurrentHashMap.newKeySet<String>().apply {
-                remoteAliases.forEach { add("${it.animeId}::${it.alias}") }
-                knownAliasesByAnime[animeId] = this
+        return withWriteLock("aliases:$animeId") {
+            val existingSet = knownAliasesByAnime[animeId] ?: run {
+                val remoteAliases = executeWithRetry("list_existing_aliases") {
+                    api.listAnimeAliases(
+                        where = buildWhereJson("animeId" to animeId),
+                        limit = 200
+                    )
+                }?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
+                ConcurrentHashMap.newKeySet<String>().apply {
+                    remoteAliases.forEach { add("${it.animeId}::${it.alias}") }
+                    knownAliasesByAnime[animeId] = this
+                }
             }
-        }
-        val missing = desiredAliases
-            .filter { it.animeId == animeId && it.alias.isNotBlank() }
-            .distinctBy { it.alias }
-            .filter { "${it.animeId}::${it.alias}" !in existingSet }
-        if (missing.isEmpty()) {
-            metricsTracker.recordD1WriteSkipped()
-            return 0
-        }
-        var inserted = 0
-        for (alias in missing) {
-            val response = executeWithRetry("insert_alias", isWrite = true) {
-                api.createAnimeAlias(alias.toD1InsertDto())
+            val missing = desiredAliases
+                .filter { it.animeId == animeId && it.alias.isNotBlank() }
+                .distinctBy { it.alias }
+                .filter { "${it.animeId}::${it.alias}" !in existingSet }
+            if (missing.isEmpty()) {
+                metricsTracker.recordD1WriteSkipped()
+                return@withWriteLock 0
             }
-            if (response?.isSuccessful == true) {
-                existingSet.add("${alias.animeId}::${alias.alias}")
-                inserted++
+            var inserted = 0
+            for (alias in missing) {
+                val response = executeWithRetry("insert_alias", isWrite = true) {
+                    api.createAnimeAlias(alias.toD1InsertDto())
+                }
+                if (response?.isSuccessful == true) {
+                    existingSet.add("${alias.animeId}::${alias.alias}")
+                    inserted++
+                }
             }
+            inserted
         }
-        return inserted
     }
 
     suspend fun upsertCatalogMappingIfChanged(mapping: CatalogMapping): Boolean {
         val dto = mapping.toD1Dto()
         val key = "mapping:${dto.aniListId}"
         val digest = dto.stableDigest()
-        if (writtenDigests[key] == digest) {
+        if (readDigest(key) == digest) {
             metricsTracker.recordD1WriteSkipped()
             return true
         }
-        val response = executeWithRetry("upsert_mapping", isWrite = true) { api.upsertCatalogMapping(dto) }
-        val ok = response?.isSuccessful == true && response.body()?.success == true
-        if (ok) writtenDigests[key] = digest
-        return ok
+        return withWriteLock(key) {
+            if (readDigest(key) == digest) {
+                metricsTracker.recordD1WriteSkipped()
+                return@withWriteLock true
+            }
+            val response = executeWithRetry("upsert_mapping", isWrite = true) { api.upsertCatalogMapping(dto) }
+            val ok = response?.isSuccessful == true && response.body()?.success == true
+            if (ok) saveDigest(key, digest)
+            ok
+        }
     }
 
     suspend fun upsertSeasonsIfChanged(seasons: List<SeasonEntry>): Int {
@@ -470,15 +582,24 @@ class CloudflareD1DataSource(
             val dto = season.toD1Dto()
             val key = "season:${dto.id}"
             val digest = dto.stableDigest()
-            if (writtenDigests[key] == digest) {
+            if (readDigest(key) == digest) {
                 metricsTracker.recordD1WriteSkipped()
                 continue
             }
-            val resp = executeWithRetry("upsert_season", isWrite = true) { api.upsertSeasonEntry(dto) }
-            if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                writtenDigests[key] = digest
-                written++
+            val wrote = withWriteLock(key) {
+                if (readDigest(key) == digest) {
+                    metricsTracker.recordD1WriteSkipped()
+                    return@withWriteLock false
+                }
+                val resp = executeWithRetry("upsert_season", isWrite = true) { api.upsertSeasonEntry(dto) }
+                if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                    saveDigest(key, digest)
+                    true
+                } else {
+                    false
+                }
             }
+            if (wrote) written++
         }
         return written
     }
@@ -492,15 +613,24 @@ class CloudflareD1DataSource(
             val dto = episode.toD1Dto()
             val key = "episode:${dto.id}"
             val digest = dto.stableDigest()
-            if (writtenDigests[key] == digest) {
+            if (readDigest(key) == digest) {
                 metricsTracker.recordD1WriteSkipped()
                 continue
             }
-            val resp = executeWithRetry("upsert_episode", isWrite = true) { api.upsertEpisodeEntry(dto) }
-            if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                writtenDigests[key] = digest
-                written++
+            val wrote = withWriteLock(key) {
+                if (readDigest(key) == digest) {
+                    metricsTracker.recordD1WriteSkipped()
+                    return@withWriteLock false
+                }
+                val resp = executeWithRetry("upsert_episode", isWrite = true) { api.upsertEpisodeEntry(dto) }
+                if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                    saveDigest(key, digest)
+                    true
+                } else {
+                    false
+                }
             }
+            if (wrote) written++
         }
         return written
     }
@@ -518,19 +648,25 @@ class CloudflareD1DataSource(
         val containerDto = container.toD1Dto()
         val cKey = "sc:${containerDto.scopeKey}"
         val cDigest = containerDto.stableDigest()
-        if (writtenDigests[cKey] == cDigest) {
+        if (readDigest(cKey) == cDigest) {
             metricsTracker.recordD1WriteSkipped()
         } else {
             tasks += async {
                 gate.withPermit {
-                    val resp = executeWithRetry("upsert_stream_container", isWrite = true) {
-                        api.upsertStreamContainer(containerDto)
-                    }
-                    if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                        writtenDigests[cKey] = cDigest
-                        true
-                    } else {
-                        false
+                    withWriteLock(cKey) {
+                        if (readDigest(cKey) == cDigest) {
+                            metricsTracker.recordD1WriteSkipped()
+                            return@withWriteLock true
+                        }
+                        val resp = executeWithRetry("upsert_stream_container", isWrite = true) {
+                            api.upsertStreamContainer(containerDto)
+                        }
+                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                            saveDigest(cKey, cDigest)
+                            true
+                        } else {
+                            false
+                        }
                     }
                 }
             }
@@ -540,19 +676,25 @@ class CloudflareD1DataSource(
             val seasonDto = season.toD1Dto()
             val sKey = "ss:${seasonDto.seasonDocKey}"
             val sDigest = seasonDto.stableDigest()
-            if (writtenDigests[sKey] == sDigest) {
+            if (readDigest(sKey) == sDigest) {
                 metricsTracker.recordD1WriteSkipped()
             } else {
                 tasks += async {
                     gate.withPermit {
-                        val resp = executeWithRetry("upsert_stream_season", isWrite = true) {
-                            api.upsertStreamSeason(seasonDto)
-                        }
-                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                            writtenDigests[sKey] = sDigest
-                            true
-                        } else {
-                            false
+                        withWriteLock(sKey) {
+                            if (readDigest(sKey) == sDigest) {
+                                metricsTracker.recordD1WriteSkipped()
+                                return@withWriteLock true
+                            }
+                            val resp = executeWithRetry("upsert_stream_season", isWrite = true) {
+                                api.upsertStreamSeason(seasonDto)
+                            }
+                            if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                                saveDigest(sKey, sDigest)
+                                true
+                            } else {
+                                false
+                            }
                         }
                     }
                 }
@@ -563,19 +705,25 @@ class CloudflareD1DataSource(
             val epDto = episode.toD1Dto()
             val eKey = "se:${epDto.episodeDocKey}"
             val eDigest = epDto.stableDigest()
-            if (writtenDigests[eKey] == eDigest) {
+            if (readDigest(eKey) == eDigest) {
                 metricsTracker.recordD1WriteSkipped()
             } else {
                 tasks += async {
                     gate.withPermit {
-                        val resp = executeWithRetry("upsert_stream_episode", isWrite = true) {
-                            api.upsertStreamEpisode(epDto)
-                        }
-                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                            writtenDigests[eKey] = eDigest
-                            true
-                        } else {
-                            false
+                        withWriteLock(eKey) {
+                            if (readDigest(eKey) == eDigest) {
+                                metricsTracker.recordD1WriteSkipped()
+                                return@withWriteLock true
+                            }
+                            val resp = executeWithRetry("upsert_stream_episode", isWrite = true) {
+                                api.upsertStreamEpisode(epDto)
+                            }
+                            if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                                saveDigest(eKey, eDigest)
+                                true
+                            } else {
+                                false
+                            }
                         }
                     }
                 }
@@ -586,20 +734,26 @@ class CloudflareD1DataSource(
             val pDto = provider.toD1Dto()
             val pKey = "sp:${pDto.providerDocKey}"
             val pDigest = pDto.stableDigest()
-            if (writtenDigests[pKey] == pDigest) {
+            if (readDigest(pKey) == pDigest) {
                 metricsTracker.recordD1WriteSkipped()
                 continue
             }
             tasks += async {
                 gate.withPermit {
-                    val resp = executeWithRetry("upsert_stream_provider", isWrite = true) {
-                        api.upsertStreamProvider(pDto)
-                    }
-                    if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                        writtenDigests[pKey] = pDigest
-                        true
-                    } else {
-                        false
+                    withWriteLock(pKey) {
+                        if (readDigest(pKey) == pDigest) {
+                            metricsTracker.recordD1WriteSkipped()
+                            return@withWriteLock true
+                        }
+                        val resp = executeWithRetry("upsert_stream_provider", isWrite = true) {
+                            api.upsertStreamProvider(pDto)
+                        }
+                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                            saveDigest(pKey, pDigest)
+                            true
+                        } else {
+                            false
+                        }
                     }
                 }
             }
@@ -617,20 +771,26 @@ class CloudflareD1DataSource(
             val sDto = source.toD1MetadataDto()
             val srcKey = "ssrc:${sDto.sourceDocKey}"
             val srcDigest = sDto.stableDigest()
-            if (writtenDigests[srcKey] == srcDigest) {
+            if (readDigest(srcKey) == srcDigest) {
                 metricsTracker.recordD1WriteSkipped()
                 continue
             }
             tasks += async {
                 gate.withPermit {
-                    val resp = executeWithRetry("upsert_stream_source", isWrite = true) {
-                        api.upsertStreamSource(sDto)
-                    }
-                    if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                        writtenDigests[srcKey] = srcDigest
-                        true
-                    } else {
-                        false
+                    withWriteLock(srcKey) {
+                        if (readDigest(srcKey) == srcDigest) {
+                            metricsTracker.recordD1WriteSkipped()
+                            return@withWriteLock true
+                        }
+                        val resp = executeWithRetry("upsert_stream_source", isWrite = true) {
+                            api.upsertStreamSource(sDto)
+                        }
+                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
+                            saveDigest(srcKey, srcDigest)
+                            true
+                        } else {
+                            false
+                        }
                     }
                 }
             }
@@ -640,40 +800,33 @@ class CloudflareD1DataSource(
     }
 
     suspend fun reportPlaybackSuccessMetadata(sourceEntity: StreamSourceEntity): Boolean {
-        val now = System.currentTimeMillis()
-        val lastAt = maxOf(
-            lastSuccessReportAt[sourceEntity.sourceDocKey] ?: 0L,
-            sourceEntity.lastPlaybackSuccessAt ?: 0L
-        )
-        if (lastAt > 0L && (now - lastAt < PLAYBACK_SUCCESS_REPORT_COOLDOWN_MS)) {
-            metricsTracker.recordD1WriteSkipped()
-            return true
+        return withWriteLock("succ:${sourceEntity.sourceDocKey}") {
+            val now = System.currentTimeMillis()
+            val lastAt = maxOf(
+                readSuccessAt(sourceEntity.sourceDocKey),
+                sourceEntity.lastPlaybackSuccessAt ?: 0L
+            )
+            if (lastAt > 0L && (now - lastAt < PLAYBACK_SUCCESS_REPORT_COOLDOWN_MS)) {
+                metricsTracker.recordD1WriteSkipped()
+                return@withWriteLock true
+            }
+            val dto = sourceEntity.toD1MetadataDto().copy(
+                status = StreamRecordStatus.AVAILABLE.name,
+                lastVerifiedAt = now,
+                lastPlaybackSuccessAt = now,
+                updatedAt = now,
+                version = maxOf(sourceEntity.version, 1L) + 1L
+            )
+            val resp = executeWithRetry("upsert_stream_source_success", isWrite = true) {
+                api.upsertStreamSource(dto)
+            }
+            val ok = resp?.isSuccessful == true && resp.body()?.success == true
+            if (ok) {
+                saveSuccessAt(sourceEntity.sourceDocKey, now)
+                saveDigest("ssrc:${dto.sourceDocKey}", dto.stableDigest())
+            }
+            ok
         }
-        // Claim cooldown slot before network call so concurrent callers coalesce without racing
-        val previousClaim = lastSuccessReportAt.putIfAbsent(sourceEntity.sourceDocKey, now)
-        if (previousClaim != null && (now - previousClaim < PLAYBACK_SUCCESS_REPORT_COOLDOWN_MS)) {
-            metricsTracker.recordD1WriteSkipped()
-            return true
-        }
-        lastSuccessReportAt[sourceEntity.sourceDocKey] = now
-
-        val dto = sourceEntity.toD1MetadataDto().copy(
-            status = StreamRecordStatus.AVAILABLE.name,
-            lastVerifiedAt = now,
-            lastPlaybackSuccessAt = now,
-            updatedAt = now,
-            version = maxOf(sourceEntity.version, 1L) + 1L
-        )
-        val resp = executeWithRetry("upsert_stream_source_success", isWrite = true) {
-            api.upsertStreamSource(dto)
-        }
-        val ok = resp?.isSuccessful == true && resp.body()?.success == true
-        if (ok) {
-            writtenDigests["ssrc:${dto.sourceDocKey}"] = dto.stableDigest()
-        } else {
-            lastSuccessReportAt.remove(sourceEntity.sourceDocKey, now)
-        }
-        return ok
     }
 
     suspend fun softDeleteSourceMetadata(sourceEntity: StreamSourceEntity): Boolean {
@@ -686,26 +839,33 @@ class CloudflareD1DataSource(
         )
         val key = "ssrc:${dto.sourceDocKey}"
         val digest = dto.stableDigest()
-        if (writtenDigests[key] == digest) {
+        if (readDigest(key) == digest) {
             metricsTracker.recordD1WriteSkipped()
             return true
         }
-        val resp = executeWithRetry("soft_delete_stream_source", isWrite = true) {
-            api.upsertStreamSource(dto)
+        return withWriteLock(key) {
+            if (readDigest(key) == digest) {
+                metricsTracker.recordD1WriteSkipped()
+                return@withWriteLock true
+            }
+            val resp = executeWithRetry("soft_delete_stream_source", isWrite = true) {
+                api.upsertStreamSource(dto)
+            }
+            val ok = resp?.isSuccessful == true && resp.body()?.success == true
+            if (ok) saveDigest(key, digest)
+            ok
         }
-        val ok = resp?.isSuccessful == true && resp.body()?.success == true
-        if (ok) writtenDigests[key] = digest
-        return ok
     }
 
     private fun rememberAnimeDigest(dto: D1AnimeEntryDto) {
-        writtenDigests["anime:${dto.id}"] = dto.stableDigest()
+        saveDigest("anime:${dto.id}", dto.stableDigest())
     }
 
     fun clearDigestCache() {
         writtenDigests.clear()
         knownAliasesByAnime.clear()
         lastSuccessReportAt.clear()
+        digestStore.clear()
     }
 
     companion object {

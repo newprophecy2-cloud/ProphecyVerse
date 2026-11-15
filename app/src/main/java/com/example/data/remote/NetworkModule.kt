@@ -254,14 +254,20 @@ object NetworkModule {
     @Volatile
     private var diskHttpCache: okhttp3.Cache? = null
 
+    @Volatile
+    private var appContext: android.content.Context? = null
+
     fun initializeHttpCache(context: android.content.Context) {
+        val appCtx = context.applicationContext
+        appContext = appCtx
         if (diskHttpCache != null) return
         synchronized(this) {
             if (diskHttpCache == null) {
-                val cacheDir = java.io.File(context.applicationContext.cacheDir, "prophecy_http_cache")
+                val cacheDir = java.io.File(appCtx.cacheDir, "prophecy_http_cache")
                 diskHttpCache = okhttp3.Cache(cacheDir, 10L * 1024L * 1024L)
             }
         }
+        d1DataSource.attachDigestStore(com.example.data.d1.SharedPreferencesD1DigestStore(appCtx))
     }
 
     private const val D1_BASE_URL = "https://prophecy-verse-db.newprophecy4.workers.dev/v1/"
@@ -332,6 +338,8 @@ object NetworkModule {
     }
 
     val d1DataSource: com.example.data.d1.CloudflareD1DataSource by lazy {
-        com.example.data.d1.CloudflareD1DataSource(d1Api)
+        val store = appContext?.let { com.example.data.d1.SharedPreferencesD1DigestStore(it) }
+            ?: com.example.data.d1.InMemoryD1DigestStore()
+        com.example.data.d1.CloudflareD1DataSource(d1Api, digestStore = store)
     }
 }

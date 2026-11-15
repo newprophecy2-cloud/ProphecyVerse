@@ -250,7 +250,10 @@ object SourceIdentityValidator {
         entity: StreamSourceEntity,
         expectedScopeKey: String,
         expectedSourceId: String? = null,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        expectedProviderId: String? = null,
+        expectedBackendEpisodeId: String? = null,
+        allowedBackendEpisodeIds: Set<String> = emptySet()
     ): SourceValidationResult {
         val normEntityScope = normalizeId(entity.scopeKey)
         val normExpectedScope = normalizeId(expectedScopeKey)
@@ -272,6 +275,50 @@ object SourceIdentityValidator {
                 SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
                 "Cached sourceId '$normEntitySourceId' did not match '$normExpectedSourceId'."
             )
+        }
+        val normEntityProviderId = normalizeId(entity.providerId)
+        if (normEntityProviderId.isEmpty()) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                "Cached source '${normEntitySourceId.ifEmpty { "blank" }}' lacks required providerId."
+            )
+        }
+        val normExpectedProviderId = expectedProviderId?.let(::normalizeId)?.takeIf { it.isNotEmpty() }
+        if (normExpectedProviderId != null && normEntityProviderId != normExpectedProviderId) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                "Cached providerId '$normEntityProviderId' did not match '$normExpectedProviderId'."
+            )
+        }
+        val normDocKey = normalizeId(entity.sourceDocKey)
+        val expectedRawDocKey = "$normExpectedScope|p|$normEntityProviderId|s|$normEntitySourceId"
+        val expectedSanitizedDocKey = "$normExpectedScope|p|$normEntityProviderId|s|${ContentIdentityHelper.sanitizeDocId(normEntitySourceId)}"
+        if (normDocKey.isEmpty() || (normDocKey != expectedRawDocKey && normDocKey != expectedSanitizedDocKey)) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                "Cached sourceDocKey '$normDocKey' did not match scope/provider identity."
+            )
+        }
+        val expectedBackendIds = buildSet {
+            expectedBackendEpisodeId?.let(::normalizeId)?.takeIf { it.isNotEmpty() }?.let(::add)
+            allowedBackendEpisodeIds.map(::normalizeId).filter { it.isNotEmpty() }.forEach(::add)
+        }
+        if (expectedBackendIds.isNotEmpty()) {
+            val normEntityBackendEp = normalizeId(entity.backendEpisodeId)
+            if (normEntityBackendEp.isEmpty()) {
+                return SourceValidationResult.Invalid(
+                    SourceDiagnosticCode.EPISODE_ID_MISMATCH,
+                    "Cached source '$normEntitySourceId' lacks expected backendEpisodeId."
+                )
+            }
+            val backendMatch = normEntityBackendEp in expectedBackendIds ||
+                expectedBackendIds.any { sameTokenCore(it, normEntityBackendEp) }
+            if (!backendMatch) {
+                return SourceValidationResult.Invalid(
+                    SourceDiagnosticCode.EPISODE_ID_MISMATCH,
+                    "Cached backendEpisodeId '$normEntityBackendEp' did not match expected $expectedBackendIds."
+                )
+            }
         }
         if (normEntitySourceId.isEmpty() || entity.status == "REMOVED" || entity.status == "FAILED" || entity.deletedAt != null) {
             return SourceValidationResult.Invalid(

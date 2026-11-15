@@ -34,6 +34,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -842,15 +843,31 @@ class PlayerViewModel(
             flushProgress()
         }
 
+        // Throttle background pre-resolution while active player is buffering/starting playback
+        viewModelScope.launch {
+            combine(
+                playerManager.isBuffering,
+                playerManager.exoPlayerInstance,
+                playerManager.errorMessage
+            ) { buffering, player, err ->
+                buffering && player != null && err == null
+            }.distinctUntilChanged().collect { shouldThrottle ->
+                preResolveManager.setPlaybackBuffering(shouldThrottle)
+            }
+        }
+
         // Report actual playback success to Firestore/Room when ExoPlayer begins playing a source
         viewModelScope.launch {
             playerManager.isPlaying.collect { playing ->
                 val ep = _currentEpisode.value
                 val srcId = activeSourceId
+                val provId = _activeSource.value?.label?.let {
+                    com.example.data.streaming.ContentIdentityHelper.deterministicProviderId(it)
+                }
                 if (playing && ep != null && !srcId.isNullOrBlank()) {
-                    val key = "${ep.id}|$srcId"
+                    val key = "${ep.id}|$srcId|${provId.orEmpty()}"
                     if (reportedSuccessKeys.add(key)) {
-                        repository.reportPlaybackSuccess(animeId, srcId, ep.seasonNumber, ep.episodeNumber)
+                        repository.reportPlaybackSuccess(animeId, srcId, ep.seasonNumber, ep.episodeNumber, provId)
                     }
                 }
             }
@@ -1089,10 +1106,7 @@ class PlayerViewModel(
                     }
                 }
 
-                // Recalculate/cancel obsolete pre-resolution work when episode changes (excluded for Movies)
-                preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = isMovieTarget)
-
-                // 3. Fast-Path: Check pre-resolve cache for instant episode start
+                // 3. Fast-Path: Check pre-resolve cache BEFORE sliding window so prepared or in-flight work is reused
                 if (normPreferredSource == null && !isMovieTarget) {
                     val prepared = preResolveManager.getPreparedSource(animeId, episode)
                     if (requestGeneration != playbackGeneration) return@launch
@@ -1120,7 +1134,7 @@ class PlayerViewModel(
                                         _isResolving.value = true
                                         _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
                                         repository.invalidateFailedCachedPlayback(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id
+                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id, prepared.providerId
                                         )
                                         val freshSources = repository.discoverStreamsForScope(
                                             animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
@@ -1143,7 +1157,7 @@ class PlayerViewModel(
                                         _isResolving.value = true
                                         _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
                                         repository.invalidateFailedCachedPlayback(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id
+                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id, prepared.providerId
                                         )
                                         val refreshedSources = repository.discoverStreamsForScope(
                                             animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
@@ -1164,14 +1178,17 @@ class PlayerViewModel(
                             sourceQuality = prepared.source.quality,
                             resolveDurationMs = 0L
                         )
+                        preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
                         return@launch
                     }
                 }
 
                 // Cache-first resolution: Memory -> Room -> D1/Firestore -> Bounded Concurrent Resolve
+                // Note: Called with isForeground = true BEFORE slideWindow so any active background resolution
+                // for this episode is promoted to foreground priority instead of cancelled.
                 _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
                 val sharedResult = repository.resolveVerifiedPlaybackForEpisode(
-                    animeId, episode, normPreferredSource
+                    animeId, episode, normPreferredSource, isForeground = true
                 )
                 val sharedResolution = sharedResult.getOrNull()
                 if (sharedResolution != null) {
@@ -1191,6 +1208,9 @@ class PlayerViewModel(
                         requestGeneration = requestGeneration,
                         preResolved = sharedResolution
                     )
+                    if (requestGeneration == playbackGeneration && !isMovieTarget) {
+                        preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
+                    }
                     return@launch
                 }
 
@@ -1238,6 +1258,9 @@ class PlayerViewModel(
                     startPositionOverrideMs = startPositionOverrideMs,
                     requestGeneration = requestGeneration
                 )
+                if (requestGeneration == playbackGeneration && !isMovieTarget && _resolutionError.value == null) {
+                    preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
+                }
             } finally {
                 com.example.data.repository.EpisodeResolutionCoordinator.endForegroundResolution()
             }
@@ -1298,13 +1321,18 @@ class PlayerViewModel(
                 lastError = "Source candidate has no usable source ID."
                 continue
             }
+            val providerId = com.example.data.streaming.ContentIdentityHelper.deterministicProviderId(source.label)
             activeSourceId = source.id
             _activeSource.value = source
 
             var resolvedDurationMs = 0L
             var resolvedFromCache = false
             val matchesPreResolved = i == 0 && !forceFresh && preResolved != null &&
-                com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(preResolved.source.id, source.id)
+                com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(preResolved.source.id, source.id) &&
+                com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(
+                    com.example.data.streaming.ContentIdentityHelper.deterministicProviderId(preResolved.source.label),
+                    providerId
+                )
             _resolutionStage.value = if (matchesPreResolved) ResolutionStage.VALIDATING_SOURCE else ResolutionStage.RESOLVING_PLAYBACK
 
             var playRes = if (matchesPreResolved && preResolved != null) {
@@ -1316,7 +1344,8 @@ class PlayerViewModel(
                     targetAnimeId,
                     episode,
                     preferredSourceId = source.id,
-                    forceResolveFresh = forceFresh
+                    forceResolveFresh = forceFresh,
+                    preferredProviderId = providerId
                 ).map {
                     resolvedDurationMs = it.resolveDurationMs
                     resolvedFromCache = it.cacheTier != "BACKEND_RESOLVE"
@@ -1335,7 +1364,8 @@ class PlayerViewModel(
                     targetAnimeId,
                     episode,
                     preferredSourceId = source.id,
-                    forceResolveFresh = true
+                    forceResolveFresh = true,
+                    preferredProviderId = providerId
                 ).map {
                     resolvedDurationMs = it.resolveDurationMs
                     resolvedFromCache = false
@@ -1385,9 +1415,9 @@ class PlayerViewModel(
                             playbackResolutionJob = viewModelScope.launch {
                                 if (resolvedFromCache) {
                                     repository.invalidateFailedCachedPlayback(
-                                        targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id
+                                        targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id, providerId
                                     )
-                                    if (retriedSourceIds.add("cache_refresh:${source.id}")) {
+                                    if (retriedSourceIds.add("cache_refresh:${providerId}:${source.id}")) {
                                         _isResolving.value = true
                                         _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
                                         resolveWithFallback(
@@ -1418,14 +1448,14 @@ class PlayerViewModel(
                     },
                     onRetryNeeded = {
                         if (requestGeneration == playbackGeneration &&
-                            (retriedSourceGeneration != requestGeneration || retriedSourceIds.add(source.id))) {
+                            (retriedSourceGeneration != requestGeneration || retriedSourceIds.add("${providerId}:${source.id}"))) {
                             retriedSourceGeneration = requestGeneration
                             playbackResolutionJob?.cancel()
                             playbackResolutionJob = viewModelScope.launch {
                                 _isResolving.value = true
                                 _resolutionStage.value = ResolutionStage.FINDING_SOURCES
                                 repository.invalidateFailedCachedPlayback(
-                                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id
+                                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id, providerId
                                 )
                                 val refreshedSources = repository.discoverStreamsForScope(
                                     targetAnimeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true

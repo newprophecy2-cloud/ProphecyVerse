@@ -1739,13 +1739,14 @@ class AnimeRepository(
         }
 
         clearSourceFailure(cacheKey)
-        val backendEpMap = aggregatedCandidates.associate { SourceIdentityValidator.normalizeId(it.second.id) to it.first }
+        val backendEpMap = aggregatedCandidates.associate {
+            "${ContentIdentityHelper.deterministicProviderId(it.second.label)}|${SourceIdentityValidator.normalizeId(it.second.id)}" to it.first
+        }
         val now = System.currentTimeMillis()
 
         val allExistingSources = streamCacheDao.getAllSources(scopeKey)
         val existingProvidersByKey = streamCacheDao.getAllProviders(scopeKey).associateBy { it.providerDocKey }
         val existingByComposite = allExistingSources.associateBy { "${it.providerId}|${SourceIdentityValidator.normalizeId(it.sourceId)}" }
-        val existingBySourceIdGroups = allExistingSources.groupBy { SourceIdentityValidator.normalizeId(it.sourceId) }
         val sourceEntities = mutableListOf<StreamSourceEntity>()
         val providersMap = linkedMapOf<String, MutableList<StreamSourceEntity>>()
         val seenProviderSourcePairs = HashSet<String>()
@@ -1757,7 +1758,6 @@ class AnimeRepository(
             val compositeKey = "$providerId|${dto.id}"
             if (!seenProviderSourcePairs.add(compositeKey)) continue
             val prev = existingByComposite[compositeKey]
-                ?: existingBySourceIdGroups[dto.id]?.singleOrNull()
             val effectiveExpiresAt = dto.expiresAt ?: prev?.expiresAt
             val validUrl = prev?.streamUrl?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) }
             val resolvedStatus = if (validUrl != null && !SourceExpiryTime.isExpiredOrInvalid(effectiveExpiresAt)) {
@@ -1767,7 +1767,9 @@ class AnimeRepository(
             } else {
                 StreamRecordStatus.MISSING_URL.name
             }
-            val resolvedBackendEpId = backendEpMap[dto.id] ?: prev?.backendEpisodeId
+            val persistedUrl = if (resolvedStatus == StreamRecordStatus.AVAILABLE.name) validUrl else null
+            val persistedSafeHeaders = if (resolvedStatus == StreamRecordStatus.AVAILABLE.name) prev?.safeHeadersJson else null
+            val resolvedBackendEpId = backendEpMap[compositeKey] ?: prev?.backendEpisodeId
             val resolvedQuality = dto.quality ?: prev?.quality
             val resolvedCodec = dto.codec ?: prev?.codec
             val resolvedLang = dto.language ?: prev?.audioLanguage
@@ -1776,7 +1778,8 @@ class AnimeRepository(
             val sourceChanged = prev == null ||
                 prev.sourceName != dto.displayProviderName ||
                 prev.backendEpisodeId != resolvedBackendEpId ||
-                prev.streamUrl != validUrl ||
+                prev.streamUrl != persistedUrl ||
+                prev.safeHeadersJson != persistedSafeHeaders ||
                 prev.quality != resolvedQuality ||
                 prev.codec != resolvedCodec ||
                 prev.audioLanguage != resolvedLang ||
@@ -1792,7 +1795,7 @@ class AnimeRepository(
                 sourceId = dto.id,
                 sourceName = dto.displayProviderName,
                 backendEpisodeId = resolvedBackendEpId,
-                streamUrl = validUrl,
+                streamUrl = persistedUrl,
                 urlType = prev?.urlType ?: "direct",
                 contentType = prev?.contentType,
                 quality = resolvedQuality,
@@ -1800,7 +1803,7 @@ class AnimeRepository(
                 audioLanguage = resolvedLang,
                 downloadable = resolvedDownloadable,
                 sizeBytes = resolvedSizeBytes,
-                safeHeadersJson = prev?.safeHeadersJson,
+                safeHeadersJson = persistedSafeHeaders,
                 expiresAt = effectiveExpiresAt,
                 status = resolvedStatus,
                 version = if (sourceChanged) (prev?.version ?: 0L) + 1L else (prev?.version ?: 1L),
@@ -2392,10 +2395,12 @@ class AnimeRepository(
         catalogEpisodeId: String? = null,
         preferredSourceId: String? = null,
         forceResolveFresh: Boolean = false,
-        allowFallbackToOtherSources: Boolean = preferredSourceId.isNullOrBlank()
+        allowFallbackToOtherSources: Boolean = preferredSourceId.isNullOrBlank(),
+        preferredProviderId: String? = null
     ): Result<ResolvedStreamPlayback> = withContext(Dispatchers.IO) {
         val playbackResolveStarted = MonotonicMetrics.nowMs()
         val normPreferred = preferredSourceId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
+        val normPreferredProvider = preferredProviderId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
         val anime = animeDao.getAnimeById(animeId)
         val identity = ContentIdentityHelper.resolveCanonicalIdentity(animeId, anime, seasonNumber, episodeNumber)
         val isMovie = identity.isMovie
@@ -2418,12 +2423,67 @@ class AnimeRepository(
             }
         }
 
+        val epRecord = if (isMovie) null else streamCacheDao.getEpisode("$contentKey:s$effectiveSeason:e$effectiveEpisode")
+        val catalogEpisode = catalogEpisodeId?.let { episodeDao.getEpisodeById(it) }
+        val knownBackendEpisodeIds = buildSet {
+            catalogEpisode?.let { ep ->
+                EpisodeSourceEpisodeIds.decode(ep.sourceEpisodeIds).forEach { id ->
+                    val norm = SourceIdentityValidator.normalizeId(id)
+                    if (norm.isNotEmpty() && !norm.startsWith("anilist_ep_") && !norm.startsWith("movie_")) {
+                        add(norm)
+                    }
+                }
+            }
+            epRecord?.let { rec ->
+                SourceIdentityValidator.normalizeId(rec.backendEpisodeId)
+                    .takeIf { it.isNotEmpty() && !it.startsWith("anilist_ep_") && !it.startsWith("movie_") }
+                    ?.let(::add)
+                EpisodeSourceEpisodeIds.decode(rec.backendSourceEpisodeIds).forEach { id ->
+                    val norm = SourceIdentityValidator.normalizeId(id)
+                    if (norm.isNotEmpty() && !norm.startsWith("anilist_ep_") && !norm.startsWith("movie_")) {
+                        add(norm)
+                    }
+                }
+            }
+        }
+
+        fun matchesPreferred(entity: StreamSourceEntity): Boolean {
+            if (normPreferred != null && !SourceIdentityValidator.normalizedIdsEqual(entity.sourceId, normPreferred)) {
+                return false
+            }
+            if (normPreferredProvider != null && !SourceIdentityValidator.normalizedIdsEqual(entity.providerId, normPreferredProvider)) {
+                return false
+            }
+            return true
+        }
+
+        fun filterRemainingCandidates(all: List<ProphecySourceDto>, winner: ProphecySourceDto, winnerProviderId: String): List<ProphecySourceDto> {
+            return listOf(winner) + all.filterNot {
+                SourceIdentityValidator.normalizedIdsEqual(it.id, winner.id) &&
+                    SourceIdentityValidator.normalizedIdsEqual(
+                        ContentIdentityHelper.deterministicProviderId(it.label),
+                        winnerProviderId
+                    )
+            }
+        }
+
         // Order sources consistently; when preferredSourceId is requested strictly, never return a different cached source
-        val orderedRoomSources = orderSourcesForPlayback(roomSources, normPreferred)
+        val orderedRoomSources = orderSourcesForPlayback(roomSources, normPreferred, normPreferredProvider)
         val candidatesDto = orderedRoomSources.map { SourceIdentityValidator.normalizeDto(it.toProphecyDto()) }
         val cacheCheckPool = when {
-            normPreferred != null -> orderedRoomSources.filter {
-                SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normPreferred)
+            normPreferred != null -> {
+                val matching = orderedRoomSources.filter(::matchesPreferred)
+                if (normPreferredProvider == null && matching.map { it.providerId }.distinct().size > 1) {
+                    SourceIdentityValidator.recordDiagnostic(
+                        code = SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                        scopeKey = scopeKey,
+                        sourceId = normPreferred,
+                        detail = "Ambiguous cached sources share sourceId without providerId"
+                    )
+                    emptyList()
+                } else {
+                    matching
+                }
             }
             else -> orderedRoomSources
         }
@@ -2431,7 +2491,13 @@ class AnimeRepository(
         // 1. Check Room/synced Stream URL cache (unless explicit forceResolveFresh requested after failure)
         if (!forceResolveFresh) {
             for (cachedSource in cacheCheckPool) {
-                val cachedValidation = SourceIdentityValidator.validateCachedSourceEntity(cachedSource, scopeKey, normPreferred)
+                val cachedValidation = SourceIdentityValidator.validateCachedSourceEntity(
+                    entity = cachedSource,
+                    expectedScopeKey = scopeKey,
+                    expectedSourceId = normPreferred ?: cachedSource.sourceId,
+                    expectedProviderId = normPreferredProvider ?: cachedSource.providerId,
+                    allowedBackendEpisodeIds = knownBackendEpisodeIds
+                )
                 if (cachedValidation is SourceValidationResult.Invalid) {
                     if (SafePlaybackHeaders.isValidStreamUrl(cachedSource.streamUrl)) {
                         SourceIdentityValidator.recordDiagnostic(
@@ -2441,6 +2507,10 @@ class AnimeRepository(
                             providerLabel = cachedSource.sourceName,
                             detail = cachedValidation.reason
                         )
+                    }
+                    if (cachedSource.streamUrl != null && (cachedValidation.code == SourceDiagnosticCode.SOURCE_EXPIRED || !SafePlaybackHeaders.isValidStreamUrl(cachedSource.streamUrl))) {
+                        memoryCache.invalidatePlayback(cachedSource.sourceId, scopeKey, cachedSource.providerId)
+                        runCatching { streamCacheDao.evictExpiredStreamUrl(cachedSource.sourceDocKey, System.currentTimeMillis()) }
                     }
                     continue
                 }
@@ -2453,9 +2523,7 @@ class AnimeRepository(
                     ResolvedStreamPlayback(
                         source = normDto,
                         directData = data,
-                        candidates = listOf(normDto) + candidatesDto.filterNot {
-                            SourceIdentityValidator.normalizedIdsEqual(it.id, normDto.id)
-                        },
+                        candidates = filterRemainingCandidates(candidatesDto, normDto, cachedSource.providerId),
                         fromCache = true,
                         cacheTier = resolvedTier,
                         resolveDurationMs = elapsed
@@ -2478,15 +2546,27 @@ class AnimeRepository(
                 if (firestoreData != null) {
                     val orderedFs = orderSourcesForPlayback(
                         firestoreData.sources.filter { it.status != "REMOVED" && it.deletedAt == null },
-                        normPreferred
+                        normPreferred,
+                        normPreferredProvider
                     )
                     val fsPool = if (normPreferred != null) {
-                        orderedFs.filter { SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normPreferred) }
+                        val matching = orderedFs.filter(::matchesPreferred)
+                        if (normPreferredProvider == null && matching.map { it.providerId }.distinct().size > 1) {
+                            emptyList()
+                        } else {
+                            matching
+                        }
                     } else {
                         orderedFs
                     }
                     for (fsSource in fsPool) {
-                        val fsValidation = SourceIdentityValidator.validateCachedSourceEntity(fsSource, scopeKey, normPreferred)
+                        val fsValidation = SourceIdentityValidator.validateCachedSourceEntity(
+                            entity = fsSource,
+                            expectedScopeKey = scopeKey,
+                            expectedSourceId = normPreferred ?: fsSource.sourceId,
+                            expectedProviderId = normPreferredProvider ?: fsSource.providerId,
+                            allowedBackendEpisodeIds = knownBackendEpisodeIds
+                        )
                         if (fsValidation !is SourceValidationResult.Valid) continue
                         val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=FIRESTORE")
                         val normDto = SourceIdentityValidator.normalizeDto(fsSource.toProphecyDto())
@@ -2495,9 +2575,7 @@ class AnimeRepository(
                             ResolvedStreamPlayback(
                                 source = normDto,
                                 directData = fsSource.toDirectPlayData(),
-                                candidates = listOf(normDto) + fsCandidates.filterNot {
-                                    SourceIdentityValidator.normalizedIdsEqual(it.id, normDto.id)
-                                },
+                                candidates = filterRemainingCandidates(fsCandidates, normDto, fsSource.providerId),
                                 fromCache = true,
                                 cacheTier = "FIRESTORE",
                                 resolveDurationMs = elapsed
@@ -2509,13 +2587,11 @@ class AnimeRepository(
         }
 
         // Re-read after Firestore sync
-        val refreshedRoomSources = orderSourcesForPlayback(streamCacheDao.getActiveSources(scopeKey), normPreferred)
+        val refreshedRoomSources = orderSourcesForPlayback(streamCacheDao.getActiveSources(scopeKey), normPreferred, normPreferredProvider)
         val allCandidates = refreshedRoomSources.map { SourceIdentityValidator.normalizeDto(it.toProphecyDto()) }
 
         val targetSources = if (normPreferred != null && !allowFallbackToOtherSources) {
-            refreshedRoomSources.filter {
-                SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normPreferred)
-            }
+            refreshedRoomSources.filter(::matchesPreferred)
         } else {
             refreshedRoomSources.filter { SourceIdentityValidator.normalizeId(it.sourceId).isNotEmpty() }
         }
@@ -2565,7 +2641,14 @@ class AnimeRepository(
                     ).data
                     val peerHit = peerSync?.sources?.firstOrNull {
                         SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normSourceId) &&
-                            SourceIdentityValidator.validateCachedSourceEntity(it, scopeKey, normSourceId).isValid
+                            SourceIdentityValidator.normalizedIdsEqual(it.providerId, sourceEntity.providerId) &&
+                            SourceIdentityValidator.validateCachedSourceEntity(
+                                entity = it,
+                                expectedScopeKey = scopeKey,
+                                expectedSourceId = normSourceId,
+                                expectedProviderId = sourceEntity.providerId,
+                                allowedBackendEpisodeIds = knownBackendEpisodeIds
+                            ).isValid
                     }
                     if (peerHit != null) {
                         val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=FIRESTORE")
@@ -2574,9 +2657,7 @@ class AnimeRepository(
                             ResolvedStreamPlayback(
                                 source = normDto,
                                 directData = peerHit.toDirectPlayData(),
-                                candidates = listOf(normDto) + allCandidates.filterNot {
-                                    SourceIdentityValidator.normalizedIdsEqual(it.id, normDto.id)
-                                },
+                                candidates = filterRemainingCandidates(allCandidates, normDto, peerHit.providerId),
                                 fromCache = true,
                                 cacheTier = "FIRESTORE",
                                 resolveDurationMs = elapsed
@@ -2605,7 +2686,12 @@ class AnimeRepository(
 
             var finalLeaseStatus = "FAILED"
             try {
-                val res = resolveDirectPlayback(normSourceId, forceRefresh = forceResolveFresh, scopeKey = scopeKey)
+                val res = resolveDirectPlayback(
+                    sourceId = normSourceId,
+                    forceRefresh = forceResolveFresh,
+                    scopeKey = scopeKey,
+                    providerId = sourceEntity.providerId
+                )
                 val playData = res.getOrNull()
                 if (playData != null) {
                     val validateStarted = MonotonicMetrics.nowMs()
@@ -2644,9 +2730,7 @@ class AnimeRepository(
                             ResolvedStreamPlayback(
                                 source = normDto,
                                 directData = sanitizedData,
-                                candidates = listOf(normDto) + allCandidates.filterNot {
-                                    SourceIdentityValidator.normalizedIdsEqual(it.id, normDto.id)
-                                },
+                                candidates = filterRemainingCandidates(allCandidates, normDto, sourceEntity.providerId),
                                 fromCache = false,
                                 cacheTier = "BACKEND_RESOLVE",
                                 resolveDurationMs = elapsed
@@ -2771,12 +2855,20 @@ class AnimeRepository(
         animeId: String,
         sourceId: String,
         seasonNumber: Int = 1,
-        episodeNumber: Int = 1
+        episodeNumber: Int = 1,
+        providerId: String? = null
     ) = withContext(Dispatchers.IO) {
+        val normSource = SourceIdentityValidator.normalizeId(sourceId)
+        val normProvider = providerId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
         val anime = animeDao.getAnimeById(animeId)
         val identity = ContentIdentityHelper.resolveCanonicalIdentity(animeId, anime, seasonNumber, episodeNumber)
         val scopeKey = ContentIdentityHelper.scopeKey(identity.contentKey, identity.isMovie, identity.seasonNumber, identity.episodeNumber)
-        val entity = streamCacheDao.getActiveSources(scopeKey).firstOrNull { it.sourceId == sourceId } ?: return@withContext
+        val matching = streamCacheDao.getActiveSources(scopeKey).filter {
+            SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normSource) &&
+                (normProvider == null || SourceIdentityValidator.normalizedIdsEqual(it.providerId, normProvider))
+        }
+        val entity = if (matching.size == 1 || normProvider != null) matching.firstOrNull() else null
+        entity ?: return@withContext
         val ok = streamingRepository.recordPlaybackSuccess(
             sourceEntity = entity,
             contentKey = identity.contentKey,
@@ -2855,13 +2947,19 @@ class AnimeRepository(
 
     private fun orderSourcesForPlayback(
         sources: List<StreamSourceEntity>,
-        preferredSourceId: String?
+        preferredSourceId: String?,
+        preferredProviderId: String? = null
     ): List<StreamSourceEntity> {
         val active = sources.filter { it.status != "REMOVED" && it.deletedAt == null }
         val normPref = preferredSourceId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
+        val normProv = preferredProviderId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
         if (normPref != null) {
             return active.sortedWith(
-                compareBy<StreamSourceEntity> { if (SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normPref)) 0 else 1 }
+                compareBy<StreamSourceEntity> {
+                    val matchesSource = SourceIdentityValidator.normalizedIdsEqual(it.sourceId, normPref)
+                    val matchesProvider = normProv == null || SourceIdentityValidator.normalizedIdsEqual(it.providerId, normProv)
+                    if (matchesSource && matchesProvider) 0 else 1
+                }
                     .thenByDescending { SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) && !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) }
                     .thenByDescending { it.lastPlaybackSuccessAt ?: 0L }
                     .thenByDescending { qualityRank(it.quality) }
@@ -3099,15 +3197,17 @@ class AnimeRepository(
     suspend fun resolveDirectPlayback(
         sourceId: String,
         forceRefresh: Boolean = false,
-        scopeKey: String? = null
+        scopeKey: String? = null,
+        providerId: String? = null
     ): Result<DirectPlayData> = withContext(Dispatchers.IO) {
         val normSourceId = SourceIdentityValidator.normalizeId(sourceId)
         val normScope = scopeKey?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
+        val normProvider = providerId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
         if (normSourceId.isEmpty()) return@withContext Result.failure(
             SourceResolutionDiagnosticException(SourceDiagnosticCode.SOURCE_NOT_PLAYABLE, "Source ID is blank")
         )
 
-        val flightKey = "${normScope.orEmpty()}::$normSourceId::fresh=$forceRefresh"
+        val flightKey = "${normScope.orEmpty()}::${normProvider.orEmpty()}::$normSourceId::fresh=$forceRefresh"
         while (true) {
             val existing = inFlightDirectResolve[flightKey]
             if (existing != null) {
@@ -3117,7 +3217,7 @@ class AnimeRepository(
             val created = CompletableDeferred<Result<DirectPlayData>>()
             if (inFlightDirectResolve.putIfAbsent(flightKey, created) == null) {
                 try {
-                    val computed = executeResolveDirectPlayback(normSourceId, forceRefresh, normScope)
+                    val computed = executeResolveDirectPlayback(normSourceId, forceRefresh, normScope, normProvider)
                     created.complete(computed)
                     return@withContext computed
                 } catch (cancelled: CancellationException) {
@@ -3139,25 +3239,46 @@ class AnimeRepository(
     private suspend fun executeResolveDirectPlayback(
         normSourceId: String,
         forceRefresh: Boolean,
-        normScope: String?
+        normScope: String?,
+        normProvider: String?
     ): Result<DirectPlayData> {
         if (forceRefresh) {
-            memoryCache.invalidatePlayback(normSourceId, normScope)
+            memoryCache.invalidatePlayback(normSourceId, normScope, normProvider)
         } else {
-            memoryCache.getResolvedPlayback(normSourceId, normScope)?.let { cachedMem ->
+            memoryCache.getResolvedPlayback(normSourceId, normScope, normProvider)?.let { cachedMem ->
                 if (SourceIdentityValidator.validateDirectPlayData(cachedMem, normSourceId).isValid) {
                     return Result.success(cachedMem)
                 }
-                memoryCache.invalidatePlayback(normSourceId, normScope)
+                memoryCache.invalidatePlayback(normSourceId, normScope, normProvider)
             }
-            val roomSource = if (normScope != null) {
-                streamCacheDao.getLatestActiveSourceInScope(normScope, normSourceId)
-            } else {
-                streamCacheDao.getLatestActiveSourceBySourceId(normSourceId)
+            val roomSource = when {
+                normScope != null && normProvider != null -> {
+                    streamCacheDao.getLatestActiveSourceForProviderInScope(normScope, normProvider, normSourceId)
+                }
+                normScope != null -> {
+                    val matches = streamCacheDao.getActiveSourcesForSourceIdInScope(normScope, normSourceId)
+                    if (matches.map { it.providerId }.distinct().size > 1) {
+                        SourceIdentityValidator.recordDiagnostic(
+                            code = SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                            scopeKey = normScope,
+                            sourceId = normSourceId,
+                            detail = "Skipped ambiguous Room source without providerId"
+                        )
+                        null
+                    } else {
+                        matches.firstOrNull()
+                    }
+                }
+                else -> streamCacheDao.getLatestActiveSourceBySourceId(normSourceId)
             }
             if (roomSource != null) {
                 val roomValid = if (normScope != null) {
-                    SourceIdentityValidator.validateCachedSourceEntity(roomSource, normScope, normSourceId).isValid
+                    SourceIdentityValidator.validateCachedSourceEntity(
+                        entity = roomSource,
+                        expectedScopeKey = normScope,
+                        expectedSourceId = normSourceId,
+                        expectedProviderId = normProvider
+                    ).isValid
                 } else {
                     SafePlaybackHeaders.isValidStreamUrl(roomSource.streamUrl) &&
                         !SourceExpiryTime.isExpiredOrInvalid(roomSource.expiresAt)
@@ -3165,8 +3286,12 @@ class AnimeRepository(
                 if (roomValid) {
                     metricsTracker.recordRoomHit()
                     val playData = roomSource.toDirectPlayData().copy(sourceId = normSourceId)
-                    memoryCache.putResolvedPlayback(normSourceId, playData, normScope)
+                    memoryCache.putResolvedPlayback(normSourceId, playData, normScope, normProvider ?: roomSource.providerId)
                     return Result.success(playData)
+                }
+                if (roomSource.streamUrl != null && (roomSource.status == StreamRecordStatus.EXPIRED.name || SourceExpiryTime.isExpiredOrInvalid(roomSource.expiresAt) || !SafePlaybackHeaders.isValidStreamUrl(roomSource.streamUrl))) {
+                    memoryCache.invalidatePlayback(normSourceId, normScope, normProvider ?: roomSource.providerId)
+                    runCatching { streamCacheDao.evictExpiredStreamUrl(roomSource.sourceDocKey, System.currentTimeMillis()) }
                 }
             }
             metricsTracker.recordRoomMiss()
@@ -3238,7 +3363,7 @@ class AnimeRepository(
                 }
                 SourceValidationResult.Valid -> Unit
             }
-            memoryCache.putResolvedPlayback(normSourceId, requestReady, normScope)
+            memoryCache.putResolvedPlayback(normSourceId, requestReady, normScope, normProvider)
             directRetryMutex.withLock { directRetryStates.remove(normSourceId) }
             Result.success(requestReady)
         } catch (cancelled: CancellationException) {
@@ -3271,10 +3396,10 @@ class AnimeRepository(
         }
     }
 
-    fun invalidateDirectPlayback(sourceId: String, scopeKey: String? = null) {
+    fun invalidateDirectPlayback(sourceId: String, scopeKey: String? = null, providerId: String? = null) {
         val normSourceId = SourceIdentityValidator.normalizeId(sourceId)
         if (normSourceId.isNotEmpty()) {
-            memoryCache.invalidatePlayback(normSourceId, scopeKey)
+            memoryCache.invalidatePlayback(normSourceId, scopeKey, providerId)
         }
     }
 
@@ -3282,21 +3407,31 @@ class AnimeRepository(
         animeId: String,
         seasonNumber: Int,
         episodeNumber: Int,
-        sourceId: String
+        sourceId: String,
+        providerId: String? = null
     ) = withContext(Dispatchers.IO) {
         val normSourceId = SourceIdentityValidator.normalizeId(sourceId)
+        val normProvider = providerId?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
         if (normSourceId.isEmpty()) return@withContext
         val anime = animeDao.getAnimeById(animeId)
         val scopeKey = SourceIdentityValidator.scopeForEpisode(animeId, anime, seasonNumber, episodeNumber)
-        memoryCache.invalidatePlayback(normSourceId, scopeKey)
-        memoryCache.invalidatePlayback(normSourceId, null)
+        memoryCache.invalidatePlayback(normSourceId, scopeKey, normProvider)
+        if (normProvider == null) {
+            memoryCache.invalidatePlayback(normSourceId, null, null)
+        }
         runCatching {
-            streamCacheDao.invalidateCachedStreamUrl(scopeKey, normSourceId, System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            if (normProvider != null) {
+                streamCacheDao.invalidateCachedStreamUrlForProvider(scopeKey, normProvider, normSourceId, now)
+            } else {
+                streamCacheDao.invalidateCachedStreamUrl(scopeKey, normSourceId, now)
+            }
         }
         SourceIdentityValidator.recordDiagnostic(
             code = SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
             scopeKey = scopeKey,
             sourceId = normSourceId,
+            providerLabel = normProvider,
             detail = "Invalidated failed cached stream URL before fresh resolve"
         )
     }

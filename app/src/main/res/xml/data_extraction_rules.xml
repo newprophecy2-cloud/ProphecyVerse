@@ -6,8 +6,18 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="prophecy_install_prefs.xml" />
+        <exclude domain="sharedpref" path="prophecy_d1_digests.xml" />
+        <exclude domain="database" path="prophecyverse.db" />
+        <exclude domain="database" path="prophecyverse.db-wal" />
+        <exclude domain="database" path="prophecyverse.db-shm" />
+        <exclude domain="database" path="prophecyverse.db-journal" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="prophecy_install_prefs.xml" />
+        <exclude domain="sharedpref" path="prophecy_d1_digests.xml" />
+        <exclude domain="database" path="prophecyverse.db" />
+        <exclude domain="database" path="prophecyverse.db-wal" />
+        <exclude domain="database" path="prophecyverse.db-shm" />
+        <exclude domain="database" path="prophecyverse.db-journal" />
     </device-transfer>
 </data-extraction-rules>

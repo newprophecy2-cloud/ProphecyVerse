@@ -15,9 +15,10 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -43,6 +44,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.ArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 @OptIn(UnstableApi::class)
 class PlayerManager(
@@ -53,6 +57,7 @@ class PlayerManager(
     private var tickerJob: Job? = null
     private var playbackGeneration: Long = 0L
     private var activeSession: PlaybackSessionIdentity? = null
+    private var networkTracker: PlaybackNetworkTracker? = null
 
     private val _exoPlayerInstance = MutableStateFlow<ExoPlayer?>(null)
     val exoPlayerInstance: StateFlow<ExoPlayer?> = _exoPlayerInstance.asStateFlow()
@@ -153,7 +158,13 @@ class PlayerManager(
         val videoResolution: String? = null,
         val activeAudioDecoder: String? = null,
         val failureCategory: PlaybackFailureCategory? = null,
-        val lastErrorMessage: String? = null
+        val lastErrorMessage: String? = null,
+        val ttfbMs: Long? = null,
+        val bytesTransferred: Long = 0L,
+        val throughputKbps: Long? = null,
+        val lastHttpStatusCode: Int? = null,
+        val supportsByteRanges: Boolean? = null,
+        val retryCount: Int = 0
     )
 
     fun initializePlayer(
@@ -171,6 +182,7 @@ class PlayerManager(
         activeSession = sessionIdentity?.copy(generation = generation)
         onRetryRequested = onRetryNeeded
         onPlaybackFailedCallback = onPlaybackFailed
+        retryCount = 0
         _errorMessage.value = null
         _activeAudioDecoder.value = null
         _isPlaybackEnded.value = false
@@ -185,13 +197,25 @@ class PlayerManager(
             contentType = directData.contentType,
             resolveDurationMs = resolveDurationMs.coerceAtLeast(0L)
         )
+        val tracker = PlaybackNetworkTracker { snap ->
+            if (generation == playbackGeneration) {
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                    ttfbMs = snap.ttfbMs,
+                    bytesTransferred = snap.bytesTransferred,
+                    throughputKbps = snap.throughputKbps,
+                    lastHttpStatusCode = snap.lastHttpStatusCode,
+                    supportsByteRanges = snap.supportsByteRanges
+                )
+            }
+        }
+        networkTracker = tracker
         Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
 
-        // Build safe HTTP DataSource with response-authorized headers
-        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+        // Build safe HTTP DataSource with response-authorized headers and bounded timeouts
+        val rawHttpFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(20000)
-            .setReadTimeoutMs(30000)
+            .setConnectTimeoutMs(HTTP_CONNECT_TIMEOUT_MS)
+            .setReadTimeoutMs(HTTP_READ_TIMEOUT_MS)
 
         val headerMap = mutableMapOf<String, String>()
         var userAgentConfigured = false
@@ -203,7 +227,7 @@ class PlayerManager(
                     if (key.isBlank() || value.contains('\r') || value.contains('\n') ||
                         isRedirectSensitiveHeader(key)) continue
                     if (key.equals("User-Agent", ignoreCase = true)) {
-                        httpDataSourceFactory.setUserAgent(value)
+                        rawHttpFactory.setUserAgent(value)
                         userAgentConfigured = true
                     } else {
                         headerMap[key] = value
@@ -222,14 +246,16 @@ class PlayerManager(
 
         // Many CDNs (Cloudflare, Akamai, storage buckets) return 403 when User-Agent is unknown or mobile bot
         if (!userAgentConfigured) {
-            httpDataSourceFactory.setUserAgent(
+            rawHttpFactory.setUserAgent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         }
 
         if (headerMap.isNotEmpty()) {
-            httpDataSourceFactory.setDefaultRequestProperties(headerMap)
+            rawHttpFactory.setDefaultRequestProperties(headerMap)
         }
+
+        val httpDataSourceFactory = DiagnosticHttpDataSourceFactory(rawHttpFactory, tracker)
 
         // Configure universal DataSource (supporting redirects, files, content, http/https)
         val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
@@ -377,6 +403,7 @@ class PlayerManager(
                             _duration.value = dur
                         }
                         retryCount = 0
+                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = 0)
                         if (!player.isPlaying && player.playWhenReady) {
                             player.play()
                         }
@@ -471,6 +498,7 @@ class PlayerManager(
 
                 if (isResolvableHttp && retryCount < 1) {
                     retryCount++
+                    _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = retryCount)
                     _errorMessage.value = "Playback link expired or connection dropped. Refreshing..."
                     onRetryRequested?.invoke()
                 } else if (onPlaybackFailedCallback != null) {
@@ -739,6 +767,7 @@ class PlayerManager(
         tickerJob?.cancel()
         tickerJob = scope.launch(Dispatchers.Main) {
             var bufferingSeconds = 0
+            var stallFallbackTriggered = false
             while (isActive) {
                 exoPlayer?.let { player ->
                     val dur = player.duration
@@ -752,16 +781,35 @@ class PlayerManager(
 
                     if (player.isPlaying) {
                         bufferingSeconds = 0
+                        stallFallbackTriggered = false
                         activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
                     } else if (player.playbackState == Player.STATE_BUFFERING) {
                         bufferingSeconds++
-                        // If buffering persists for 15s without playing, auto fallback to next source
-                        if (bufferingSeconds >= 15) {
+                        val lastTransferAtMs = networkTracker?.lastTransferAtMs() ?: 0L
+                        val hasRecentTransfer = lastTransferAtMs > 0L &&
+                            (System.currentTimeMillis() - lastTransferAtMs) < RECENT_TRANSFER_WINDOW_MS
+                        if (!stallFallbackTriggered &&
+                            shouldTriggerBufferingStallFallback(
+                                bufferingSeconds = bufferingSeconds,
+                                hasRecentTransfer = hasRecentTransfer
+                            )
+                        ) {
+                            stallFallbackTriggered = true
                             bufferingSeconds = 0
-                            Log.w(TAG, "Playback stalled in buffering state for 15s. Triggering fallback.")
-                            _errorMessage.value = "Playback link stalled. Trying alternative source..."
-                            onPlaybackFailedCallback?.invoke()
+                            Log.w(
+                                TAG,
+                                "Playback stalled in buffering state (recentTransfer=$hasRecentTransfer, " +
+                                    "bytes=${networkTracker?.totalBytesTransferred() ?: 0L}). Triggering fallback."
+                            )
+                            if (onPlaybackFailedCallback != null) {
+                                _errorMessage.value = "Playback link stalled. Trying alternative source..."
+                                onPlaybackFailedCallback?.invoke()
+                            } else {
+                                _errorMessage.value = "Stream buffering stalled. Please try another source."
+                            }
                         }
+                    } else {
+                        bufferingSeconds = 0
                     }
                 }
                 delay(1000)
@@ -781,6 +829,7 @@ class PlayerManager(
         playbackGeneration++
         tickerJob?.cancel()
         tickerJob = null
+        networkTracker = null
         exoPlayer?.let { player ->
             activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
             player.stop()
@@ -795,8 +844,140 @@ class PlayerManager(
         _videoResolution.value = null
     }
 
+    internal data class NetworkMetricsSnapshot(
+        val ttfbMs: Long?,
+        val bytesTransferred: Long,
+        val throughputKbps: Long?,
+        val lastHttpStatusCode: Int?,
+        val supportsByteRanges: Boolean?
+    )
+
+    internal class PlaybackNetworkTracker(
+        private val onUpdate: (NetworkMetricsSnapshot) -> Unit = {}
+    ) {
+        private val bytesTransferred = AtomicLong(0L)
+        private val firstOpenNanos = AtomicLong(0L)
+        private val firstByteNanos = AtomicLong(0L)
+        private val lastTransferAt = AtomicLong(0L)
+        private val ttfbMs = AtomicLong(-1L)
+        private val lastStatus = AtomicInteger(-1)
+        private val byteRangeSupport = AtomicInteger(-1) // -1 unknown, 0 false, 1 true
+        private val hasBytes = AtomicBoolean(false)
+
+        fun onRequestStart() {
+            firstOpenNanos.compareAndSet(0L, System.nanoTime())
+        }
+
+        fun onResponseHeaders(statusCode: Int, headers: Map<String, List<String>>) {
+            if (statusCode > 0) {
+                lastStatus.set(statusCode)
+            }
+            val acceptRanges = headers.entries.firstOrNull { it.key.equals("Accept-Ranges", ignoreCase = true) }
+                ?.value?.joinToString(",")?.trim()?.lowercase()
+            val hasContentRange = headers.keys.any { it.equals("Content-Range", ignoreCase = true) }
+            when {
+                statusCode == 206 || hasContentRange || acceptRanges == "bytes" -> byteRangeSupport.set(1)
+                acceptRanges == "none" -> byteRangeSupport.compareAndSet(-1, 0)
+            }
+            emitSnapshot()
+        }
+
+        fun onBytesRead(count: Int) {
+            if (count <= 0) return
+            val nowNanos = System.nanoTime()
+            if (hasBytes.compareAndSet(false, true)) {
+                firstByteNanos.set(nowNanos)
+                val started = firstOpenNanos.get()
+                if (started > 0L) {
+                    ttfbMs.set(((nowNanos - started) / 1_000_000L).coerceAtLeast(0L))
+                }
+            }
+            bytesTransferred.addAndGet(count.toLong())
+            lastTransferAt.set(System.currentTimeMillis())
+            emitSnapshot()
+        }
+
+        fun lastTransferAtMs(): Long = lastTransferAt.get()
+
+        fun totalBytesTransferred(): Long = bytesTransferred.get()
+
+        fun snapshot(): NetworkMetricsSnapshot {
+            val total = bytesTransferred.get()
+            val ttfb = ttfbMs.get().takeIf { it >= 0L }
+            val startRead = firstByteNanos.get()
+            val throughput = if (startRead > 0L && total > 0L) {
+                val elapsedMs = ((System.nanoTime() - startRead) / 1_000_000L).coerceAtLeast(1L)
+                (total * 8L) / elapsedMs // bits per ms == kbps
+            } else null
+            val status = lastStatus.get().takeIf { it > 0 }
+            val rangeSupport = when (byteRangeSupport.get()) {
+                1 -> true
+                0 -> false
+                else -> null
+            }
+            return NetworkMetricsSnapshot(
+                ttfbMs = ttfb,
+                bytesTransferred = total,
+                throughputKbps = throughput,
+                lastHttpStatusCode = status,
+                supportsByteRanges = rangeSupport
+            )
+        }
+
+        private fun emitSnapshot() {
+            onUpdate(snapshot())
+        }
+    }
+
+    internal class DiagnosticHttpDataSource(
+        private val delegate: HttpDataSource,
+        private val tracker: PlaybackNetworkTracker
+    ) : HttpDataSource by delegate {
+        override fun open(dataSpec: DataSpec): Long {
+            tracker.onRequestStart()
+            val length = delegate.open(dataSpec)
+            tracker.onResponseHeaders(delegate.responseCode, delegate.responseHeaders)
+            return length
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            val read = delegate.read(buffer, offset, length)
+            if (read > 0) {
+                tracker.onBytesRead(read)
+            }
+            return read
+        }
+    }
+
+    internal class DiagnosticHttpDataSourceFactory(
+        private val delegateFactory: HttpDataSource.Factory,
+        private val tracker: PlaybackNetworkTracker
+    ) : HttpDataSource.Factory {
+        override fun createDataSource(): HttpDataSource =
+            DiagnosticHttpDataSource(delegateFactory.createDataSource(), tracker)
+
+        override fun setDefaultRequestProperties(defaultRequestProperties: Map<String, String>): HttpDataSource.Factory {
+            delegateFactory.setDefaultRequestProperties(defaultRequestProperties)
+            return this
+        }
+    }
+
     companion object {
         const val TAG = "PlayerManager"
+        const val HTTP_CONNECT_TIMEOUT_MS = 12_000
+        const val HTTP_READ_TIMEOUT_MS = 20_000
+        const val STALL_NO_DATA_SECONDS = 12
+        const val MAX_SLOW_BUFFER_SECONDS = 30
+        const val RECENT_TRANSFER_WINDOW_MS = 5_000L
+
+        internal fun shouldTriggerBufferingStallFallback(
+            bufferingSeconds: Int,
+            hasRecentTransfer: Boolean
+        ): Boolean = if (hasRecentTransfer) {
+            bufferingSeconds >= MAX_SLOW_BUFFER_SECONDS
+        } else {
+            bufferingSeconds >= STALL_NO_DATA_SECONDS
+        }
 
         /** Custom credential headers are not forwarded through uncontrolled CDN redirects. */
         fun isRedirectSensitiveHeader(headerName: String): Boolean {

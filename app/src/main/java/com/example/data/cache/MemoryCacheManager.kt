@@ -7,6 +7,7 @@ import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.DirectPlayData
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.SourceExpiryTime
+import com.example.data.streaming.SafePlaybackHeaders
 
 /**
  * Bounded, thread-safe in-memory LRU cache layer with configurable per-domain TTLs.
@@ -76,6 +77,22 @@ class MemoryCacheManager(
             while (it.hasNext()) {
                 if (predicate(it.next())) it.remove()
             }
+        }
+
+        fun findValidEntries(nowMs: Long, predicate: (String) -> Boolean): List<Pair<String, CacheEntry<V>>> = synchronized(lock) {
+            val expiredKeys = mutableListOf<String>()
+            val matches = mutableListOf<Pair<String, CacheEntry<V>>>()
+            for ((k, entry) in map) {
+                if (predicate(k)) {
+                    if (entry.isExpired(nowMs)) {
+                        expiredKeys += k
+                    } else {
+                        matches += k to entry
+                    }
+                }
+            }
+            expiredKeys.forEach { map.remove(it) }
+            matches
         }
 
         fun clear() = synchronized(lock) {
@@ -221,37 +238,71 @@ class MemoryCacheManager(
         streamSnapshotCache.remove(cacheKey)
     }
 
-    fun playbackCacheKey(sourceId: String, scopeKey: String? = null): String {
+    fun playbackCacheKey(sourceId: String, scopeKey: String? = null, providerId: String? = null): String {
         val normSource = sourceId.trim()
         val normScope = scopeKey?.trim()?.takeIf { it.isNotEmpty() }
-        return if (normScope != null) "$normScope::$normSource" else normSource
+        val normProvider = providerId?.trim()?.takeIf { it.isNotEmpty() }
+        return when {
+            normScope != null && normProvider != null -> "$normScope|p|$normProvider::$normSource"
+            normScope != null -> "$normScope::$normSource"
+            normProvider != null -> "p|$normProvider::$normSource"
+            else -> normSource
+        }
     }
 
-    fun getResolvedPlayback(sourceId: String, scopeKey: String? = null): DirectPlayData? {
+    fun getResolvedPlayback(sourceId: String, scopeKey: String? = null, providerId: String? = null): DirectPlayData? {
         val normSource = sourceId.trim()
         if (normSource.isEmpty()) {
             metricsTracker.recordMemoryMiss()
             return null
         }
-        val key = playbackCacheKey(normSource, scopeKey)
-        val hit = playbackCache.get(key, clockMs())
-        if (hit != null) {
-            if (hit.value.sourceId.trim() != normSource || SourceExpiryTime.isExpiredOrInvalid(hit.value.expiresAt)) {
+        val normScope = scopeKey?.trim()?.takeIf { it.isNotEmpty() }
+        val normProvider = providerId?.trim()?.takeIf { it.isNotEmpty() }
+        val now = clockMs()
+        val key = playbackCacheKey(normSource, normScope, normProvider)
+        val exactHit = playbackCache.get(key, now)
+        if (exactHit != null) {
+            val valData = exactHit.value
+            if (valData.sourceId.trim() != normSource ||
+                !SafePlaybackHeaders.isValidStreamUrl(valData.playbackUrl) ||
+                SourceExpiryTime.isExpiredOrInvalid(valData.expiresAt, now)
+            ) {
                 playbackCache.remove(key)
                 metricsTracker.recordMemoryMiss()
                 return null
             }
             metricsTracker.recordMemoryHit()
-            return if (hit.value.sourceId == normSource) hit.value else hit.value.copy(sourceId = normSource)
+            return if (valData.sourceId == normSource) valData else valData.copy(sourceId = normSource)
+        }
+        // Only allow unambiguous fallback across providers when caller omitted providerId in a concrete scope
+        if (normScope != null && normProvider == null) {
+            val prefix = "$normScope|p|"
+            val suffix = "::$normSource"
+            val candidates = playbackCache.findValidEntries(now) { k ->
+                k.startsWith(prefix) && k.endsWith(suffix)
+            }.filter { (k, entry) ->
+                val v = entry.value
+                val valid = v.sourceId.trim() == normSource &&
+                    SafePlaybackHeaders.isValidStreamUrl(v.playbackUrl) &&
+                    !SourceExpiryTime.isExpiredOrInvalid(v.expiresAt, now)
+                if (!valid) playbackCache.remove(k)
+                valid
+            }
+            if (candidates.size == 1) {
+                val chosen = candidates.single().second.value
+                metricsTracker.recordMemoryHit()
+                return if (chosen.sourceId == normSource) chosen else chosen.copy(sourceId = normSource)
+            }
         }
         metricsTracker.recordMemoryMiss()
         return null
     }
 
-    fun putResolvedPlayback(sourceId: String, data: DirectPlayData, scopeKey: String? = null) {
+    fun putResolvedPlayback(sourceId: String, data: DirectPlayData, scopeKey: String? = null, providerId: String? = null) {
         val normSource = sourceId.trim()
         val normDataId = data.sourceId.trim()
         if (normSource.isEmpty() || normDataId != normSource) return
+        if (!SafePlaybackHeaders.isValidStreamUrl(data.playbackUrl)) return
         if (SourceExpiryTime.isExpiredOrInvalid(data.expiresAt)) return
         val now = clockMs()
         val parsedExpiryMs = SourceExpiryTime.parseEpochMillis(data.expiresAt)
@@ -259,18 +310,34 @@ class MemoryCacheManager(
         val effectiveTtl = minOf(playbackUrlMaxTtlMs, remainingToExpiry)
         if (effectiveTtl > 0L) {
             val normalizedData = if (data.sourceId == normSource) data else data.copy(sourceId = normSource)
-            playbackCache.put(playbackCacheKey(normSource, scopeKey), normalizedData, effectiveTtl, now)
+            playbackCache.put(playbackCacheKey(normSource, scopeKey, providerId), normalizedData, effectiveTtl, now)
         }
     }
 
-    fun invalidatePlayback(sourceId: String, scopeKey: String? = null) {
+    fun invalidatePlayback(sourceId: String, scopeKey: String? = null, providerId: String? = null) {
         val normSource = sourceId.trim()
         if (normSource.isEmpty()) return
-        if (!scopeKey.isNullOrBlank()) {
-            playbackCache.remove(playbackCacheKey(normSource, scopeKey))
-        } else {
-            playbackCache.remove(normSource)
-            playbackCache.removeWhere { it == normSource || it.endsWith("::$normSource") }
+        val normScope = scopeKey?.trim()?.takeIf { it.isNotEmpty() }
+        val normProvider = providerId?.trim()?.takeIf { it.isNotEmpty() }
+        when {
+            normScope != null && normProvider != null -> {
+                playbackCache.remove(playbackCacheKey(normSource, normScope, normProvider))
+            }
+            normScope != null -> {
+                playbackCache.remove(playbackCacheKey(normSource, normScope, null))
+                val prefix = "$normScope|p|"
+                val suffix = "::$normSource"
+                playbackCache.removeWhere { it.startsWith(prefix) && it.endsWith(suffix) }
+            }
+            normProvider != null -> {
+                val marker = "|p|$normProvider::$normSource"
+                playbackCache.remove("p|$normProvider::$normSource")
+                playbackCache.removeWhere { it.endsWith(marker) }
+            }
+            else -> {
+                playbackCache.remove(normSource)
+                playbackCache.removeWhere { it == normSource || it.endsWith("::$normSource") }
+            }
         }
     }
 

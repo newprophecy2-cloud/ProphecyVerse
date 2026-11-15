@@ -9,10 +9,18 @@ object PreResolvePlan {
     const val FAST_WINDOW_SIZE = 7
     const val PREVIOUS_WINDOW_SIZE = 6
 
-    fun sameSeasonEpisodes(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> =
-        EpisodeCanonicalizer.canonicalize(emptyList(), allEpisodes.filter {
-            it.animeId == current.animeId && it.seasonNumber == current.seasonNumber
+    fun sameSeasonEpisodes(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> {
+        if (current.animeId.isBlank() || current.id.isBlank() || current.seasonNumber <= 0 || current.id.startsWith("movie_")) {
+            return emptyList()
+        }
+        return EpisodeCanonicalizer.canonicalize(emptyList(), allEpisodes.filter {
+            it.id.isNotBlank() &&
+                !it.id.startsWith("movie_") &&
+                it.animeId == current.animeId &&
+                it.seasonNumber == current.seasonNumber &&
+                it.seasonNumber > 0
         })
+    }
 
     fun upcoming(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> {
         val ordered = sameSeasonEpisodes(current, allEpisodes)

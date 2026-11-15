@@ -184,14 +184,16 @@ class DownloadManager private constructor(private val context: Context) {
                 var resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
                     animeId,
                     episode,
-                    preferredSourceId = preferredSourceId
+                    preferredSourceId = preferredSourceId,
+                    isForeground = false
                 )
                 if (resolutionResult.isFailure && isTransientResolutionFailure(resolutionResult.exceptionOrNull())) {
                     delay(1_500L)
                     resolutionResult = repository.resolveVerifiedPlaybackForEpisode(
                         animeId,
                         episode,
-                        preferredSourceId = preferredSourceId
+                        preferredSourceId = preferredSourceId,
+                        isForeground = false
                     )
                 }
                 var verified = resolutionResult.getOrNull()
@@ -204,7 +206,8 @@ class DownloadManager private constructor(private val context: Context) {
                         animeId,
                         episode,
                         preferredSourceId = preferredSourceId,
-                        forceResolveFresh = true
+                        forceResolveFresh = true,
+                        isForeground = false
                     ).getOrNull()
                 }
                 if (verified == null) {
