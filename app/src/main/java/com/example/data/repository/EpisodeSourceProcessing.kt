@@ -3,8 +3,11 @@ package com.example.data.repository
 import com.example.data.local.EpisodeEntry
 import com.example.data.local.SeasonEntry
 import com.example.data.remote.ProphecySourceDto
+import java.net.URI
+import java.net.URLDecoder
 import java.text.ParsePosition
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
@@ -15,7 +18,7 @@ enum class ExpiryState {
     INVALID
 }
 
-/** Parses API ISO-8601 expiry values without requiring API-26 java.time on minSdk 24. */
+/** Parses API ISO-8601 and presigned URL expiry values without requiring API-26 java.time on minSdk 24. */
 object SourceExpiryTime {
     private val fractionalZonePattern = Regex("^(.+T\\d{2}:\\d{2}:\\d{2})\\.(\\d+)(Z|[+-]\\d{2}:?\\d{2})$")
     private val patterns = listOf(
@@ -24,6 +27,8 @@ object SourceExpiryTime {
         "yyyy-MM-dd'T'HH:mm:ss.SSSX",
         "yyyy-MM-dd'T'HH:mm:ssX"
     )
+    private const val SIGV4_DATE_PATTERN = "yyyyMMdd'T'HHmmss'Z'"
+    private const val ISO_UTC_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
     fun parseEpochMillis(value: String?): Long? {
         val source = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
@@ -44,11 +49,77 @@ object SourceExpiryTime {
         return null
     }
 
+    /**
+     * Extracts expiry epoch milliseconds from presigned stream URLs (e.g. AWS S3 / Cloudflare R2
+     * `X-Amz-Date` + `X-Amz-Expires`, or explicit epoch `Expires`/`exp` params). Returns `null`
+     * for plain unsigned URLs with no expiry parameters.
+     */
+    fun extractUrlExpiryEpochMillis(streamUrl: String?): Long? {
+        val raw = streamUrl?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        val rawQuery = runCatching { URI(raw).rawQuery }.getOrNull()
+            ?: raw.substringAfter('?', "").substringBefore('#').takeIf { it.isNotEmpty() }
+            ?: return null
+
+        val params = LinkedHashMap<String, String>()
+        for (pair in rawQuery.split('&')) {
+            if (pair.isEmpty()) continue
+            val idx = pair.indexOf('=')
+            val keyRaw = if (idx >= 0) pair.substring(0, idx) else pair
+            val valRaw = if (idx >= 0) pair.substring(idx + 1) else ""
+            val key = decodeQueryComponent(keyRaw).lowercase(Locale.US)
+            val value = decodeQueryComponent(valRaw).trim()
+            if (key.isNotEmpty() && value.isNotEmpty()) {
+                params[key] = value
+            }
+        }
+
+        val amzDate = params["x-amz-date"]
+        val amzExpiresSec = params["x-amz-expires"]?.toLongOrNull()
+        if (!amzDate.isNullOrBlank() && amzExpiresSec != null && amzExpiresSec >= 0L) {
+            val signedAt = parseSigV4DateMillis(amzDate)
+            if (signedAt != null) {
+                return signedAt + (amzExpiresSec * 1_000L)
+            }
+        }
+
+        val epochCandidate = params["expires"]?.toLongOrNull()
+            ?: params["exp"]?.toLongOrNull()
+        if (epochCandidate != null && epochCandidate >= 1_000_000_000L) {
+            return if (epochCandidate >= 100_000_000_000L) epochCandidate else epochCandidate * 1_000L
+        }
+        return null
+    }
+
+    fun deriveIsoExpiryFromUrl(streamUrl: String?): String? {
+        val epochMs = extractUrlExpiryEpochMillis(streamUrl) ?: return null
+        val formatter = SimpleDateFormat(ISO_UTC_FORMAT, Locale.US).apply {
+            isLenient = false
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        return formatter.format(Date(epochMs))
+    }
+
     fun evaluateExpiry(value: String?, nowMs: Long = System.currentTimeMillis()): ExpiryState {
         val source = value?.trim()
         if (source.isNullOrEmpty()) return ExpiryState.MISSING
         val epoch = parseEpochMillis(source) ?: return ExpiryState.INVALID
         return if (epoch <= nowMs) ExpiryState.EXPIRED else ExpiryState.VALID
+    }
+
+    fun evaluateStreamExpiry(
+        explicitExpiresAt: String?,
+        streamUrl: String?,
+        nowMs: Long = System.currentTimeMillis()
+    ): ExpiryState {
+        val explicitState = evaluateExpiry(explicitExpiresAt, nowMs)
+        if (explicitState == ExpiryState.EXPIRED || explicitState == ExpiryState.INVALID) {
+            return explicitState
+        }
+        val urlExpiryMs = extractUrlExpiryEpochMillis(streamUrl)
+        if (urlExpiryMs != null) {
+            return if (urlExpiryMs <= nowMs) ExpiryState.EXPIRED else ExpiryState.VALID
+        }
+        return explicitState
     }
 
     fun isExpiredOrInvalid(value: String?, nowMs: Long = System.currentTimeMillis()): Boolean =
@@ -59,6 +130,19 @@ object SourceExpiryTime {
 
     fun isExpired(value: String?, nowMs: Long = System.currentTimeMillis()): Boolean =
         parseEpochMillis(value)?.let { it <= nowMs } ?: false
+
+    private fun parseSigV4DateMillis(raw: String): Long? {
+        val formatter = SimpleDateFormat(SIGV4_DATE_PATTERN, Locale.US).apply {
+            isLenient = false
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val pos = ParsePosition(0)
+        val parsed = formatter.parse(raw.trim(), pos) ?: return null
+        return if (pos.index == raw.trim().length) parsed.time else null
+    }
+
+    private fun decodeQueryComponent(raw: String): String =
+        runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
 }
 
 /** States supported by the API response and local freshness information. */

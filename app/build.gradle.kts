@@ -113,6 +113,7 @@ dependencies {
   implementation(libs.androidx.media3.session)
   implementation(libs.androidx.media3.exoplayer.hls)
   implementation(libs.androidx.media3.exoplayer.dash)
+  implementation(libs.androidx.media3.datasource.okhttp)
   implementation(libs.media3.ffmpeg.decoder)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)

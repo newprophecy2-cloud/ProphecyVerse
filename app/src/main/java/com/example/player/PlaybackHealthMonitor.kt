@@ -53,14 +53,20 @@ class PlaybackHealthMonitor(
         private set
     var bufferingSecondsTotal: Int = 0
         private set
+    var rebufferCount: Int = 0
+        private set
+    var totalRebufferDurationMs: Long = 0L
+        private set
 
     private var lastObservedBytes: Long = 0L
     private var lastObservedBufferedPositionMs: Long = Long.MIN_VALUE
     private var bufferingStartedLogged: Boolean = false
+    private var activeRebufferStartedAtMs: Long? = null
     private var stallRecoveryTriggered: Boolean = false
     private var lastProgressLogSec: Int = 0
 
-    fun markReady() {
+    fun markReady(nowMs: Long = System.currentTimeMillis()) {
+        finalizeActiveRebuffer(nowMs)
         hasBecomeReady = true
         noProgressSeconds = 0
         bufferingSecondsTotal = 0
@@ -68,6 +74,33 @@ class PlaybackHealthMonitor(
         stallRecoveryTriggered = false
         lastProgressLogSec = 0
         state = PlaybackHealthState.IDLE
+    }
+
+    fun onPlayerBufferingState(nowMs: Long = System.currentTimeMillis()) {
+        if (hasBecomeReady && activeRebufferStartedAtMs == null) {
+            activeRebufferStartedAtMs = nowMs
+            rebufferCount++
+            if (!bufferingStartedLogged) {
+                bufferingStartedLogged = true
+                PlaybackDiagnosticsLogger.log(
+                    type = PlaybackDiagnosticEventType.PLAYBACK_BUFFERING_STARTED,
+                    scopeKey = scopeKey,
+                    sourceId = sourceId,
+                    detail = "kind=REBUFFERING rebuffer_count=$rebufferCount"
+                )
+            }
+        }
+    }
+
+    private fun finalizeActiveRebuffer(nowMs: Long) {
+        val startedAt = activeRebufferStartedAtMs ?: return
+        totalRebufferDurationMs += (nowMs - startedAt).coerceAtLeast(0L)
+        activeRebufferStartedAtMs = null
+    }
+
+    fun currentTotalRebufferDurationMs(nowMs: Long = System.currentTimeMillis()): Long {
+        val activeElapsed = activeRebufferStartedAtMs?.let { (nowMs - it).coerceAtLeast(0L) } ?: 0L
+        return totalRebufferDurationMs + activeElapsed
     }
 
     fun evaluateTick(
@@ -79,6 +112,7 @@ class PlaybackHealthMonitor(
         nowMs: Long = System.currentTimeMillis()
     ): TickEvaluation {
         if (isPlaying) {
+            finalizeActiveRebuffer(nowMs)
             hasBecomeReady = true
             noProgressSeconds = 0
             bufferingSecondsTotal = 0
@@ -98,6 +132,7 @@ class PlaybackHealthMonitor(
         }
 
         if (!isBuffering) {
+            finalizeActiveRebuffer(nowMs)
             noProgressSeconds = 0
             bufferingSecondsTotal = 0
             bufferingStartedLogged = false
@@ -112,13 +147,18 @@ class PlaybackHealthMonitor(
             )
         }
 
+        if (hasBecomeReady && activeRebufferStartedAtMs == null) {
+            activeRebufferStartedAtMs = nowMs
+            rebufferCount++
+        }
+
         if (!bufferingStartedLogged) {
             bufferingStartedLogged = true
             PlaybackDiagnosticsLogger.log(
                 type = PlaybackDiagnosticEventType.PLAYBACK_BUFFERING_STARTED,
                 scopeKey = scopeKey,
                 sourceId = sourceId,
-                detail = "kind=${if (hasBecomeReady) "REBUFFERING" else "INITIAL_BUFFERING"}"
+                detail = "kind=${if (hasBecomeReady) "REBUFFERING rebuffer_count=$rebufferCount" else "INITIAL_BUFFERING"}"
             )
         }
 
@@ -144,7 +184,7 @@ class PlaybackHealthMonitor(
                     type = PlaybackDiagnosticEventType.PLAYBACK_BUFFERING_PROGRESSING,
                     scopeKey = scopeKey,
                     sourceId = sourceId,
-                    detail = "state=${state.name} kind=${if (hasBecomeReady) "REBUFFERING" else "INITIAL_BUFFERING"} bytes=$bytesTransferred buffered_ms=$bufferedPositionMs"
+                    detail = "state=${state.name} kind=${if (hasBecomeReady) "REBUFFERING" else "INITIAL_BUFFERING"} bytes=$bytesTransferred buffered_ms=$bufferedPositionMs rebuffer_count=$rebufferCount"
                 )
             }
             return TickEvaluation(
@@ -164,7 +204,7 @@ class PlaybackHealthMonitor(
                 type = PlaybackDiagnosticEventType.PLAYBACK_STALL_CONFIRMED,
                 scopeKey = scopeKey,
                 sourceId = sourceId,
-                detail = "no_progress_sec=$noProgressSeconds bytes=$bytesTransferred buffered_ms=$bufferedPositionMs",
+                detail = "no_progress_sec=$noProgressSeconds bytes=$bytesTransferred buffered_ms=$bufferedPositionMs rebuffer_count=$rebufferCount",
                 isWarning = true
             )
             true

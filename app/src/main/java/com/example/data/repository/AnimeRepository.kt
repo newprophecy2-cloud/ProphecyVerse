@@ -2221,11 +2221,83 @@ class AnimeRepository(
         return D1StreamKeys(animeId = resolvedAnimeId, episodeId = resolvedEpisodeId)
     }
 
-    private fun inferUrlTypeFromUrl(url: String, fallback: String = "direct"): String {
-        val clean = url.substringBefore('?').lowercase()
+    private suspend fun resolveD1StreamKeyCandidates(
+        animeId: String,
+        anime: AnimeEntry?,
+        identity: com.example.data.streaming.CanonicalStreamIdentity,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        catalogEpisodeId: String?,
+        preferredBackendEpisodeId: String? = null,
+        knownBackendEpisodeIds: Set<String> = emptySet()
+    ): List<D1StreamKeys> {
+        val primary = resolveD1StreamKeys(
+            animeId = animeId,
+            anime = anime,
+            identity = identity,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            catalogEpisodeId = catalogEpisodeId,
+            preferredBackendEpisodeId = preferredBackendEpisodeId,
+            knownBackendEpisodeIds = knownBackendEpisodeIds
+        )
+        val syntheticLocalMovieId = "movie_${identity.contentKey}"
+        val syntheticLocalMovieFallback = "movie_${identity.contentKey}_e1"
+        fun isSyntheticCatalogId(id: String): Boolean =
+            id.startsWith("anilist_ep_") ||
+                id == syntheticLocalMovieId ||
+                id == syntheticLocalMovieFallback ||
+                id == "movie_$animeId"
+
+        val hasResolvedBackendAnime = !anime?.backendAnimeId.isNullOrBlank() ||
+            !identity.backendAnimeId.isNullOrBlank()
+        val candidateAnimeIds = buildList {
+            add(primary.animeId)
+            anime?.backendAnimeId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+            identity.backendAnimeId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+            if (!hasResolvedBackendAnime) {
+                animeId.trim().takeIf { it.isNotEmpty() }?.let(::add)
+            }
+        }.distinct()
+
+        val hasRealBackendEpisode = !preferredBackendEpisodeId.isNullOrBlank() &&
+            !isSyntheticCatalogId(preferredBackendEpisodeId.trim()) ||
+            knownBackendEpisodeIds.any { it.isNotBlank() && !isSyntheticCatalogId(it.trim()) }
+        val candidateEpisodeIds = buildList {
+            add(primary.episodeId)
+            preferredBackendEpisodeId?.trim()?.takeIf { it.isNotEmpty() && !isSyntheticCatalogId(it) }?.let(::add)
+            knownBackendEpisodeIds.forEach { epId ->
+                val clean = epId.trim()
+                if (clean.isNotEmpty() && !isSyntheticCatalogId(clean)) add(clean)
+            }
+            if (!hasRealBackendEpisode) {
+                catalogEpisodeId?.trim()?.takeIf { it.isNotEmpty() && !isSyntheticCatalogId(it) }?.let(::add)
+            }
+        }.distinct()
+
+        return buildList {
+            add(primary)
+            for (aId in candidateAnimeIds) {
+                for (eId in candidateEpisodeIds) {
+                    val item = D1StreamKeys(aId, eId)
+                    if (item !in this) add(item)
+                }
+            }
+        }
+    }
+
+    private fun inferUrlTypeFromUrl(
+        url: String,
+        contentType: String? = null,
+        fallback: String = "direct"
+    ): String {
+        val inferred = com.example.data.d1.CloudflareD1DataSource.resolveEffectiveUrlType(
+            explicitUrlType = fallback.takeIf { !it.equals("direct", ignoreCase = true) },
+            url = url,
+            contentType = contentType
+        )
         return when {
-            clean.endsWith(".m3u8") -> "hls"
-            clean.endsWith(".mpd") -> "dash"
+            inferred != "direct" -> inferred
             fallback.isNotBlank() -> fallback
             else -> "direct"
         }
@@ -2357,9 +2429,9 @@ class AnimeRepository(
                     )
                 }
 
-                // 1b. Cloudflare D1 Stream URL Cache lookup (anime_id, episode_id, source_id)
+                // 1b. Cloudflare D1 Stream URL Cache lookup across candidate (anime_id, episode_id, source_id) keys
                 val preferredEpId = discoveredBackendEpisodeIds["$scopeKey|$candidateProviderId|$normSourceId"]
-                val d1Keys = resolveD1StreamKeys(
+                val d1KeyCandidates = resolveD1StreamKeyCandidates(
                     animeId = animeId,
                     anime = anime,
                     identity = identity,
@@ -2370,21 +2442,29 @@ class AnimeRepository(
                     knownBackendEpisodeIds = knownBackendEpisodeIds
                 )
                 checkedCacheKeys += "$candidateProviderId|$normSourceId"
-                val d1Hit = d1DataSource.getValidStreamUrl(
-                    animeId = d1Keys.animeId,
-                    episodeId = d1Keys.episodeId,
-                    sourceId = normSourceId
-                )
+                var d1Hit: com.example.data.d1.CloudflareD1DataSource.CachedStreamUrl? = null
+                for (d1Keys in d1KeyCandidates) {
+                    val found = d1DataSource.getValidStreamUrl(
+                        animeId = d1Keys.animeId,
+                        episodeId = d1Keys.episodeId,
+                        sourceId = normSourceId
+                    )
+                    if (found != null) {
+                        d1Hit = found
+                        break
+                    }
+                }
                 if (d1Hit != null) {
+                    val restoredHeaders = d1Hit.safeHeaders
                     val data = DirectPlayData(
                         mode = "direct",
                         sourceId = normSourceId,
                         playbackUrl = d1Hit.streamUrl,
-                        urlType = inferUrlTypeFromUrl(d1Hit.streamUrl, "direct"),
+                        urlType = inferUrlTypeFromUrl(d1Hit.streamUrl, d1Hit.contentType, d1Hit.urlType),
                         compatibility = "verified",
-                        requiresHeaders = false,
-                        headers = emptyList(),
-                        contentType = null,
+                        requiresHeaders = restoredHeaders.isNotEmpty(),
+                        headers = restoredHeaders,
+                        contentType = d1Hit.contentType,
                         expiresAt = d1Hit.expiresAt ?: candidate.expiresAt
                     )
                     if (SourceIdentityValidator.validateDirectPlayData(data, normSourceId).isValid) {
@@ -2458,7 +2538,8 @@ class AnimeRepository(
                 animeId = d1Keys.animeId,
                 episodeId = d1Keys.episodeId,
                 skipCacheCheck = !forceResolveFresh && alreadyCheckedCache,
-                allowBypassBackoff = allowBypassBackoff
+                allowBypassBackoff = allowBypassBackoff,
+                sourceMetadata = candidate
             )
             val playData = res.getOrNull()
                 ?: return Result.failure(res.exceptionOrNull() ?: IllegalStateException("Direct playback failed"))
@@ -2887,7 +2968,8 @@ class AnimeRepository(
         animeId: String = "",
         episodeId: String = "",
         skipCacheCheck: Boolean = false,
-        allowBypassBackoff: Boolean = false
+        allowBypassBackoff: Boolean = false,
+        sourceMetadata: ProphecySourceDto? = null
     ): Result<DirectPlayData> = withContext(Dispatchers.IO) {
         val normSourceId = SourceIdentityValidator.normalizeId(sourceId)
         val normScope = scopeKey?.let { SourceIdentityValidator.normalizeId(it) }?.takeIf { it.isNotEmpty() }
@@ -2916,7 +2998,8 @@ class AnimeRepository(
                         explicitAnimeId = normAnime,
                         explicitEpisodeId = normEpisode,
                         skipCacheCheck = skipCacheCheck,
-                        allowBypassBackoff = allowBypassBackoff
+                        allowBypassBackoff = allowBypassBackoff,
+                        sourceMetadata = sourceMetadata
                     )
                     created.complete(computed)
                     return@withContext computed
@@ -2944,7 +3027,8 @@ class AnimeRepository(
         explicitAnimeId: String = "",
         explicitEpisodeId: String = "",
         skipCacheCheck: Boolean = false,
-        allowBypassBackoff: Boolean = false
+        allowBypassBackoff: Boolean = false,
+        sourceMetadata: ProphecySourceDto? = null
     ): Result<DirectPlayData> {
         val scopeContentKey = normScope?.substringAfter(':', "")?.substringBefore(":s")
         val resolvedAnimeId = explicitAnimeId.takeIf { it.isNotBlank() }
@@ -2991,15 +3075,16 @@ class AnimeRepository(
             if (resolvedAnimeId.isNotBlank() && resolvedEpisodeId.isNotBlank()) {
                 val d1Hit = d1DataSource.getValidStreamUrl(resolvedAnimeId, resolvedEpisodeId, normSourceId)
                 if (d1Hit != null) {
+                    val restoredHeaders = d1Hit.safeHeaders
                     val d1PlayData = DirectPlayData(
                         mode = "direct",
                         sourceId = normSourceId,
                         playbackUrl = d1Hit.streamUrl,
-                        urlType = inferUrlTypeFromUrl(d1Hit.streamUrl, "direct"),
+                        urlType = inferUrlTypeFromUrl(d1Hit.streamUrl, d1Hit.contentType, d1Hit.urlType),
                         compatibility = "verified",
-                        requiresHeaders = false,
-                        headers = emptyList(),
-                        contentType = null,
+                        requiresHeaders = restoredHeaders.isNotEmpty(),
+                        headers = restoredHeaders,
+                        contentType = d1Hit.contentType,
                         expiresAt = d1Hit.expiresAt
                     )
                     if (SourceIdentityValidator.validateDirectPlayData(d1PlayData, normSourceId).isValid) {
@@ -3121,25 +3206,47 @@ class AnimeRepository(
                 SourceValidationResult.Valid -> Unit
             }
 
-            // Persist validated resolved Stream URL to Cloudflare D1 before returning to player (expires_at saved only when actual expiry is known)
+            // Persist validated resolved Stream URL to Cloudflare D1 before returning to player (safe headers + content metadata + explicit/derived expiry)
             if (resolvedAnimeId.isNotBlank() && resolvedEpisodeId.isNotBlank()) {
                 val validKnownExpiry = requestReady.expiresAt?.trim()?.takeIf {
                     SourceExpiryTime.evaluateExpiry(it) == ExpiryState.VALID
-                }
-                try {
+                } ?: SourceExpiryTime.deriveIsoExpiryFromUrl(requestReady.playbackUrl)
+                val saved = try {
                     kotlinx.coroutines.withTimeoutOrNull(4_000L) {
                         d1DataSource.saveStreamUrl(
                             animeId = resolvedAnimeId,
                             episodeId = resolvedEpisodeId,
                             sourceId = normSourceId,
                             streamUrl = requestReady.playbackUrl,
-                            expiresAt = validKnownExpiry
+                            expiresAt = validKnownExpiry,
+                            providerId = normProvider,
+                            sourceName = sourceMetadata?.label?.trim()?.takeIf { it.isNotEmpty() },
+                            urlType = requestReady.urlType,
+                            contentType = requestReady.contentType,
+                            headers = requestReady.headers,
+                            quality = sourceMetadata?.quality,
+                            codec = sourceMetadata?.codec,
+                            audioLanguage = sourceMetadata?.language,
+                            downloadable = sourceMetadata?.downloadable,
+                            sizeBytes = sourceMetadata?.sizeBytes
                         )
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (err: Throwable) {
-                    Log.w("AnimeRepository", "D1 saveStreamUrl failed cleanly: ${err.message}")
+                    Log.e(
+                        "AnimeRepository",
+                        "D1 persistence error: anime=$resolvedAnimeId, " +
+                            "episode=$resolvedEpisodeId, source=$normSourceId (${err::class.simpleName})"
+                    )
+                    false
+                }
+                if (saved != true) {
+                    Log.e(
+                        "AnimeRepository",
+                        "D1 persistence failed: anime=$resolvedAnimeId, " +
+                            "episode=$resolvedEpisodeId, source=$normSourceId"
+                    )
                 }
             }
 
@@ -3246,7 +3353,7 @@ class AnimeRepository(
                 }
             }
         }
-        val d1Keys = resolveD1StreamKeys(
+        val d1KeyCandidates = resolveD1StreamKeyCandidates(
             animeId = animeId,
             anime = anime,
             identity = identity,
@@ -3257,7 +3364,9 @@ class AnimeRepository(
             knownBackendEpisodeIds = knownBackendIds
         )
         runCatching {
-            d1DataSource.invalidateStreamUrl(d1Keys.animeId, d1Keys.episodeId, normSourceId)
+            d1KeyCandidates.forEach { d1Keys ->
+                d1DataSource.invalidateStreamUrl(d1Keys.animeId, d1Keys.episodeId, normSourceId)
+            }
         }
         SourceIdentityValidator.recordDiagnostic(
             code = SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,

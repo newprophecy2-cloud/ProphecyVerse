@@ -185,11 +185,14 @@ class Fix4CacheSecurityTest {
         // D1 write is awaited inline before returning resolved playback
         assertTrue("D1 save should have completed before return", capturedD1Bodies.isNotEmpty())
         val d1Joined = capturedD1Bodies.joinToString("\n")
-        assertTrue("D1 stream_urls must store resolved stream_url", d1Joined.contains("https://cdn.example.com/secure/stream.m3u8"))
-        assertFalse("D1 stream_urls must never persist Authorization", d1Joined.contains("top-secret-jwt"))
-        assertFalse("D1 stream_urls must never persist Cookie", d1Joined.contains("secret_cookie"))
-        assertFalse("D1 stream_urls must never persist Referer header", d1Joined.contains("kwik.si"))
-        assertFalse("D1 stream_urls must never persist Session-Id", d1Joined.contains("sess_999"))
+        assertTrue("D1 stream_sources must store resolved streamUrl", d1Joined.contains("https://cdn.example.com/secure/stream.m3u8"))
+        assertTrue("D1 stream_sources persists non-sensitive Referer in safeHeadersJson", d1Joined.contains("safeHeadersJson") && d1Joined.contains("kwik.si"))
+        assertTrue("D1 stream_sources persists non-sensitive User-Agent in safeHeadersJson", d1Joined.contains("User-Agent") && d1Joined.contains("ProphecyPlayer"))
+        assertFalse("D1 stream_sources must never persist Authorization", d1Joined.contains("top-secret-jwt"))
+        assertFalse("D1 stream_sources must never persist Cookie", d1Joined.contains("secret_cookie"))
+        assertFalse("D1 stream_sources must never persist X-Auth-Token", d1Joined.contains("secret_token"))
+        assertFalse("D1 stream_sources must never persist X-Signature", d1Joined.contains("hmac_sig"))
+        assertFalse("D1 stream_sources must never persist Session-Id", d1Joined.contains("sess_999"))
     }
 
     @Test
@@ -219,15 +222,15 @@ class Fix4CacheSecurityTest {
         // Seed expired entry in mock D1 store
         val d1Store = ConcurrentHashMap<String, String>()
         val recId = CloudflareD1DataSource.deterministicRecordId("b_402", "402_s1_e1", "src_402")
-        d1Store[recId] = """{"id":"$recId","anime_id":"b_402","episode_id":"402_s1_e1","source_id":"src_402","stream_url":"https://stale.cdn.example/expired.mp4","expires_at":"2020-01-01T00:00:00Z"}"""
+        d1Store[recId] = """{"sourceDocKey":"$recId","scopeKey":"b_402","providerId":"direct","sourceId":"src_402","sourceName":"src_402","backendEpisodeId":"402_s1_e1","streamUrl":"https://stale.cdn.example/expired.mp4","urlType":"direct","expiresAt":"2020-01-01T00:00:00Z","status":"AVAILABLE","version":1,"updatedAt":1800000000000,"deletedAt":null}"""
 
         val server = HttpServer.create(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0)
         server.createContext("/v1/") { exchange ->
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    val key = path.removePrefix("/v1/tables/stream_urls/")
+                method == "GET" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val key = path.removePrefix("/v1/tables/stream_sources/")
                     val raw = d1Store[key]
                     if (raw == null) {
                         val b = """{"success":false,"error":"Not found"}""".toByteArray()
@@ -235,25 +238,25 @@ class Fix4CacheSecurityTest {
                         exchange.sendResponseHeaders(404, b.size.toLong())
                         exchange.responseBody.use { it.write(b) }
                     } else {
-                        val b = """{"success":true,"data":$raw}""".toByteArray()
+                        val b = """{"success":true,"table":"stream_sources","data":$raw}""".toByteArray()
                         exchange.responseHeaders.add("Content-Type", "application/json")
                         exchange.sendResponseHeaders(200, b.size.toLong())
                         exchange.responseBody.use { it.write(b) }
                     }
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     val body = exchange.requestBody.bufferedReader().readText()
-                    val idMatch = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: recId
+                    val idMatch = Regex(""""sourceDocKey"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: recId
                     d1Store[idMatch] = body
-                    val b = """{"success":true}""".toByteArray()
+                    val b = """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""".toByteArray()
                     exchange.responseHeaders.add("Content-Type", "application/json")
                     exchange.sendResponseHeaders(200, b.size.toLong())
                     exchange.responseBody.use { it.write(b) }
                 }
-                method == "DELETE" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    val key = path.removePrefix("/v1/tables/stream_urls/")
+                method == "DELETE" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val key = path.removePrefix("/v1/tables/stream_sources/")
                     d1Store.remove(key)
-                    val b = """{"success":true}""".toByteArray()
+                    val b = """{"success":true,"message":"Record deleted","table":"stream_sources","changes":1}""".toByteArray()
                     exchange.responseHeaders.add("Content-Type", "application/json")
                     exchange.sendResponseHeaders(200, b.size.toLong())
                     exchange.responseBody.use { it.write(b) }
@@ -319,13 +322,17 @@ class Fix4CacheSecurityTest {
     fun fix4_d1ExpiredRemoteRecordRejectedOnRead() = runBlocking {
         val fakeD1 = FakeInMemoryD1Api()
         val recId = CloudflareD1DataSource.deterministicRecordId("be_404", "ep_404_1", "src_404")
-        fakeD1.records[recId] = com.example.data.d1.D1StreamUrlRecordDto(
-            id = recId,
-            animeId = "be_404",
-            episodeId = "ep_404_1",
+        fakeD1.records[recId] = com.example.data.d1.D1StreamSourceRecordDto(
+            sourceDocKey = recId,
+            scopeKey = "be_404",
+            providerId = "direct",
             sourceId = "src_404",
+            sourceName = "src_404",
+            backendEpisodeId = "ep_404_1",
             streamUrl = "https://cdn.example/expired.m3u8",
-            expiresAt = "2020-05-01T00:00:00Z"
+            urlType = "hls",
+            expiresAt = "2020-05-01T00:00:00Z",
+            updatedAt = 1_800_000_000_000L
         )
         val d1 = createTestD1DataSource(metricsTracker, fakeD1)
         assertNull("Expired D1 record must be rejected as null", d1.getValidStreamUrl("be_404", "ep_404_1", "src_404"))
@@ -338,7 +345,7 @@ class Fix4CacheSecurityTest {
         server.createContext("/v1/") { exchange ->
             val bodyText = exchange.requestBody.bufferedReader().readText()
             capturedBodies.add(bodyText)
-            val json = """{"success":true,"data":{"ok":true}}"""
+            val json = """{"success":true,"message":"Record saved","table":"stream_sources","data":$bodyText}"""
             val bytes = json.toByteArray()
             exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(200, bytes.size.toLong())
@@ -356,20 +363,23 @@ class Fix4CacheSecurityTest {
             .create(CloudflareD1ApiService::class.java)
         val d1 = CloudflareD1DataSource(api, metricsTracker)
 
-        // Unknown/unparseable expiry must NOT be persisted in expires_at
-        d1.saveStreamUrl(
-            animeId = "be_405",
-            episodeId = "ep_405_1",
-            sourceId = "src_405",
-            streamUrl = "https://cdn.example/ep1.m3u8",
-            expiresAt = "not-a-valid-date"
+        // Unknown/unparseable expiry must NOT be persisted in expiresAt
+        assertTrue(
+            d1.saveStreamUrl(
+                animeId = "be_405",
+                episodeId = "ep_405_1",
+                sourceId = "src_405",
+                streamUrl = "https://cdn.example/ep1.m3u8",
+                expiresAt = "not-a-valid-date"
+            )
         )
         assertTrue(capturedBodies.isNotEmpty())
         val payload = capturedBodies.single()
-        assertTrue(payload.contains(""""anime_id":"be_405""""))
-        assertTrue(payload.contains(""""episode_id":"ep_405_1""""))
-        assertTrue(payload.contains(""""source_id":"src_405""""))
-        assertTrue(payload.contains(""""stream_url":"https://cdn.example/ep1.m3u8""""))
+        assertTrue(payload.contains(""""scopeKey":"be_405""""))
+        assertTrue(payload.contains(""""backendEpisodeId":"ep_405_1""""))
+        assertTrue(payload.contains(""""sourceId":"src_405""""))
+        assertTrue(payload.contains(""""streamUrl":"https://cdn.example/ep1.m3u8""""))
+        assertTrue(payload.contains(""""expiresAt":null"""))
         assertFalse("Unknown expiry must be omitted rather than fabricated", payload.contains("not-a-valid-date"))
     }
 

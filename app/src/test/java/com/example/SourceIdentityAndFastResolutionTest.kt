@@ -8,7 +8,7 @@ import com.example.data.cache.MemoryCacheManager
 import com.example.data.d1.CloudflareD1ApiService
 import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1BooleanAdapterFactory
-import com.example.data.d1.D1StreamUrlRecordDto
+import com.example.data.d1.D1StreamSourceRecordDto
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.EpisodeEntry
@@ -488,20 +488,24 @@ class SourceIdentityAndFastResolutionTest {
         val scopeEp2 = "anime:100:s1:e2"
         val scopeS2Ep1 = "anime:100:s2:e1"
 
-        val ep2Record = D1StreamUrlRecordDto(
-            id = CloudflareD1DataSource.deterministicRecordId("be_100", "be_100_e2", sharedSourceId),
-            animeId = "be_100",
-            episodeId = "be_100_e2",
+        val ep2Record = D1StreamSourceRecordDto(
+            sourceDocKey = CloudflareD1DataSource.deterministicRecordId("be_100", "be_100_e2", sharedSourceId),
+            scopeKey = "be_100",
+            providerId = "direct",
             sourceId = sharedSourceId,
+            sourceName = sharedSourceId,
+            backendEpisodeId = "be_100_e2",
             streamUrl = "https://cdn.example/wrong_ep2.mp4",
-            expiresAt = "2099-01-01T00:00:00Z"
+            urlType = "direct",
+            expiresAt = "2099-01-01T00:00:00Z",
+            updatedAt = 1800000000000L
         )
 
-        val wrongEpCheck = SourceIdentityValidator.validateD1StreamUrlRecord(ep2Record, "be_100", "be_100_e1", sharedSourceId)
+        val wrongEpCheck = SourceIdentityValidator.validateD1StreamSourceRecord(ep2Record, "be_100", "be_100_e1", sharedSourceId)
         assertTrue(wrongEpCheck is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (wrongEpCheck as SourceValidationResult.Invalid).code)
 
-        val wrongAnimeCheck = SourceIdentityValidator.validateD1StreamUrlRecord(ep2Record, "be_other", "be_100_e2", sharedSourceId)
+        val wrongAnimeCheck = SourceIdentityValidator.validateD1StreamSourceRecord(ep2Record, "be_other", "be_100_e2", sharedSourceId)
         assertTrue(wrongAnimeCheck is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (wrongAnimeCheck as SourceValidationResult.Invalid).code)
 
@@ -738,17 +742,17 @@ class SourceIdentityAndFastResolutionTest {
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                method == "GET" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_sources/")
                     val raw = d1Store[id]
-                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
-                    else sendJson(exchange, 200, """{"success":true,"data":$raw}""")
+                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Record not found"}""")
+                    else sendJson(exchange, 200, """{"success":true,"table":"stream_sources","data":$raw}""")
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     val body = exchange.requestBody.bufferedReader().readText()
-                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    val recId = Regex(""""sourceDocKey"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
                     if (recId.isNotEmpty()) d1Store[recId] = body
-                    sendJson(exchange, 200, """{"success":true}""")
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
                 else -> sendJson(exchange, 404, """{"success":false}""")
             }
@@ -825,22 +829,22 @@ class SourceIdentityAndFastResolutionTest {
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                method == "GET" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_sources/")
                     val raw = d1Store[id]
-                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
-                    else sendJson(exchange, 200, """{"success":true,"data":$raw}""")
+                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Record not found"}""")
+                    else sendJson(exchange, 200, """{"success":true,"table":"stream_sources","data":$raw}""")
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     val body = exchange.requestBody.bufferedReader().readText()
-                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    val recId = Regex(""""sourceDocKey"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
                     if (recId.isNotEmpty()) d1Store[recId] = body
-                    sendJson(exchange, 200, """{"success":true}""")
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
-                method == "DELETE" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                method == "DELETE" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_sources/")
                     d1Store.remove(id)
-                    sendJson(exchange, 200, """{"success":true}""")
+                    sendJson(exchange, 200, """{"success":true,"message":"Record deleted","table":"stream_sources","changes":1}""")
                 }
                 else -> sendJson(exchange, 404, """{"success":false}""")
             }
@@ -1057,17 +1061,18 @@ class SourceIdentityAndFastResolutionTest {
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path == "/v1/tables/stream_urls/$recId" -> {
+                method == "GET" && path == "/v1/tables/stream_sources/$recId" -> {
                     d1Reads.incrementAndGet()
-                    // Return an expired stream_url -> client MUST reject it and resolve via Backend!
+                    // Return an expired streamUrl -> client MUST reject it and resolve via Backend!
                     sendJson(
                         exchange, 200,
-                        """{"success":true,"data":{"id":"$recId","anime_id":"be_1200","episode_id":"be_ep_1200","source_id":"src_d1_only","stream_url":"https://untrusted.d1.url/expired.mp4","expires_at":"2020-01-01T00:00:00Z"}}"""
+                        """{"success":true,"table":"stream_sources","data":{"sourceDocKey":"$recId","scopeKey":"be_1200","providerId":"direct","sourceId":"src_d1_only","sourceName":"src_d1_only","backendEpisodeId":"be_ep_1200","streamUrl":"https://untrusted.d1.url/expired.mp4","urlType":"direct","expiresAt":"2020-01-01T00:00:00Z","status":"AVAILABLE","version":1,"updatedAt":1800000000000,"deletedAt":null}}"""
                     )
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     d1UpsertCalls.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true,"message":"Upserted"}""")
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
                 else -> sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
             }

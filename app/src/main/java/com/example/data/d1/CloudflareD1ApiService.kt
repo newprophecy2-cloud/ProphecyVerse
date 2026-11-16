@@ -10,33 +10,34 @@ import retrofit2.http.Query
 
 /**
  * Retrofit interface strictly bound to the Prophecy-verse-DB Cloudflare Worker routes
- * for resolved Stream URL caching only (`/v1/tables`, `/v1/tables/stream_urls`,
- * `/v1/tables/stream_urls/:id`, `/v1/tables/stream_urls/upsert`).
+ * for resolved Stream URL caching using the canonical `stream_sources` table:
+ * `/v1/tables`, `/v1/tables/stream_sources`, `/v1/tables/stream_sources/{id}`,
+ * `/v1/tables/stream_sources/upsert`.
  */
 interface CloudflareD1ApiService {
 
     @GET("tables")
     suspend fun listTables(): Response<D1TablesResponse>
 
-    @GET("tables/stream_urls")
-    suspend fun listStreamUrls(
+    @GET("tables/stream_sources")
+    suspend fun listStreamSources(
         @Query("where") where: String? = null,
         @Query("limit") limit: Int? = null,
         @Query("offset") offset: Int? = null
-    ): Response<D1ListResponse<D1StreamUrlRecordDto>>
+    ): Response<D1ListResponse<D1StreamSourceRecordDto>>
 
-    @GET("tables/stream_urls/{id}")
-    suspend fun getStreamUrl(
+    @GET("tables/stream_sources/{id}")
+    suspend fun getStreamSource(
         @Path("id") id: String
-    ): Response<D1RecordResponse<D1StreamUrlRecordDto>>
+    ): Response<D1RecordResponse<D1StreamSourceRecordDto>>
 
-    @POST("tables/stream_urls/upsert")
-    suspend fun upsertStreamUrl(
-        @Body record: D1StreamUrlRecordDto
-    ): Response<D1RecordResponse<D1StreamUrlRecordDto>>
+    @POST("tables/stream_sources/upsert")
+    suspend fun upsertStreamSource(
+        @Body record: D1StreamSourceRecordDto
+    ): Response<D1RecordResponse<D1StreamSourceRecordDto>>
 
-    @DELETE("tables/stream_urls/{id}")
-    suspend fun deleteStreamUrl(
+    @DELETE("tables/stream_sources/{id}")
+    suspend fun deleteStreamSource(
         @Path("id") id: String
-    ): Response<D1RecordResponse<D1StreamUrlRecordDto>>
+    ): Response<D1RecordResponse<D1StreamSourceRecordDto>>
 }

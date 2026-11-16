@@ -17,14 +17,13 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
-import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
@@ -33,8 +32,15 @@ import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
 import androidx.media3.decoder.ffmpeg.FfmpegLibrary
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultAllocator
 import androidx.media3.extractor.DefaultExtractorsFactory
+import com.example.data.d1.CloudflareD1DataSource
+import com.example.data.metrics.PlaybackDiagnosticEventType
+import com.example.data.metrics.PlaybackDiagnosticsLogger
 import com.example.data.remote.DirectPlayData
+import com.example.data.remote.NetworkModule
+import com.example.data.streaming.MonotonicMetrics
+import okhttp3.OkHttpClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -176,8 +182,22 @@ class PlayerManager(
         val lastHttpStatusCode: Int? = null,
         val supportsByteRanges: Boolean? = null,
         val retryCount: Int = 0,
-        val healthState: PlaybackHealthState = PlaybackHealthState.IDLE
+        val healthState: PlaybackHealthState = PlaybackHealthState.IDLE,
+        val cacheTier: String? = null,
+        val configuredHeaderNames: List<String> = emptyList(),
+        val startupToReadyMs: Long? = null,
+        val rebufferCount: Int = 0,
+        val totalRebufferMs: Long = 0L,
+        val responseContentType: String? = null
     )
+
+    /**
+     * Stops any previously active episode playback immediately before resolving a new episode/source,
+     * preventing overlapping audio or wasted background CDN transfer during transitions.
+     */
+    fun stopActivePlaybackForSwitch() {
+        release(resetRetryBudget = true)
+    }
 
     fun initializePlayer(
         directData: DirectPlayData,
@@ -189,7 +209,8 @@ class PlayerManager(
         sourceQuality: String? = null,
         resolveDurationMs: Long = 0L,
         isRecoveryAttempt: Boolean = false,
-        onFailureSignal: ((PlaybackFailureReason) -> Unit)? = null
+        onFailureSignal: ((PlaybackFailureReason) -> Unit)? = null,
+        cacheTier: String? = null
     ): ExoPlayer {
         release(resetRetryBudget = !isRecoveryAttempt)
         val cleanPlaybackUrl = directData.playbackUrl.trim()
@@ -215,6 +236,7 @@ class PlayerManager(
         _currentPosition.value = startPositionMs
         val providerDiagnostic = providerName?.replace(Regex("[\\r\\n\\t]"), " ")?.take(64) ?: "unknown"
         val scopeLabel = sessionIdentity?.let { "${it.animeId}:s${it.seasonNumber}:e${it.episodeId}" } ?: "player"
+        val configuredHeaderNames = extractConfiguredHeaderNames(directData.headers)
         healthMonitor = PlaybackHealthMonitor(
             scopeKey = scopeLabel,
             sourceId = directData.sourceId,
@@ -228,7 +250,9 @@ class PlayerManager(
             contentType = directData.contentType,
             resolveDurationMs = resolveDurationMs.coerceAtLeast(0L),
             retryCount = currentRetryCount,
-            healthState = PlaybackHealthState.INITIAL_BUFFERING
+            healthState = PlaybackHealthState.INITIAL_BUFFERING,
+            cacheTier = cacheTier,
+            configuredHeaderNames = configuredHeaderNames
         )
         val tracker = PlaybackNetworkTracker { snap ->
             if (generation == playbackGeneration) {
@@ -237,58 +261,27 @@ class PlayerManager(
                     bytesTransferred = snap.bytesTransferred,
                     throughputKbps = snap.throughputKbps,
                     lastHttpStatusCode = snap.lastHttpStatusCode,
-                    supportsByteRanges = snap.supportsByteRanges
+                    supportsByteRanges = snap.supportsByteRanges,
+                    responseContentType = snap.responseContentType
                 )
             }
         }
         networkTracker = tracker
-        Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType} session_retry=$currentRetryCount")
+        val prepareStartedAtMs = MonotonicMetrics.nowMs()
+        val headerNamesSummary = configuredHeaderNames.joinToString(",").ifEmpty { "default_ua_only" }
+        Log.i(
+            TAG,
+            "playback_start provider=$providerDiagnostic tier=${cacheTier ?: "unknown"} " +
+                "backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType} " +
+                "headers=[$headerNamesSummary] session_retry=$currentRetryCount"
+        )
 
-        // Build safe HTTP DataSource with response-authorized headers and bounded timeouts
-        val rawHttpFactory = DefaultHttpDataSource.Factory()
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(HTTP_CONNECT_TIMEOUT_MS)
-            .setReadTimeoutMs(HTTP_READ_TIMEOUT_MS)
-
-        val headerMap = mutableMapOf<String, String>()
-        var userAgentConfigured = false
-        if (directData.headers.isNotEmpty()) {
-            for (headerPair in directData.headers) {
-                if (headerPair.size >= 2) {
-                    val key = headerPair[0]
-                    val value = headerPair[1]
-                    if (key.isBlank() || value.contains('\r') || value.contains('\n') ||
-                        isRedirectSensitiveHeader(key)) continue
-                    if (key.equals("User-Agent", ignoreCase = true)) {
-                        rawHttpFactory.setUserAgent(value)
-                        userAgentConfigured = true
-                    } else {
-                        headerMap[key] = value
-                        if (key.equals("Referer", ignoreCase = true) && !headerMap.containsKey("Origin")) {
-                            try {
-                                val uri = Uri.parse(value)
-                                if (uri.scheme != null && uri.host != null) {
-                                    headerMap["Origin"] = "${uri.scheme}://${uri.host}"
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-            }
-        }
-
-        // Many CDNs (Cloudflare, Akamai, storage buckets) return 403 when User-Agent is unknown or mobile bot
-        if (!userAgentConfigured) {
-            rawHttpFactory.setUserAgent(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
-
-        if (headerMap.isNotEmpty()) {
-            rawHttpFactory.setDefaultRequestProperties(headerMap)
-        }
-
-        val httpDataSourceFactory = DiagnosticHttpDataSourceFactory(rawHttpFactory, tracker)
+        // Build pooled OkHttp DataSource with response-authorized safe headers and bounded timeouts
+        val httpDataSourceFactory = buildStreamingHttpDataSourceFactory(
+            headers = directData.headers,
+            tracker = tracker,
+            okHttpClient = NetworkModule.streamingOkHttpClient
+        )
 
         // Configure universal DataSource (supporting redirects, files, content, http/https)
         val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
@@ -363,16 +356,7 @@ class PlayerManager(
             setEnableDecoderFallback(true)
         }
 
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                /* minBufferMs = */ 4000,
-                /* maxBufferMs = */ 50000,
-                /* bufferForPlaybackMs = */ 500,
-                /* bufferForPlaybackAfterRebufferMs = */ 1000
-            )
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .setBackBuffer(15000, true)
-            .build()
+        val loadControl = buildDefaultLoadControl()
 
         val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
@@ -443,10 +427,19 @@ class PlayerManager(
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
                         _isBuffering.value = true
+                        healthMonitor?.onPlayerBufferingState()
+                        healthMonitor?.let { mon ->
+                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                                rebufferCount = mon.rebufferCount,
+                                totalRebufferMs = mon.currentTotalRebufferDurationMs()
+                            )
+                        }
                     }
                     Player.STATE_READY -> {
                         _isBuffering.value = false
-                        healthMonitor?.markReady()
+                        val mon = healthMonitor
+                        val firstReadyTransition = mon != null && !mon.hasBecomeReady
+                        mon?.markReady()
                         _healthState.value = PlaybackHealthState.IDLE
                         sessionRetryTracker.onReadyStateReached()
                         if (!hasUnsupportedTrackError) {
@@ -456,11 +449,29 @@ class PlayerManager(
                         if (dur > 0 && dur != C.TIME_UNSET) {
                             _duration.value = dur
                         }
+                        val startupMs = if (firstReadyTransition) {
+                            (MonotonicMetrics.nowMs() - prepareStartedAtMs).coerceAtLeast(0L)
+                        } else {
+                            _playbackDiagnostics.value.startupToReadyMs
+                        }
                         // Retry budget belongs to the logical playback session; NEVER reset on STATE_READY.
-                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                        val currentDiag = _playbackDiagnostics.value.copy(
                             healthState = PlaybackHealthState.IDLE,
-                            retryCount = sessionRetryTracker.currentRetryCount(activeLogicalSessionKey)
+                            retryCount = sessionRetryTracker.currentRetryCount(activeLogicalSessionKey),
+                            startupToReadyMs = startupMs,
+                            rebufferCount = mon?.rebufferCount ?: _playbackDiagnostics.value.rebufferCount,
+                            totalRebufferMs = mon?.currentTotalRebufferDurationMs() ?: _playbackDiagnostics.value.totalRebufferMs
                         )
+                        _playbackDiagnostics.value = currentDiag
+                        if (firstReadyTransition) {
+                            PlaybackDiagnosticsLogger.log(
+                                type = PlaybackDiagnosticEventType.PLAYBACK_RESOLUTION_SUCCEEDED,
+                                scopeKey = scopeLabel,
+                                sourceId = directData.sourceId,
+                                providerLabel = providerDiagnostic,
+                                detail = "ready_ms=${startupMs ?: -1} tier=${cacheTier ?: "unknown"} ttfb_ms=${currentDiag.ttfbMs ?: -1} http=${currentDiag.lastHttpStatusCode ?: -1} range=${currentDiag.supportsByteRanges} content_type=${currentDiag.responseContentType ?: currentDiag.contentType ?: "unknown"}"
+                            )
+                        }
                         if (!player.isPlaying && player.playWhenReady) {
                             player.play()
                         }
@@ -808,9 +819,17 @@ class PlayerManager(
                             bufferedPositionMs = player.bufferedPosition,
                             lastTransferAtMs = networkTracker?.lastTransferAtMs() ?: 0L
                         )
-                        if (_healthState.value != eval.state) {
+                        val totalRebufMs = monitor.currentTotalRebufferDurationMs()
+                        if (_healthState.value != eval.state ||
+                            _playbackDiagnostics.value.rebufferCount != monitor.rebufferCount ||
+                            _playbackDiagnostics.value.totalRebufferMs != totalRebufMs
+                        ) {
                             _healthState.value = eval.state
-                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(healthState = eval.state)
+                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                                healthState = eval.state,
+                                rebufferCount = monitor.rebufferCount,
+                                totalRebufferMs = totalRebufMs
+                            )
                         }
                         if (player.isPlaying) {
                             activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
@@ -898,7 +917,8 @@ class PlayerManager(
         val bytesTransferred: Long,
         val throughputKbps: Long?,
         val lastHttpStatusCode: Int?,
-        val supportsByteRanges: Boolean?
+        val supportsByteRanges: Boolean?,
+        val responseContentType: String? = null
     )
 
     internal class PlaybackNetworkTracker(
@@ -912,6 +932,8 @@ class PlayerManager(
         private val lastStatus = AtomicInteger(-1)
         private val byteRangeSupport = AtomicInteger(-1) // -1 unknown, 0 false, 1 true
         private val hasBytes = AtomicBoolean(false)
+        @Volatile
+        private var responseContentType: String? = null
 
         fun onRequestStart() {
             firstOpenNanos.compareAndSet(0L, System.nanoTime())
@@ -924,6 +946,11 @@ class PlayerManager(
             val acceptRanges = headers.entries.firstOrNull { it.key.equals("Accept-Ranges", ignoreCase = true) }
                 ?.value?.joinToString(",")?.trim()?.lowercase()
             val hasContentRange = headers.keys.any { it.equals("Content-Range", ignoreCase = true) }
+            val ct = headers.entries.firstOrNull { it.key.equals("Content-Type", ignoreCase = true) }
+                ?.value?.firstOrNull()?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }
+            if (ct != null) {
+                responseContentType = ct
+            }
             when {
                 statusCode == 206 || hasContentRange || acceptRanges == "bytes" -> byteRangeSupport.set(1)
                 acceptRanges == "none" -> byteRangeSupport.compareAndSet(-1, 0)
@@ -969,7 +996,8 @@ class PlayerManager(
                 bytesTransferred = total,
                 throughputKbps = throughput,
                 lastHttpStatusCode = status,
-                supportsByteRanges = rangeSupport
+                supportsByteRanges = rangeSupport,
+                responseContentType = responseContentType
             )
         }
 
@@ -1015,8 +1043,89 @@ class PlayerManager(
         const val TAG = "PlayerManager"
         const val HTTP_CONNECT_TIMEOUT_MS = 12_000
         const val HTTP_READ_TIMEOUT_MS = 20_000
+        const val MIN_BUFFER_MS = 25_000
+        const val MAX_BUFFER_MS = 60_000
+        const val BUFFER_FOR_PLAYBACK_MS = 2_000
+        const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 4_000
+        const val BACK_BUFFER_MS = 15_000
         const val STALL_NO_DATA_SECONDS = PlaybackHealthMonitor.DEFAULT_STALL_NO_PROGRESS_SECONDS
         const val RECENT_TRANSFER_WINDOW_MS = PlaybackHealthMonitor.DEFAULT_RECENT_TRANSFER_WINDOW_MS
+        private const val DEFAULT_STREAM_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+        fun buildDefaultLoadControl(): DefaultLoadControl =
+            DefaultLoadControl.Builder()
+                .setAllocator(DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE))
+                .setBufferDurationsMs(
+                    MIN_BUFFER_MS,
+                    MAX_BUFFER_MS,
+                    BUFFER_FOR_PLAYBACK_MS,
+                    BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
+                )
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .setBackBuffer(BACK_BUFFER_MS, true)
+                .build()
+
+        internal fun extractConfiguredHeaderNames(headers: List<List<String>>): List<String> {
+            val names = LinkedHashSet<String>()
+            var hasUserAgent = false
+            for (pair in headers) {
+                if (pair.size < 2) continue
+                val key = pair[0].trim()
+                val value = pair[1]
+                if (key.isEmpty() || value.contains('\r') || value.contains('\n') || isRedirectSensitiveHeader(key)) continue
+                names.add(key)
+                if (key.equals("User-Agent", ignoreCase = true)) hasUserAgent = true
+                if (key.equals("Referer", ignoreCase = true)) names.add("Origin")
+            }
+            if (!hasUserAgent) names.add("User-Agent")
+            return names.toList()
+        }
+
+        internal fun buildStreamingHttpDataSourceFactory(
+            headers: List<List<String>>,
+            tracker: PlaybackNetworkTracker,
+            okHttpClient: OkHttpClient = NetworkModule.streamingOkHttpClient
+        ): HttpDataSource.Factory {
+            val rawHttpFactory = OkHttpDataSource.Factory(okHttpClient)
+            val headerMap = LinkedHashMap<String, String>()
+            var userAgentConfigured = false
+            for (headerPair in headers) {
+                if (headerPair.size >= 2) {
+                    val key = headerPair[0].trim()
+                    val value = headerPair[1].trim()
+                    if (key.isEmpty() || value.isEmpty() ||
+                        value.contains('\r') || value.contains('\n') ||
+                        isRedirectSensitiveHeader(key)
+                    ) {
+                        continue
+                    }
+                    if (key.equals("User-Agent", ignoreCase = true)) {
+                        rawHttpFactory.setUserAgent(value)
+                        userAgentConfigured = true
+                    } else {
+                        headerMap[key] = value
+                        if (key.equals("Referer", ignoreCase = true) &&
+                            headerMap.keys.none { it.equals("Origin", ignoreCase = true) }
+                        ) {
+                            runCatching {
+                                val uri = Uri.parse(value)
+                                if (uri.scheme != null && uri.host != null) {
+                                    headerMap["Origin"] = "${uri.scheme}://${uri.host}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!userAgentConfigured) {
+                rawHttpFactory.setUserAgent(DEFAULT_STREAM_USER_AGENT)
+            }
+            if (headerMap.isNotEmpty()) {
+                rawHttpFactory.setDefaultRequestProperties(headerMap)
+            }
+            return DiagnosticHttpDataSourceFactory(rawHttpFactory, tracker)
+        }
 
         /**
          * Slow-but-progressing downloads NEVER trigger stall fallback or source rediscovery.
@@ -1062,40 +1171,49 @@ class PlayerManager(
         }
 
         /**
-         * Infers MIME type from direct response data (url_type, content_type, filename, or URI path).
-         * This prevents ExoPlayer from failing when Cloudflare R2, S3, or CDN token URLs lack
-         * a file extension in their path.
+         * Infers MIME type from backend metadata (`contentType`, `urlType`), URI path, and
+         * signed-storage `response-content-type` / `response-content-disposition` (`filename=...`) parameters.
+         * Never guesses from generic arbitrary query params like `?file=...`.
          */
         fun detectMimeType(directData: DirectPlayData): String? {
             val urlType = directData.urlType.lowercase().trim()
             val contentType = directData.contentType?.lowercase() ?: ""
-            val path = Uri.parse(directData.playbackUrl).path.orEmpty().lowercase()
+            val parsedUri = runCatching { Uri.parse(directData.playbackUrl) }.getOrNull()
+            val path = parsedUri?.path.orEmpty().lowercase()
 
-            return when {
-                contentType.contains("mpegurl") || contentType.contains("m3u8") -> MimeTypes.APPLICATION_M3U8
+            return mimeTypeFromContentType(contentType)
+                ?: when (urlType) {
+                    "hls", "m3u8" -> MimeTypes.APPLICATION_M3U8
+                    "dash", "mpd" -> MimeTypes.APPLICATION_MPD
+                    "mkv", "matroska" -> MimeTypes.VIDEO_MATROSKA
+                    "mp4" -> MimeTypes.VIDEO_MP4
+                    "webm" -> MimeTypes.VIDEO_WEBM
+                    else -> null
+                }
+                ?: mimeTypeFromFilename(path)
+                ?: parsedUri?.getQueryParameter("response-content-type")?.lowercase()?.let(::mimeTypeFromContentType)
+                ?: CloudflareD1DataSource.extractResponseDispositionFilename(directData.playbackUrl)
+                    ?.lowercase()
+                    ?.let(::mimeTypeFromFilename)
+        }
 
-                contentType.contains("dash") || contentType.contains("mpd") -> MimeTypes.APPLICATION_MPD
+        private fun mimeTypeFromContentType(contentType: String): String? = when {
+            contentType.isBlank() -> null
+            contentType.contains("mpegurl") || contentType.contains("m3u8") -> MimeTypes.APPLICATION_M3U8
+            contentType.contains("dash") || contentType.contains("mpd") -> MimeTypes.APPLICATION_MPD
+            contentType.contains("matroska") || contentType.contains("x-mkv") -> MimeTypes.VIDEO_MATROSKA
+            contentType.contains("mp4") -> MimeTypes.VIDEO_MP4
+            contentType.contains("webm") -> MimeTypes.VIDEO_WEBM
+            else -> null
+        }
 
-                contentType.contains("matroska") || contentType.contains("x-mkv") -> MimeTypes.VIDEO_MATROSKA
-
-                contentType.contains("mp4") -> MimeTypes.VIDEO_MP4
-
-                contentType.contains("webm") -> MimeTypes.VIDEO_WEBM
-
-                urlType == "hls" || urlType == "m3u8" -> MimeTypes.APPLICATION_M3U8
-                urlType == "dash" || urlType == "mpd" -> MimeTypes.APPLICATION_MPD
-                urlType == "mkv" || urlType == "matroska" -> MimeTypes.VIDEO_MATROSKA
-                urlType == "mp4" -> MimeTypes.VIDEO_MP4
-                urlType == "webm" -> MimeTypes.VIDEO_WEBM
-
-                path.endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
-                path.endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
-                path.endsWith(".mkv") -> MimeTypes.VIDEO_MATROSKA
-                path.endsWith(".mp4") -> MimeTypes.VIDEO_MP4
-                path.endsWith(".webm") -> MimeTypes.VIDEO_WEBM
-
-                else -> null
-            }
+        private fun mimeTypeFromFilename(name: String): String? = when {
+            name.endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
+            name.endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
+            name.endsWith(".mkv") -> MimeTypes.VIDEO_MATROSKA
+            name.endsWith(".mp4") -> MimeTypes.VIDEO_MP4
+            name.endsWith(".webm") -> MimeTypes.VIDEO_WEBM
+            else -> null
         }
 
         fun isFfmpegLibraryAvailable(): Boolean = runCatching {

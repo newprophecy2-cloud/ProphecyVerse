@@ -159,33 +159,37 @@ class Fix3IdentityValidationTest {
 
     @Test
     fun fix3_cachedUrlFromWrongAnimeEpisodeSourceOrExpired_isRejected() {
-        val validD1 = com.example.data.d1.D1StreamUrlRecordDto(
-            id = "r1",
-            animeId = "be_3002",
-            episodeId = "be_s1_e2",
+        val validD1 = com.example.data.d1.D1StreamSourceRecordDto(
+            sourceDocKey = "r1",
+            scopeKey = "be_3002",
+            providerId = "direct",
             sourceId = "src_1",
+            sourceName = "src_1",
+            backendEpisodeId = "be_s1_e2",
             streamUrl = "https://cdn.example/s1e2.m3u8",
-            expiresAt = "2099-01-01T00:00:00Z"
+            urlType = "hls",
+            expiresAt = "2099-01-01T00:00:00Z",
+            updatedAt = 1_800_000_000_000L
         )
-        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_1").isValid)
+        assertTrue(SourceIdentityValidator.validateD1StreamSourceRecord(validD1, "be_3002", "be_s1_e2", "src_1").isValid)
 
-        val wrongAnime = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_9999", "be_s1_e2", "src_1")
+        val wrongAnime = SourceIdentityValidator.validateD1StreamSourceRecord(validD1, "be_9999", "be_s1_e2", "src_1")
         assertTrue(wrongAnime is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (wrongAnime as SourceValidationResult.Invalid).code)
 
-        val wrongEp = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e1", "src_1")
+        val wrongEp = SourceIdentityValidator.validateD1StreamSourceRecord(validD1, "be_3002", "be_s1_e1", "src_1")
         assertTrue(wrongEp is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (wrongEp as SourceValidationResult.Invalid).code)
 
-        val wrongSource = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_other")
+        val wrongSource = SourceIdentityValidator.validateD1StreamSourceRecord(validD1, "be_3002", "be_s1_e2", "src_other")
         assertTrue(wrongSource is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (wrongSource as SourceValidationResult.Invalid).code)
 
-        val expired = SourceIdentityValidator.validateD1StreamUrlRecord(validD1.copy(expiresAt = "2020-01-01T00:00:00Z"), "be_3002", "be_s1_e2", "src_1")
+        val expired = SourceIdentityValidator.validateD1StreamSourceRecord(validD1.copy(expiresAt = "2020-01-01T00:00:00Z"), "be_3002", "be_s1_e2", "src_1")
         assertTrue(expired is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.SOURCE_EXPIRED, (expired as SourceValidationResult.Invalid).code)
 
-        val badScheme = SourceIdentityValidator.validateD1StreamUrlRecord(validD1.copy(streamUrl = "ftp://bad.example/file"), "be_3002", "be_s1_e2", "src_1")
+        val badScheme = SourceIdentityValidator.validateD1StreamSourceRecord(validD1.copy(streamUrl = "ftp://bad.example/file"), "be_3002", "be_s1_e2", "src_1")
         assertTrue(badScheme is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.SOURCE_NOT_PLAYABLE, (badScheme as SourceValidationResult.Invalid).code)
     }

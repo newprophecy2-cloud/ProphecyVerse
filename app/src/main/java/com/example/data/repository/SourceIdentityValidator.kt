@@ -2,7 +2,7 @@ package com.example.data.repository
 
 import android.util.Base64
 import android.util.Log
-import com.example.data.d1.D1StreamUrlRecordDto
+import com.example.data.d1.D1StreamSourceRecordDto
 import com.example.data.local.AnimeEntry
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecyEpisodeFullResponse
@@ -244,13 +244,14 @@ object SourceIdentityValidator {
     }
 
     /**
-     * Validates a Cloudflare D1 Stream URL record keyed by (anime_id, episode_id, source_id).
+     * Validates a Cloudflare D1 `stream_sources` record keyed by `(anime_id, episode_id, source_id)`.
      */
-    fun validateD1StreamUrlRecord(
-        record: D1StreamUrlRecordDto,
+    fun validateD1StreamSourceRecord(
+        record: D1StreamSourceRecordDto,
         expectedAnimeId: String,
         expectedEpisodeId: String,
         expectedSourceId: String,
+        expectedSourceDocKey: String? = null,
         nowMs: Long = System.currentTimeMillis()
     ): SourceValidationResult {
         val normExpectedAnime = normalizeId(expectedAnimeId)
@@ -259,37 +260,58 @@ object SourceIdentityValidator {
         if (normExpectedAnime.isEmpty() || normExpectedEp.isEmpty() || normExpectedSrc.isEmpty()) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
-                "Expected D1 stream URL identity key is incomplete."
+                "Expected D1 stream source identity key is incomplete."
             )
         }
-        if (normalizeId(record.animeId) != normExpectedAnime) {
+        val normExpectedDocKey = expectedSourceDocKey?.let(::normalizeId)?.takeIf { it.isNotEmpty() }
+        if (normExpectedDocKey != null && normalizeId(record.sourceDocKey) != normExpectedDocKey) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                "D1 sourceDocKey '${record.sourceDocKey}' did not match '$normExpectedDocKey'."
+            )
+        }
+        if (record.deletedAt != null) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
+                "D1 stream source record is soft-deleted."
+            )
+        }
+        val normalizedStatus = record.status.trim().uppercase()
+        if (normalizedStatus in setOf("REMOVED", "EXPIRED", "FAILED", "TEMPORARILY_UNAVAILABLE")) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
+                "D1 stream source status '$normalizedStatus' is not playable."
+            )
+        }
+        if (normalizeId(record.scopeKey) != normExpectedAnime) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.ANIME_ID_MISMATCH,
-                "D1 anime_id '${record.animeId}' did not match '$normExpectedAnime'."
+                "D1 scopeKey/anime_id '${record.scopeKey}' did not match '$normExpectedAnime'."
             )
         }
-        if (normalizeId(record.episodeId) != normExpectedEp) {
+        if (normalizeId(record.backendEpisodeId) != normExpectedEp) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.EPISODE_ID_MISMATCH,
-                "D1 episode_id '${record.episodeId}' did not match '$normExpectedEp'."
+                "D1 backendEpisodeId/episode_id '${record.backendEpisodeId}' did not match '$normExpectedEp'."
             )
         }
         if (normalizeId(record.sourceId) != normExpectedSrc) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
-                "D1 source_id '${record.sourceId}' did not match '$normExpectedSrc'."
+                "D1 sourceId '${record.sourceId}' did not match '$normExpectedSrc'."
             )
         }
         if (!SafePlaybackHeaders.isValidStreamUrl(record.streamUrl)) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
-                "D1 cached stream_url failed scheme/validity verification."
+                "D1 cached streamUrl failed scheme/validity verification."
             )
         }
-        if (SourceExpiryTime.isExpiredOrInvalid(record.expiresAt, nowMs)) {
+        val d1ExpiryState = SourceExpiryTime.evaluateStreamExpiry(record.expiresAt, record.streamUrl, nowMs)
+        if (d1ExpiryState == ExpiryState.EXPIRED || d1ExpiryState == ExpiryState.INVALID) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.SOURCE_EXPIRED,
-                "D1 cached stream_url for '$normExpectedSrc' is expired or has invalid expiry."
+                "D1 cached streamUrl for '$normExpectedSrc' is expired or has invalid expiry."
             )
         }
         return SourceValidationResult.Valid
@@ -298,7 +320,8 @@ object SourceIdentityValidator {
     /**
      * Validates a resolved [DirectPlayData] returned from cache or `/api/v1/play/direct`.
      * Allows legitimate provider-specific source IDs distinct from canonical episode IDs,
-     * and treats blank/null `expiresAt` as valid while enforcing exact normalized `sourceId` identity.
+     * and treats blank/null `expiresAt` as valid while enforcing exact normalized `sourceId` identity
+     * and presigned URL expiry.
      */
     fun validateDirectPlayData(
         data: DirectPlayData,
@@ -331,7 +354,8 @@ object SourceIdentityValidator {
                 "Direct-play URL failed scheme/validity verification."
             )
         }
-        if (SourceExpiryTime.isExpiredOrInvalid(data.expiresAt, nowMs)) {
+        val playExpiryState = SourceExpiryTime.evaluateStreamExpiry(data.expiresAt, data.playbackUrl, nowMs)
+        if (playExpiryState == ExpiryState.EXPIRED || playExpiryState == ExpiryState.INVALID) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.SOURCE_EXPIRED,
                 "Direct-play URL for '$normExpected' is already expired."

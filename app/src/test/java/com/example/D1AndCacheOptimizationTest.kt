@@ -7,7 +7,7 @@ import com.example.data.cache.MemoryCacheManager
 import com.example.data.d1.CloudflareD1ApiService
 import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1BooleanAdapterFactory
-import com.example.data.d1.D1StreamUrlRecordDto
+import com.example.data.d1.D1StreamSourceRecordDto
 import com.example.data.d1.SharedPreferencesD1DigestStore
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
@@ -131,45 +131,52 @@ class D1AndCacheOptimizationTest {
     }
 
     @Test
-    fun d1StreamUrlRecordDto_serialization_andIdentityExpiryValidation() {
-        val adapter = moshi.adapter(D1StreamUrlRecordDto::class.java)
+    fun d1StreamSourceRecordDto_serialization_andIdentityExpiryValidation() {
+        val adapter = moshi.adapter(D1StreamSourceRecordDto::class.java)
         val raw = """
             {
-              "id": "rec_21",
-              "anime_id": "be_21",
-              "episode_id": "be_ep_1",
-              "source_id": "src_1080p",
-              "stream_url": "https://cdn.example/master.m3u8",
-              "expires_at": "2099-01-01T00:00:00Z"
+              "sourceDocKey": "rec_21",
+              "scopeKey": "be_21",
+              "providerId": "direct",
+              "sourceId": "src_1080p",
+              "sourceName": "src_1080p",
+              "backendEpisodeId": "be_ep_1",
+              "streamUrl": "https://cdn.example/master.m3u8",
+              "urlType": "hls",
+              "expiresAt": "2099-01-01T00:00:00Z",
+              "status": "AVAILABLE",
+              "version": 1,
+              "updatedAt": 1800000000000,
+              "deletedAt": null
             }
         """.trimIndent()
         val parsed = adapter.fromJson(raw)!!
-        assertEquals("be_21", parsed.animeId)
-        assertEquals("be_ep_1", parsed.episodeId)
+        assertEquals("be_21", parsed.scopeKey)
+        assertEquals("be_ep_1", parsed.backendEpisodeId)
         assertEquals("src_1080p", parsed.sourceId)
         assertEquals("https://cdn.example/master.m3u8", parsed.streamUrl)
         assertEquals("2099-01-01T00:00:00Z", parsed.expiresAt)
 
         assertTrue(
-            SourceIdentityValidator.validateD1StreamUrlRecord(parsed, "be_21", "be_ep_1", "src_1080p").isValid
+            SourceIdentityValidator.validateD1StreamSourceRecord(parsed, "be_21", "be_ep_1", "src_1080p").isValid
         )
         assertTrue(
-            SourceIdentityValidator.validateD1StreamUrlRecord(
+            SourceIdentityValidator.validateD1StreamSourceRecord(
                 parsed.copy(expiresAt = null), "be_21", "be_ep_1", "src_1080p"
             ).isValid
         )
         assertTrue(
-            SourceIdentityValidator.validateD1StreamUrlRecord(
+            SourceIdentityValidator.validateD1StreamSourceRecord(
                 parsed.copy(expiresAt = "2020-01-01T00:00:00Z"), "be_21", "be_ep_1", "src_1080p"
             ) is SourceValidationResult.Invalid
         )
         assertTrue(
-            SourceIdentityValidator.validateD1StreamUrlRecord(
+            SourceIdentityValidator.validateD1StreamSourceRecord(
                 parsed.copy(streamUrl = "ftp://bad-scheme.example/video.mp4"), "be_21", "be_ep_1", "src_1080p"
             ) is SourceValidationResult.Invalid
         )
         assertTrue(
-            SourceIdentityValidator.validateD1StreamUrlRecord(
+            SourceIdentityValidator.validateD1StreamSourceRecord(
                 parsed, "be_other", "be_ep_1", "src_1080p"
             ) is SourceValidationResult.Invalid
         )
@@ -184,38 +191,48 @@ class D1AndCacheOptimizationTest {
         val missingRecId = CloudflareD1DataSource.deterministicRecordId("be_404", "ep_404_1", "src_missing")
         val badRecId = CloudflareD1DataSource.deterministicRecordId("be_400", "ep_400_1", "src_bad")
 
+        val store = ConcurrentHashMap<String, String>()
+        val initialRec = """{"sourceDocKey":"$recId","scopeKey":"be_101","providerId":"direct","sourceId":"src_1","sourceName":"src_1","backendEpisodeId":"ep_101_1","streamUrl":"https://cdn.example/101.m3u8","urlType":"hls","expiresAt":"2099-01-01T00:00:00Z","status":"AVAILABLE","version":1,"updatedAt":1800000000000,"deletedAt":null}"""
+
         val api = startMockD1Server { exchange ->
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
                 method == "GET" && path == "/v1/tables" -> {
-                    sendJson(exchange, 200, """{"success":true,"count":1,"tables":["stream_urls"]}""")
+                    sendJson(exchange, 200, """{"success":true,"count":1,"tables":["stream_sources"]}""")
                 }
-                method == "GET" && path == "/v1/tables/stream_urls/$recId" -> {
+                method == "GET" && path == "/v1/tables/stream_sources" -> {
+                    sendJson(exchange, 200, """{"success":true,"table":"stream_sources","total":${store.size},"limit":1,"offset":0,"count":0,"data":[]}""")
+                }
+                method == "GET" && path == "/v1/tables/stream_sources/$recId" -> {
                     val attempt = getAttempts.incrementAndGet()
                     when (attempt) {
                         1 -> sendJson(exchange, 429, """{"success":false,"error":"Rate limited"}""")
                         2 -> sendJson(exchange, 503, """{"success":false,"error":"Transient"}""")
-                        else -> sendJson(
-                            exchange,
-                            200,
-                            """{"success":true,"data":{"id":"$recId","anime_id":"be_101","episode_id":"ep_101_1","source_id":"src_1","stream_url":"https://cdn.example/101.m3u8","expires_at":"2099-01-01T00:00:00Z"}}"""
-                        )
+                        else -> {
+                            val current = store[recId] ?: initialRec
+                            store.putIfAbsent(recId, initialRec)
+                            sendJson(exchange, 200, """{"success":true,"table":"stream_sources","data":$current}""")
+                        }
                     }
                 }
-                method == "GET" && path == "/v1/tables/stream_urls/$missingRecId" -> {
+                method == "GET" && path == "/v1/tables/stream_sources/$missingRecId" -> {
                     sendJson(exchange, 404, """{"success":false,"error":"Record not found"}""")
                 }
-                method == "GET" && path == "/v1/tables/stream_urls/$badRecId" -> {
+                method == "GET" && path == "/v1/tables/stream_sources/$badRecId" -> {
                     sendJson(exchange, 400, """{"success":false,"error":"Bad request"}""")
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     upsertPosts.incrementAndGet()
-                    capturedPosts.add(exchange.requestBody.bufferedReader().readText())
-                    sendJson(exchange, 200, """{"success":true,"message":"Upserted"}""")
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    capturedPosts.add(body)
+                    store[recId] = body
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
-                method == "DELETE" && path.startsWith("/v1/tables/stream_urls/") -> {
-                    sendJson(exchange, 200, """{"success":true,"message":"Deleted"}""")
+                method == "DELETE" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val delId = path.removePrefix("/v1/tables/stream_sources/")
+                    store.remove(delId)
+                    sendJson(exchange, 200, """{"success":true,"message":"Record deleted","table":"stream_sources","changes":1}""")
                 }
                 else -> sendJson(exchange, 404, """{"success":false,"error":"Unhandled"}""")
             }
@@ -242,15 +259,15 @@ class D1AndCacheOptimizationTest {
         assertNull(d1.getValidStreamUrl("be_404", "ep_404_1", "src_missing"))
         assertNull(d1.getValidStreamUrl("be_400", "ep_400_1", "src_bad"))
 
-        // Diff-checked write: unchanged record already remembered from GET is skipped
+        // Diff-checked write: unchanged record confirmed present remotely is skipped
         assertTrue(d1.saveStreamUrl("be_101", "ep_101_1", "src_1", "https://cdn.example/101.m3u8", "2099-01-01T00:00:00Z"))
         assertEquals(0, upsertPosts.get())
         assertTrue(metricsTracker.snapshot().d1WriteSkipsUnchanged >= 1L)
 
-        // New URL without known expiry saves omitting bogus expires_at, and repeat write is skipped
+        // New URL without known expiry saves with explicit null expiresAt (never fabricated), and repeat write is skipped when remote confirms
         assertTrue(d1.saveStreamUrl("be_101", "ep_101_1", "src_1", "https://cdn.example/101_new.mp4", expiresAt = null))
         assertEquals(1, upsertPosts.get())
-        assertFalse(capturedPosts.single().contains("expires_at"))
+        assertTrue(capturedPosts.single().contains(""""expiresAt":null"""))
         assertTrue(d1.saveStreamUrl("be_101", "ep_101_1", "src_1", "https://cdn.example/101_new.mp4", expiresAt = null))
         assertEquals(1, upsertPosts.get())
 
@@ -325,19 +342,19 @@ class D1AndCacheOptimizationTest {
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
+                method == "GET" && path.startsWith("/v1/tables/stream_sources/") -> {
                     d1GetCalls.incrementAndGet()
-                    val recId = path.removePrefix("/v1/tables/stream_urls/")
+                    val recId = path.removePrefix("/v1/tables/stream_sources/")
                     val raw = d1Store[recId]
-                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
-                    else sendJson(exchange, 200, """{"success":true,"data":$raw}""")
+                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Record not found"}""")
+                    else sendJson(exchange, 200, """{"success":true,"table":"stream_sources","data":$raw}""")
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     d1PostCalls.incrementAndGet()
                     val body = exchange.requestBody.bufferedReader().readText()
-                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    val recId = Regex(""""sourceDocKey"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
                     if (recId.isNotEmpty()) d1Store[recId] = body
-                    sendJson(exchange, 200, """{"success":true,"message":"Upserted"}""")
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
                 else -> sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
             }
@@ -451,7 +468,7 @@ class D1AndCacheOptimizationTest {
 
         val saveDeadline = System.currentTimeMillis() + 2000L
         while (d1Store.isEmpty() && System.currentTimeMillis() < saveDeadline) Thread.sleep(20L)
-        assertTrue("D1 stream_urls must contain newly resolved URL", d1Store.isNotEmpty())
+        assertTrue("D1 stream_sources must contain newly resolved URL", d1Store.isNotEmpty())
 
         // 4. Clearing Memory -> next resolve hits D1 with ZERO additional Backend direct-play calls!
         memCache.invalidatePlayback("src_d1_1", "anime:500:s1:e1")

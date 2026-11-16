@@ -101,18 +101,31 @@ class Fix5DuplicateWritesTest {
     }
 
     @Test
-    fun fix5_d1DigestPersistsAcrossRestart_andSkipsUnchangedWrites() = runBlocking {
+    fun fix5_d1DigestPersistsAcrossRestart_andSkipsUnchangedWritesAfterRemoteVerification() = runBlocking {
         val streamUrlWrites = AtomicInteger(0)
+        val remoteRows = ConcurrentHashMap<String, String>()
 
         val api = startMockD1Server { exchange ->
             val method = exchange.requestMethod
             val path = exchange.requestURI.path
             when {
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     streamUrlWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    val id = Regex(""""sourceDocKey"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    remoteRows[id] = body
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
-                else -> sendJson(exchange, 200, """{"success":true,"data":[]}""")
+                method == "GET" && path.startsWith("/v1/tables/stream_sources/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_sources/")
+                    val row = remoteRows[id]
+                    if (row == null) {
+                        sendJson(exchange, 404, """{"success":false,"error":"Record not found"}""")
+                    } else {
+                        sendJson(exchange, 200, """{"success":true,"table":"stream_sources","data":$row}""")
+                    }
+                }
+                else -> sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
             }
         }
 
@@ -130,6 +143,7 @@ class Fix5DuplicateWritesTest {
         assertEquals(1, streamUrlWrites.get())
 
         // Simulate fresh app restart: brand new CloudflareD1DataSource backed by SharedPreferencesD1DigestStore
+        // Remote row is still present and matches digest -> skips redundant POST upsert
         val store2 = SharedPreferencesD1DigestStore(context)
         val ds2 = CloudflareD1DataSource(api, metricsTracker, store2)
         assertTrue(
@@ -141,10 +155,10 @@ class Fix5DuplicateWritesTest {
                 expiresAt = "2099-01-01T00:00:00Z"
             )
         )
-        assertEquals("Restart with persisted digest must not re-write unchanged stream URL", 1, streamUrlWrites.get())
+        assertEquals("Restart with persisted digest and verified remote row must not re-write unchanged stream URL", 1, streamUrlWrites.get())
         assertTrue(metricsTracker.snapshot().d1WriteSkipsUnchanged >= 1)
 
-        // Mutating stream_url still triggers an updated D1 write
+        // Mutating streamUrl still triggers an updated D1 write
         assertTrue(
             ds2.saveStreamUrl(
                 animeId = "be_501",
@@ -174,27 +188,32 @@ class Fix5DuplicateWritesTest {
     fun fix5_concurrentIdenticalD1ReadsAndWritesCoalesceUnderPerKeyLock() = runBlocking {
         val streamUrlReads = AtomicInteger(0)
         val streamUrlWrites = AtomicInteger(0)
+        val remoteRows = ConcurrentHashMap<String, String>()
         val recId = CloudflareD1DataSource.deterministicRecordId("be_502", "ep_502_1", "s1")
+        remoteRows[recId] = """{"sourceDocKey":"$recId","scopeKey":"be_502","providerId":"direct","sourceId":"s1","sourceName":"s1","backendEpisodeId":"ep_502_1","streamUrl":"https://cdn.example.com/a.m3u8","urlType":"hls","expiresAt":"2099-01-01T00:00:00Z","status":"AVAILABLE","version":1,"updatedAt":1800000000000,"deletedAt":null}"""
 
         val api = startMockD1Server { exchange ->
             val method = exchange.requestMethod
             val path = exchange.requestURI.path
             when {
-                method == "GET" && path == "/v1/tables/stream_urls/$recId" -> {
+                method == "GET" && path == "/v1/tables/stream_sources/$recId" -> {
                     Thread.sleep(20)
                     streamUrlReads.incrementAndGet()
+                    val row = remoteRows[recId]
                     sendJson(
                         exchange,
                         200,
-                        """{"success":true,"data":{"id":"$recId","anime_id":"be_502","episode_id":"ep_502_1","source_id":"s1","stream_url":"https://cdn.example.com/a.m3u8","expires_at":"2099-01-01T00:00:00Z"}}"""
+                        """{"success":true,"table":"stream_sources","data":$row}"""
                     )
                 }
-                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
                     Thread.sleep(15)
                     streamUrlWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    remoteRows[recId] = body
+                    sendJson(exchange, 200, """{"success":true,"message":"Record saved","table":"stream_sources","data":$body}""")
                 }
-                else -> sendJson(exchange, 200, """{"success":true}""")
+                else -> sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
             }
         }
 
@@ -217,6 +236,6 @@ class Fix5DuplicateWritesTest {
             }
         }.awaitAll()
         assertTrue(writeResults.all { it })
-        assertEquals("Concurrent identical D1 stream_url writes must coalesce to 1 POST", 1, streamUrlWrites.get())
+        assertEquals("Concurrent identical D1 stream_sources writes must coalesce to 1 POST", 1, streamUrlWrites.get())
     }
 }

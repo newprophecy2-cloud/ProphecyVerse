@@ -415,6 +415,26 @@ object NetworkModule {
             .build()
     }
 
+    /**
+     * Dedicated streaming OkHttpClient for Media3 OkHttpDataSource:
+     * shares the warm TLS/HTTP2 connection pool, avoids OkHttp 10MB API disk cache contention,
+     * enables cross-host CDN redirects, and uses callTimeout=0 so sustained Range video transfers
+     * are never killed mid-stream while connect/read timeouts bound hung sockets.
+     */
+    val streamingOkHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectionPool(sharedConnectionPool)
+            .cache(null)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.MILLISECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+
     val d1OkHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectionPool(sharedConnectionPool)

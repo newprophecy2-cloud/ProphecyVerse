@@ -8,7 +8,7 @@ import com.example.data.d1.CloudflareD1ApiService
 import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1ListResponse
 import com.example.data.d1.D1RecordResponse
-import com.example.data.d1.D1StreamUrlRecordDto
+import com.example.data.d1.D1StreamSourceRecordDto
 import com.example.data.d1.D1TablesResponse
 import com.example.data.d1.InMemoryD1DigestStore
 import com.example.data.local.AnimeEntry
@@ -458,7 +458,22 @@ class PlaybackRepairV3Test {
         )
         assertEquals("After 404 miss cleared digest, identical URL must be written back to D1", 2, fakeApi.writeCount)
 
-        // 2. Cold restart with persisted digest older than 10 minutes must NOT skip write
+        // 2. Remote deletion WITHOUT prior GET (even while in-memory digest is hot!) MUST still re-save to D1
+        fakeApi.records.clear()
+        assertTrue(
+            d1.saveStreamUrl(
+                animeId = "be_1",
+                episodeId = "ep_1",
+                sourceId = "src_1",
+                streamUrl = "https://cdn.example/video.m3u8",
+                expiresAt = "2099-01-01T00:00:00Z",
+                nowMs = now + 3_000L
+            )
+        )
+        assertEquals("Hot local digest must not block re-saving after remote delete", 3, fakeApi.writeCount)
+        assertTrue(fakeApi.records.containsKey(CloudflareD1DataSource.deterministicRecordId("be_1", "ep_1", "src_1")))
+
+        // 3. Cold restart with persisted digest older than 10 minutes must NOT skip write
         fakeApi.records.clear()
         val coldD1 = CloudflareD1DataSource(api = fakeApi, digestStore = digestStore)
         assertTrue(
@@ -471,14 +486,22 @@ class PlaybackRepairV3Test {
                 nowMs = now + 15 * 60 * 1_000L
             )
         )
-        assertEquals("Stale persisted digest (>10m) must force a fresh D1 write", 3, fakeApi.writeCount)
+        assertEquals("Stale persisted digest (>10m) must force a fresh D1 write", 4, fakeApi.writeCount)
 
-        // 3. verifyHealth checks explicitly for 'stream_urls' table
+        // 4. verifyHealth checks real queryability of canonical 'stream_sources' table
         val missingTableApi = object : CloudflareD1ApiService by fakeApi {
             override suspend fun listTables(): Response<D1TablesResponse> =
-                Response.success(D1TablesResponse(success = true, count = 1, tables = listOf("stream_sources")))
+                Response.success(D1TablesResponse(success = true, count = 1, tables = listOf("stream_urls")))
         }
         assertFalse(CloudflareD1DataSource(api = missingTableApi).verifyHealth())
+        val failingProbeApi = object : CloudflareD1ApiService by fakeApi {
+            override suspend fun listStreamSources(where: String?, limit: Int?, offset: Int?) =
+                Response.error<com.example.data.d1.D1ListResponse<com.example.data.d1.D1StreamSourceRecordDto>>(
+                    404,
+                    """{"success":false,"error":"Table not found","table":"stream_sources"}""".toResponseBody(null)
+                )
+        }
+        assertFalse(CloudflareD1DataSource(api = failingProbeApi).verifyHealth())
         assertTrue(d1.verifyHealth())
     }
 

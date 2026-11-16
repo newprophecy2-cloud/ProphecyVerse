@@ -963,6 +963,7 @@ class PlayerViewModel(
         sessionRecoveryMarkers.clear()
         recoveryCoordinator.beginGeneration(requestGeneration)
         playbackResolutionJob?.cancel()
+        playerManager.stopActivePlaybackForSwitch()
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
         _availableSources.value = emptyList()
@@ -1016,7 +1017,8 @@ class PlayerViewModel(
                             onPlaybackFailed = null,
                             onRetryNeeded = {},
                             providerName = "Offline",
-                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, requestGeneration)
+                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, requestGeneration),
+                            cacheTier = "OFFLINE"
                         )
                         return@launch
                     }
@@ -1069,7 +1071,8 @@ class PlayerViewModel(
                             providerName = prepared.source.displayProviderName,
                             sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, requestGeneration),
                             sourceQuality = prepared.source.quality,
-                            resolveDurationMs = 0L
+                            resolveDurationMs = 0L,
+                            cacheTier = "PRE_RESOLVED"
                         )
                         preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
                         return@launch
@@ -1399,6 +1402,7 @@ class PlayerViewModel(
 
             var resolvedDurationMs = 0L
             var resolvedFromCache = false
+            var resolvedCacheTier: String? = null
             val matchesPreResolved = i == 0 && !forceFresh && preResolved != null &&
                 com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(preResolved.source.id, source.id) &&
                 com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(
@@ -1410,6 +1414,7 @@ class PlayerViewModel(
             var playRes = if (matchesPreResolved && preResolved != null) {
                 resolvedDurationMs = preResolved.resolveDurationMs
                 resolvedFromCache = preResolved.cacheTier != "BACKEND_RESOLVE"
+                resolvedCacheTier = preResolved.cacheTier
                 Result.success(preResolved.directData)
             } else {
                 repository.resolveVerifiedPlaybackForEpisode(
@@ -1421,6 +1426,7 @@ class PlayerViewModel(
                 ).map {
                     resolvedDurationMs = it.resolveDurationMs
                     resolvedFromCache = it.cacheTier != "BACKEND_RESOLVE"
+                    resolvedCacheTier = it.cacheTier
                     it.directData
                 }
             }
@@ -1441,6 +1447,7 @@ class PlayerViewModel(
                 ).map {
                     resolvedDurationMs = it.resolveDurationMs
                     resolvedFromCache = false
+                    resolvedCacheTier = it.cacheTier
                     it.directData
                 }
             }
@@ -1504,7 +1511,8 @@ class PlayerViewModel(
                     ),
                     sourceQuality = source.quality,
                     resolveDurationMs = resolvedDurationMs,
-                    isRecoveryAttempt = isRecoveryAttempt
+                    isRecoveryAttempt = isRecoveryAttempt,
+                    cacheTier = resolvedCacheTier
                 )
 
                 return

@@ -8,6 +8,7 @@ import com.squareup.moshi.JsonReader
 import com.squareup.moshi.JsonWriter
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.ToJson
+import com.squareup.moshi.Types
 import java.lang.reflect.Type
 
 /**
@@ -60,10 +61,70 @@ object NullableD1BooleanAdapter : JsonAdapter<Boolean?>() {
 
 object D1BooleanAdapterFactory : JsonAdapter.Factory {
     override fun create(type: Type, annotations: MutableSet<out Annotation>, moshi: Moshi): JsonAdapter<*>? {
-        return when (type) {
+        if (annotations.isNotEmpty()) return null
+        return when (Types.getRawType(type)) {
             Boolean::class.javaPrimitiveType -> D1BooleanAdapter
             Boolean::class.javaObjectType -> NullableD1BooleanAdapter
+            D1StreamSourceRecordDto::class.java -> {
+                val delegate = moshi.nextAdapter<D1StreamSourceRecordDto>(this, type, annotations)
+                D1StreamSourceRecordJsonAdapter(delegate)
+            }
             else -> null
+        }
+    }
+}
+
+/**
+ * Ensures `expiresAt` and `deletedAt` are always serialized (including explicit `null`)
+ * so Worker `ON CONFLICT DO UPDATE SET` clears stale expiry/deletion timestamps when
+ * an entry is re-saved with unknown expiry (`expiresAt = null`) or restored after soft-delete.
+ */
+private class D1StreamSourceRecordJsonAdapter(
+    private val delegate: JsonAdapter<D1StreamSourceRecordDto>
+) : JsonAdapter<D1StreamSourceRecordDto>() {
+    override fun fromJson(reader: JsonReader): D1StreamSourceRecordDto? = delegate.fromJson(reader)
+
+    override fun toJson(writer: JsonWriter, value: D1StreamSourceRecordDto?) {
+        if (value == null) {
+            writer.nullValue()
+            return
+        }
+        val previousSerializeNulls = writer.serializeNulls
+        writer.serializeNulls = true
+        try {
+            writer.beginObject()
+            writer.name("sourceDocKey"); writer.value(value.sourceDocKey)
+            writer.name("scopeKey"); writer.value(value.scopeKey)
+            writer.name("providerId"); writer.value(value.providerId)
+            writer.name("sourceId"); writer.value(value.sourceId)
+            writer.name("sourceName"); writer.value(value.sourceName)
+            writer.name("backendEpisodeId")
+            if (value.backendEpisodeId == null) writer.nullValue() else writer.value(value.backendEpisodeId)
+            writer.name("streamUrl")
+            if (value.streamUrl == null) writer.nullValue() else writer.value(value.streamUrl)
+            writer.name("urlType"); writer.value(value.urlType)
+            value.contentType?.let { writer.name("contentType"); writer.value(it) }
+            value.quality?.let { writer.name("quality"); writer.value(it) }
+            value.codec?.let { writer.name("codec"); writer.value(it) }
+            value.audioLanguage?.let { writer.name("audioLanguage"); writer.value(it) }
+            value.downloadable?.let {
+                writer.name("downloadable")
+                D1BooleanAdapter.toJson(writer, it)
+            }
+            value.sizeBytes?.let { writer.name("sizeBytes"); writer.value(it) }
+            value.safeHeadersJson?.let { writer.name("safeHeadersJson"); writer.value(it) }
+            writer.name("expiresAt")
+            if (value.expiresAt == null) writer.nullValue() else writer.value(value.expiresAt)
+            writer.name("status"); writer.value(value.status)
+            writer.name("version"); writer.value(value.version)
+            value.lastVerifiedAt?.let { writer.name("lastVerifiedAt"); writer.value(it) }
+            value.lastPlaybackSuccessAt?.let { writer.name("lastPlaybackSuccessAt"); writer.value(it) }
+            writer.name("updatedAt"); writer.value(value.updatedAt)
+            writer.name("deletedAt")
+            if (value.deletedAt == null) writer.nullValue() else writer.value(value.deletedAt)
+            writer.endObject()
+        } finally {
+            writer.serializeNulls = previousSerializeNulls
         }
     }
 }
@@ -94,20 +155,42 @@ data class D1RecordResponse<T>(
     val table: String? = null,
     val message: String? = null,
     val data: T? = null,
+    val changes: Int? = null,
     val error: String? = null
 )
 
 /**
- * Cloudflare D1 Stream URL cache record.
- * Stores resolved Stream URLs only, keyed by (anime_id, episode_id, source_id),
- * with optional expires_at recorded ONLY when actual expiry is known.
+ * Canonical Cloudflare D1 `stream_sources` table record.
+ * Maps the composite identity `(anime_id, episode_id, source_id)` onto `stream_sources` columns:
+ * - `sourceDocKey`: deterministic primary key from `(anime_id, episode_id, source_id)`
+ * - `scopeKey`: canonical `anime_id`
+ * - `backendEpisodeId`: canonical `episode_id`
+ * - `sourceId`: canonical `source_id`
+ * - `streamUrl`: validated resolved playback URL
+ * - `expiresAt`: nullable ISO-8601 expiry timestamp (ONLY set when actual expiry is known)
  */
 @JsonClass(generateAdapter = true)
-data class D1StreamUrlRecordDto(
-    @Json(name = "id") val id: String? = null,
-    @Json(name = "anime_id") val animeId: String = "",
-    @Json(name = "episode_id") val episodeId: String = "",
-    @Json(name = "source_id") val sourceId: String = "",
-    @Json(name = "stream_url") val streamUrl: String = "",
-    @Json(name = "expires_at") val expiresAt: String? = null
+data class D1StreamSourceRecordDto(
+    @Json(name = "sourceDocKey") val sourceDocKey: String = "",
+    @Json(name = "scopeKey") val scopeKey: String = "",
+    @Json(name = "providerId") val providerId: String = "direct",
+    @Json(name = "sourceId") val sourceId: String = "",
+    @Json(name = "sourceName") val sourceName: String = "",
+    @Json(name = "backendEpisodeId") val backendEpisodeId: String? = null,
+    @Json(name = "streamUrl") val streamUrl: String? = null,
+    @Json(name = "urlType") val urlType: String = "direct",
+    @Json(name = "contentType") val contentType: String? = null,
+    @Json(name = "quality") val quality: String? = null,
+    @Json(name = "codec") val codec: String? = null,
+    @Json(name = "audioLanguage") val audioLanguage: String? = null,
+    @Json(name = "downloadable") val downloadable: Boolean? = null,
+    @Json(name = "sizeBytes") val sizeBytes: Long? = null,
+    @Json(name = "safeHeadersJson") val safeHeadersJson: String? = null,
+    @Json(name = "expiresAt") val expiresAt: String? = null,
+    @Json(name = "status") val status: String = "AVAILABLE",
+    @Json(name = "version") val version: Long = 1L,
+    @Json(name = "lastVerifiedAt") val lastVerifiedAt: Long? = null,
+    @Json(name = "lastPlaybackSuccessAt") val lastPlaybackSuccessAt: Long? = null,
+    @Json(name = "updatedAt") val updatedAt: Long = 0L,
+    @Json(name = "deletedAt") val deletedAt: Long? = null
 )

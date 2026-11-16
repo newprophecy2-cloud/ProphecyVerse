@@ -6,6 +6,8 @@ import com.example.data.metrics.PlaybackDiagnosticEvent
 import com.example.data.metrics.PlaybackDiagnosticsLogger
 import com.example.data.repository.ExpiryState
 import com.example.data.repository.SourceExpiryTime
+import com.example.data.repository.SourceIdentityValidator
+import com.example.data.repository.SourceValidationResult
 import com.example.data.streaming.MonotonicMetrics
 import com.example.data.streaming.SafePlaybackHeaders
 import kotlinx.coroutines.CancellationException
@@ -18,7 +20,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
-import org.json.JSONObject
 import retrofit2.Response
 import java.io.IOException
 import java.security.MessageDigest
@@ -94,8 +95,9 @@ class SharedPreferencesD1DigestStore(context: android.content.Context) : D1Diges
 
 /**
  * Cloudflare D1 REST Data Source backed by the Prophecy-verse-DB Worker API.
- * Strictly stores and validates resolved Stream URLs only, keyed by (anime_id, episode_id, source_id),
- * storing expires_at only when actual expiry is known.
+ * Strictly stores and validates resolved Stream URLs in the canonical `stream_sources` table,
+ * keyed by `(anime_id, episode_id, source_id)` via deterministic `sourceDocKey`,
+ * storing `expiresAt` ONLY when actual expiry is known.
  */
 class CloudflareD1DataSource(
     private val api: CloudflareD1ApiService,
@@ -107,7 +109,18 @@ class CloudflareD1DataSource(
         val episodeId: String,
         val sourceId: String,
         val streamUrl: String,
-        val expiresAt: String? = null
+        val expiresAt: String? = null,
+        val urlType: String = "direct",
+        val contentType: String? = null,
+        val safeHeadersJson: String? = null,
+        val safeHeaders: List<List<String>> = emptyList(),
+        val providerId: String? = null,
+        val quality: String? = null,
+        val codec: String? = null,
+        val audioLanguage: String? = null,
+        val downloadable: Boolean? = null,
+        val sizeBytes: Long? = null,
+        val lookupDurationMs: Long = 0L
     )
 
     private val singleFlightScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -174,6 +187,7 @@ class CloudflareD1DataSource(
     private suspend fun <T> executeWithRetry(
         operationName: String,
         isWrite: Boolean = false,
+        maxRetries: Int = MAX_RETRIES,
         call: suspend () -> Response<T>
     ): Response<T>? {
         var attempt = 0
@@ -198,9 +212,11 @@ class CloudflareD1DataSource(
                     return response
                 }
                 val transient = code == 429 || code in 500..599
-                if (!transient || attempt >= MAX_RETRIES) {
+                if (!transient || attempt >= maxRetries) {
                     metricsTracker.recordD1Error(elapsed)
-                    val errBody = runCatching { response.errorBody()?.string()?.take(180) }.getOrNull()
+                    val errBody = runCatching { response.errorBody()?.string()?.take(180) }
+                        .getOrNull()
+                        ?.let(PlaybackDiagnosticsLogger::sanitize)
                     Log.w(TAG, "D1 $operationName failed with HTTP $code ${errBody.orEmpty()}".trim())
                     return response
                 }
@@ -209,7 +225,7 @@ class CloudflareD1DataSource(
             } catch (e: IOException) {
                 val elapsed = (MonotonicMetrics.nowMs() - startedAt).coerceAtLeast(0L)
                 metricsTracker.recordApiRequest(false)
-                if (attempt >= MAX_RETRIES) {
+                if (attempt >= maxRetries) {
                     metricsTracker.recordD1Error(elapsed)
                     Log.w(TAG, "D1 $operationName network error: ${e::class.simpleName}")
                     return null
@@ -236,20 +252,34 @@ class CloudflareD1DataSource(
         else -> 0
     }
 
+    /**
+     * Verifies D1 Worker health and real queryability of the canonical `stream_sources` table.
+     */
     suspend fun verifyHealth(): Boolean {
-        val resp = executeWithRetry("verifyHealth") { api.listTables() } ?: return false
-        val body = resp.body() ?: return false
-        if (!resp.isSuccessful || !body.success) return false
-        val hasStreamUrlsTable = body.tables.any { it.equals("stream_urls", ignoreCase = true) }
-        if (!hasStreamUrlsTable) {
-            Log.w(TAG, "D1 health check schema mismatch: 'stream_urls' table missing; available=${body.tables}")
+        val tablesResp = executeWithRetry("verifyHealthTables") { api.listTables() } ?: return false
+        val tablesBody = tablesResp.body() ?: return false
+        if (!tablesResp.isSuccessful || !tablesBody.success) return false
+        val hasCanonicalTable = tablesBody.tables.any { it.equals(CANONICAL_TABLE, ignoreCase = true) }
+        if (!hasCanonicalTable) {
+            Log.w(TAG, "D1 health check schema mismatch: '$CANONICAL_TABLE' table missing; available=${tablesBody.tables}")
+            return false
         }
-        return hasStreamUrlsTable
+
+        val probeResp = executeWithRetry("verifyHealthStreamSources") { api.listStreamSources(limit = 1) } ?: return false
+        val probeBody = probeResp.body() ?: return false
+        if (!probeResp.isSuccessful || !probeBody.success) return false
+        val tableMatches = probeBody.table.isNullOrBlank() ||
+            probeBody.table.equals(CANONICAL_TABLE, ignoreCase = true)
+        if (!tableMatches) {
+            Log.w(TAG, "D1 health check unexpected table '${probeBody.table}' for '$CANONICAL_TABLE'")
+        }
+        return tableMatches
     }
 
     /**
-     * Looks up a cached Stream URL from D1 by exact (anime_id, episode_id, source_id).
-     * Validates URL scheme/host and expiry; treats expired, invalid, or unavailable entries as misses.
+     * Looks up a cached Stream URL from D1 `stream_sources` by exact `(anime_id, episode_id, source_id)`.
+     * Primary lookup uses deterministic `sourceDocKey`; if absent (404), queries matching rows via
+     * structured JSON `where` filter and strictly filters deleted/expired/unplayable/mismatched records.
      */
     suspend fun getValidStreamUrl(
         animeId: String,
@@ -264,117 +294,301 @@ class CloudflareD1DataSource(
 
         val lockKey = digestKey(normAnime, normEpisode, normSource)
         val recordId = deterministicRecordId(normAnime, normEpisode, normSource)
-        val flightKey = "stream_url:$normAnime|$normEpisode|$normSource"
+        val flightKey = "stream_source:$normAnime|$normEpisode|$normSource"
         return coalesceRead(flightKey) {
-            val resp = executeWithRetry("getStreamUrl") {
-                api.getStreamUrl(recordId)
+            val lookupStartedAt = MonotonicMetrics.nowMs()
+            val resp = executeWithRetry("getStreamSource") {
+                api.getStreamSource(recordId)
             }
             if (resp == null) {
                 return@coalesceRead null
             }
-            if (resp.code() == 404 || resp.code() == 410) {
-                removeDigest(lockKey)
-                PlaybackDiagnosticsLogger.log(
-                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
-                    animeId = normAnime,
-                    episodeId = normEpisode,
-                    sourceId = normSource,
-                    reason = "http_${resp.code()}"
-                )
-                return@coalesceRead null
-            }
-            if (!resp.isSuccessful) {
-                return@coalesceRead null
-            }
-            val body = resp.body()
-            if (body == null || !body.success) {
-                removeDigest(lockKey)
-                Log.w(TAG, "D1 getStreamUrl unsuccessful response: ${body?.error ?: "empty body"}")
-                PlaybackDiagnosticsLogger.log(
-                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
-                    animeId = normAnime,
-                    episodeId = normEpisode,
-                    sourceId = normSource,
-                    reason = "unsuccessful_body"
-                )
-                return@coalesceRead null
-            }
-            val record = body.data ?: run {
-                removeDigest(lockKey)
-                PlaybackDiagnosticsLogger.log(
-                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
-                    animeId = normAnime,
-                    episodeId = normEpisode,
-                    sourceId = normSource,
-                    reason = "empty_data"
-                )
-                return@coalesceRead null
-            }
 
-            if (record.animeId.trim() != normAnime ||
-                record.episodeId.trim() != normEpisode ||
-                record.sourceId.trim() != normSource
-            ) {
-                removeDigest(lockKey)
-                return@coalesceRead null
-            }
-            val candidateUrl = record.streamUrl.trim()
-            if (!SafePlaybackHeaders.isValidStreamUrl(candidateUrl)) {
-                removeDigest(lockKey)
-                return@coalesceRead null
-            }
-            val rawExpiry = record.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
-            when (SourceExpiryTime.evaluateExpiry(rawExpiry, nowMs)) {
-                ExpiryState.EXPIRED, ExpiryState.INVALID -> {
+            var resolvedRecord: D1StreamSourceRecordDto? = null
+            var expectedDocKeyForValidation: String? = recordId
+
+            if (resp.code() == 404 || resp.code() == 410) {
+                // Fallback query by exact composite identity in case Worker row used an alternate sourceDocKey
+                val whereJson = buildWhereJson(
+                    "scopeKey" to normAnime,
+                    "backendEpisodeId" to normEpisode,
+                    "sourceId" to normSource
+                )
+                val listResp = executeWithRetry("listStreamSourceByComposite", maxRetries = 0) {
+                    api.listStreamSources(where = whereJson, limit = 10)
+                }
+                val listBody = listResp?.body()
+                val listTableOk = listBody?.table.isNullOrBlank() ||
+                    listBody?.table.equals(CANONICAL_TABLE, ignoreCase = true)
+                val matchingRow = if (listResp?.isSuccessful == true && listBody?.success == true && listTableOk) {
+                    listBody.data.orEmpty()
+                        .asSequence()
+                        .filter { row ->
+                            SourceIdentityValidator.validateD1StreamSourceRecord(
+                                record = row,
+                                expectedAnimeId = normAnime,
+                                expectedEpisodeId = normEpisode,
+                                expectedSourceId = normSource,
+                                expectedSourceDocKey = null,
+                                nowMs = nowMs
+                            ).isValid
+                        }
+                        .maxByOrNull { it.updatedAt }
+                } else {
+                    null
+                }
+                if (matchingRow == null) {
                     removeDigest(lockKey)
+                    val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
                     PlaybackDiagnosticsLogger.log(
                         event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
                         animeId = normAnime,
                         episodeId = normEpisode,
                         sourceId = normSource,
-                        reason = "expired_or_invalid"
+                        reason = "http_${resp.code()}",
+                        detail = "lookup_ms=$lookupMs"
                     )
-                    null
+                    return@coalesceRead null
                 }
-                ExpiryState.MISSING -> {
-                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n"), nowMs)
+                resolvedRecord = matchingRow
+                expectedDocKeyForValidation = null
+            } else {
+                if (!resp.isSuccessful) {
+                    return@coalesceRead null
+                }
+                val body = resp.body()
+                val tableMatches = body?.table.isNullOrBlank() ||
+                    body?.table.equals(CANONICAL_TABLE, ignoreCase = true)
+                if (body == null || !body.success || !tableMatches) {
+                    removeDigest(lockKey)
+                    val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
+                    Log.w(TAG, "D1 getStreamSource unsuccessful response: ${body?.error ?: "empty_or_invalid_body"}")
                     PlaybackDiagnosticsLogger.log(
-                        event = PlaybackDiagnosticEvent.D1_CACHE_HIT,
-                        animeId = normAnime,
-                        episodeId = normEpisode,
-                        sourceId = normSource
-                    )
-                    CachedStreamUrl(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
                         animeId = normAnime,
                         episodeId = normEpisode,
                         sourceId = normSource,
-                        streamUrl = candidateUrl,
-                        expiresAt = null
+                        reason = "unsuccessful_body",
+                        detail = "lookup_ms=$lookupMs"
                     )
+                    return@coalesceRead null
                 }
-                ExpiryState.VALID -> {
-                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n${rawExpiry.orEmpty()}"), nowMs)
+                resolvedRecord = body.data ?: run {
+                    removeDigest(lockKey)
+                    val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
                     PlaybackDiagnosticsLogger.log(
-                        event = PlaybackDiagnosticEvent.D1_CACHE_HIT,
-                        animeId = normAnime,
-                        episodeId = normEpisode,
-                        sourceId = normSource
-                    )
-                    CachedStreamUrl(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
                         animeId = normAnime,
                         episodeId = normEpisode,
                         sourceId = normSource,
-                        streamUrl = candidateUrl,
-                        expiresAt = rawExpiry
+                        reason = "empty_data",
+                        detail = "lookup_ms=$lookupMs"
                     )
+                    return@coalesceRead null
                 }
             }
+
+            val record = resolvedRecord
+            val validation = SourceIdentityValidator.validateD1StreamSourceRecord(
+                record = record,
+                expectedAnimeId = normAnime,
+                expectedEpisodeId = normEpisode,
+                expectedSourceId = normSource,
+                expectedSourceDocKey = expectedDocKeyForValidation,
+                nowMs = nowMs
+            )
+            if (validation is SourceValidationResult.Invalid) {
+                removeDigest(lockKey)
+                val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource,
+                    reason = validation.code.name,
+                    detail = "lookup_ms=$lookupMs status=${record.status}"
+                )
+                return@coalesceRead null
+            }
+
+            val candidateUrl = record.streamUrl?.trim().orEmpty()
+            val rawExpiry = record.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+            val expiryState = SourceExpiryTime.evaluateStreamExpiry(rawExpiry, candidateUrl, nowMs)
+            val normalizedExpiry = when (expiryState) {
+                ExpiryState.MISSING -> null
+                ExpiryState.VALID -> rawExpiry ?: SourceExpiryTime.deriveIsoExpiryFromUrl(candidateUrl)
+                ExpiryState.EXPIRED, ExpiryState.INVALID -> {
+                    removeDigest(lockKey)
+                    val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
+                    PlaybackDiagnosticsLogger.log(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource,
+                        reason = "expired_or_invalid",
+                        detail = "lookup_ms=$lookupMs expiry_state=${expiryState.name}"
+                    )
+                    return@coalesceRead null
+                }
+            }
+
+            val restoredHeaders = SafePlaybackHeaders.fromJson(record.safeHeadersJson)
+            val restoredHeaderNames = restoredHeaders.joinToString(",") { it[0] }.ifEmpty { "none" }
+            val resolvedUrlType = resolveEffectiveUrlType(
+                explicitUrlType = record.urlType,
+                url = candidateUrl,
+                contentType = record.contentType
+            )
+            val cleanContentType = record.contentType?.trim()?.takeIf { it.isNotEmpty() }
+
+            saveDigest(
+                lockKey,
+                computeMetadataDigest(
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource,
+                    streamUrl = candidateUrl,
+                    expiresAt = rawExpiry,
+                    safeHeadersJson = record.safeHeadersJson,
+                    contentType = cleanContentType,
+                    urlType = resolvedUrlType
+                ),
+                nowMs
+            )
+            val lookupMs = (MonotonicMetrics.nowMs() - lookupStartedAt).coerceAtLeast(0L)
+            PlaybackDiagnosticsLogger.log(
+                event = PlaybackDiagnosticEvent.D1_CACHE_HIT,
+                animeId = normAnime,
+                episodeId = normEpisode,
+                sourceId = normSource,
+                providerLabel = record.providerId,
+                detail = "lookup_ms=$lookupMs status=${record.status} expiry_state=${expiryState.name} url_type=$resolvedUrlType headers=$restoredHeaderNames"
+            )
+            CachedStreamUrl(
+                animeId = normAnime,
+                episodeId = normEpisode,
+                sourceId = normSource,
+                streamUrl = candidateUrl,
+                expiresAt = normalizedExpiry,
+                urlType = resolvedUrlType,
+                contentType = cleanContentType,
+                safeHeadersJson = record.safeHeadersJson?.trim()?.takeIf { it.isNotEmpty() },
+                safeHeaders = restoredHeaders,
+                providerId = record.providerId.trim().takeIf { it.isNotEmpty() },
+                quality = record.quality?.trim()?.takeIf { it.isNotEmpty() },
+                codec = record.codec?.trim()?.takeIf { it.isNotEmpty() },
+                audioLanguage = record.audioLanguage?.trim()?.takeIf { it.isNotEmpty() },
+                downloadable = record.downloadable,
+                sizeBytes = record.sizeBytes,
+                lookupDurationMs = lookupMs
+            )
         }
     }
 
     /**
-     * Saves a validated resolved Stream URL to D1 keyed by (anime_id, episode_id, source_id).
-     * Stores expires_at ONLY when actual valid expiry is known; never stores invalid or already-expired URLs.
+     * Lists all valid, non-deleted, non-expired cached stream source rows for a given `(animeId, episodeId)`
+     * so multiple sources for the same episode remain independently accessible without collision.
+     */
+    suspend fun getStreamUrlsForEpisode(
+        animeId: String,
+        episodeId: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): List<CachedStreamUrl> {
+        val normAnime = animeId.trim()
+        val normEpisode = episodeId.trim()
+        if (normAnime.isEmpty() || normEpisode.isEmpty()) return emptyList()
+
+        val whereJson = buildWhereJson(
+            "scopeKey" to normAnime,
+            "backendEpisodeId" to normEpisode
+        )
+        val resp = executeWithRetry("listEpisodeStreamSources") {
+            api.listStreamSources(where = whereJson, limit = 50)
+        } ?: return emptyList()
+        if (!resp.isSuccessful) return emptyList()
+        val body = resp.body() ?: return emptyList()
+        val tableOk = body.table.isNullOrBlank() || body.table.equals(CANONICAL_TABLE, ignoreCase = true)
+        if (!body.success || !tableOk) return emptyList()
+
+        return body.data.orEmpty().mapNotNull { record ->
+            val srcId = record.sourceId.trim()
+            if (srcId.isEmpty()) return@mapNotNull null
+            val valid = SourceIdentityValidator.validateD1StreamSourceRecord(
+                record = record,
+                expectedAnimeId = normAnime,
+                expectedEpisodeId = normEpisode,
+                expectedSourceId = srcId,
+                expectedSourceDocKey = null,
+                nowMs = nowMs
+            ).isValid
+            if (!valid) return@mapNotNull null
+            val url = record.streamUrl?.trim().orEmpty()
+            val rawExpiry = record.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+            val effectiveExpiry = rawExpiry ?: SourceExpiryTime.deriveIsoExpiryFromUrl(url)
+            val safeHeaders = SafePlaybackHeaders.fromJson(record.safeHeadersJson)
+            CachedStreamUrl(
+                animeId = normAnime,
+                episodeId = normEpisode,
+                sourceId = srcId,
+                streamUrl = url,
+                expiresAt = effectiveExpiry,
+                urlType = resolveEffectiveUrlType(record.urlType, url, record.contentType),
+                contentType = record.contentType?.trim()?.takeIf { it.isNotEmpty() },
+                safeHeadersJson = record.safeHeadersJson?.trim()?.takeIf { it.isNotEmpty() },
+                safeHeaders = safeHeaders,
+                providerId = record.providerId.trim().takeIf { it.isNotEmpty() },
+                quality = record.quality?.trim()?.takeIf { it.isNotEmpty() },
+                codec = record.codec?.trim()?.takeIf { it.isNotEmpty() },
+                audioLanguage = record.audioLanguage?.trim()?.takeIf { it.isNotEmpty() },
+                downloadable = record.downloadable,
+                sizeBytes = record.sizeBytes
+            )
+        }
+    }
+
+    private suspend fun verifyRemoteRecordMatches(
+        recordId: String,
+        normAnime: String,
+        normEpisode: String,
+        normSource: String,
+        normUrl: String,
+        normalizedExpiry: String?,
+        normalizedSafeHeadersJson: String?,
+        normalizedContentType: String?,
+        nowMs: Long
+    ): Boolean {
+        val resp = executeWithRetry("verifyRemoteStreamSource", maxRetries = 0) {
+            api.getStreamSource(recordId)
+        } ?: return false
+        if (!resp.isSuccessful) return false
+        val body = resp.body() ?: return false
+        if (!body.success) return false
+        val tableMatches = body.table.isNullOrBlank() ||
+            body.table.equals(CANONICAL_TABLE, ignoreCase = true)
+        if (!tableMatches) return false
+        val remote = body.data ?: return false
+        val validation = SourceIdentityValidator.validateD1StreamSourceRecord(
+            record = remote,
+            expectedAnimeId = normAnime,
+            expectedEpisodeId = normEpisode,
+            expectedSourceId = normSource,
+            expectedSourceDocKey = recordId,
+            nowMs = nowMs
+        )
+        if (validation !is SourceValidationResult.Valid) return false
+        val remoteExpiry = remote.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+        val remoteHeadersJson = remote.safeHeadersJson?.trim()?.takeIf { it.isNotEmpty() }
+        val remoteContentType = remote.contentType?.trim()?.takeIf { it.isNotEmpty() }
+        return remote.streamUrl?.trim() == normUrl &&
+            remoteExpiry == normalizedExpiry &&
+            remoteHeadersJson == normalizedSafeHeadersJson &&
+            remoteContentType == normalizedContentType
+    }
+
+    /**
+     * Saves a validated resolved Stream URL to D1 `stream_sources` keyed by `(anime_id, episode_id, source_id)`.
+     * Stores `expiresAt` ONLY when actual valid expiry is known (explicit or derived from SigV4 URL params),
+     * persists only privacy-safe headers via `SafePlaybackHeaders.toJson`, and skips duplicate writes cleanly.
      */
     suspend fun saveStreamUrl(
         animeId: String,
@@ -383,7 +597,18 @@ class CloudflareD1DataSource(
         streamUrl: String,
         expiresAt: String? = null,
         nowMs: Long = System.currentTimeMillis(),
-        forceWrite: Boolean = false
+        forceWrite: Boolean = false,
+        providerId: String? = null,
+        sourceName: String? = null,
+        urlType: String? = null,
+        contentType: String? = null,
+        headers: List<List<String>> = emptyList(),
+        quality: String? = null,
+        codec: String? = null,
+        audioLanguage: String? = null,
+        downloadable: Boolean? = null,
+        sizeBytes: Long? = null,
+        lastPlaybackSuccessAt: Long? = null
     ): Boolean {
         val normAnime = animeId.trim()
         val normEpisode = episodeId.trim()
@@ -392,52 +617,132 @@ class CloudflareD1DataSource(
         if (normAnime.isEmpty() || normEpisode.isEmpty() || normSource.isEmpty()) return false
         if (!SafePlaybackHeaders.isValidStreamUrl(normUrl)) return false
 
-        val normalizedExpiry: String? = expiresAt?.trim()?.takeIf { it.isNotEmpty() }?.let { rawExp ->
-            when (SourceExpiryTime.evaluateExpiry(rawExp, nowMs)) {
-                ExpiryState.VALID -> rawExp
-                ExpiryState.EXPIRED -> return false
-                ExpiryState.INVALID, ExpiryState.MISSING -> null
-            }
+        val urlDerivedExpiry = SourceExpiryTime.deriveIsoExpiryFromUrl(normUrl)
+        val rawExplicitExpiry = expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+        val streamExpiryState = SourceExpiryTime.evaluateStreamExpiry(rawExplicitExpiry, normUrl, nowMs)
+        if (streamExpiryState == ExpiryState.EXPIRED) return false
+
+        val normalizedExpiry: String? = when (SourceExpiryTime.evaluateExpiry(rawExplicitExpiry, nowMs)) {
+            ExpiryState.VALID -> rawExplicitExpiry
+            ExpiryState.EXPIRED -> return false
+            ExpiryState.INVALID, ExpiryState.MISSING -> urlDerivedExpiry
         }
 
-        val lockKey = digestKey(normAnime, normEpisode, normSource)
-        return withWriteLock(lockKey) {
-            val digest = sha256Hex("$normAnime\n$normEpisode\n$normSource\n$normUrl\n${normalizedExpiry.orEmpty()}")
-            if (!forceWrite && readDigest(lockKey) == digest && !isPersistedDigestStale(lockKey, nowMs)) {
-                writtenDigests[lockKey] = digest
-                metricsTracker.recordD1WriteSkipped()
-                return@withWriteLock true
-            }
+        val cleanProviderId = providerId?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_PROVIDER_ID
+        val cleanSourceName = sourceName?.trim()?.takeIf { it.isNotEmpty() } ?: normSource
+        val cleanContentType = contentType?.trim()?.takeIf { it.isNotEmpty() }
+        val resolvedUrlType = resolveEffectiveUrlType(urlType, normUrl, cleanContentType)
+        val safeHeadersJson = SafePlaybackHeaders.toJson(headers)
+        val cleanQuality = quality?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanCodec = codec?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanLanguage = audioLanguage?.trim()?.takeIf { it.isNotEmpty() }
 
-            val record = D1StreamUrlRecordDto(
-                id = deterministicRecordId(normAnime, normEpisode, normSource),
+        val lockKey = digestKey(normAnime, normEpisode, normSource)
+        val recordId = deterministicRecordId(normAnime, normEpisode, normSource)
+        return withWriteLock(lockKey) {
+            val digest = computeMetadataDigest(
                 animeId = normAnime,
                 episodeId = normEpisode,
                 sourceId = normSource,
                 streamUrl = normUrl,
-                expiresAt = normalizedExpiry
+                expiresAt = normalizedExpiry,
+                safeHeadersJson = safeHeadersJson,
+                contentType = cleanContentType,
+                urlType = resolvedUrlType
             )
-            val resp = executeWithRetry("upsertStreamUrl", isWrite = true) {
-                api.upsertStreamUrl(record)
+            if (!forceWrite && readDigest(lockKey) == digest && !isPersistedDigestStale(lockKey, nowMs)) {
+                val remoteStillPresent = verifyRemoteRecordMatches(
+                    recordId = recordId,
+                    normAnime = normAnime,
+                    normEpisode = normEpisode,
+                    normSource = normSource,
+                    normUrl = normUrl,
+                    normalizedExpiry = normalizedExpiry,
+                    normalizedSafeHeadersJson = safeHeadersJson,
+                    normalizedContentType = cleanContentType,
+                    nowMs = nowMs
+                )
+                if (remoteStillPresent) {
+                    writtenDigests[lockKey] = digest
+                    metricsTracker.recordD1WriteSkipped()
+                    return@withWriteLock true
+                }
+                removeDigest(lockKey)
             }
-            val succeeded = resp != null && resp.isSuccessful && (resp.body()?.success != false)
+
+            val record = D1StreamSourceRecordDto(
+                sourceDocKey = recordId,
+                scopeKey = normAnime,
+                providerId = cleanProviderId,
+                sourceId = normSource,
+                sourceName = cleanSourceName,
+                backendEpisodeId = normEpisode,
+                streamUrl = normUrl,
+                urlType = resolvedUrlType,
+                contentType = cleanContentType,
+                quality = cleanQuality,
+                codec = cleanCodec,
+                audioLanguage = cleanLanguage,
+                downloadable = downloadable,
+                sizeBytes = sizeBytes,
+                safeHeadersJson = safeHeadersJson,
+                expiresAt = normalizedExpiry,
+                status = STATUS_AVAILABLE,
+                version = 1L,
+                lastVerifiedAt = nowMs,
+                lastPlaybackSuccessAt = lastPlaybackSuccessAt,
+                updatedAt = nowMs,
+                deletedAt = null
+            )
+            val resp = executeWithRetry("upsertStreamSource", isWrite = true) {
+                api.upsertStreamSource(record)
+            }
+            val responseBody = resp?.body()
+            val savedRecord = responseBody?.data
+            val tableMatches = responseBody?.table.isNullOrBlank() ||
+                responseBody?.table.equals(CANONICAL_TABLE, ignoreCase = true)
+            val savedExpiry = savedRecord?.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+            val savedIdentityMatches = savedRecord != null &&
+                savedRecord.sourceDocKey.trim() == recordId &&
+                savedRecord.scopeKey.trim() == normAnime &&
+                savedRecord.backendEpisodeId?.trim() == normEpisode &&
+                savedRecord.sourceId.trim() == normSource &&
+                savedRecord.streamUrl?.trim() == normUrl &&
+                savedRecord.deletedAt == null &&
+                savedExpiry == normalizedExpiry
+
+            val succeeded =
+                resp?.isSuccessful == true &&
+                responseBody?.success == true &&
+                tableMatches &&
+                savedIdentityMatches
+
             if (succeeded) {
                 saveDigest(lockKey, digest, nowMs)
+                val headerNames = SafePlaybackHeaders.fromJson(safeHeadersJson)
+                    .joinToString(",") { it[0] }.ifEmpty { "none" }
                 PlaybackDiagnosticsLogger.log(
                     event = PlaybackDiagnosticEvent.D1_CACHE_WRITE,
                     animeId = normAnime,
                     episodeId = normEpisode,
-                    sourceId = normSource
+                    sourceId = normSource,
+                    providerLabel = cleanProviderId,
+                    detail = "url_type=$resolvedUrlType headers=$headerNames has_expiry=${normalizedExpiry != null}"
                 )
             } else {
-                Log.w(TAG, "D1 saveStreamUrl failed: ${resp?.body()?.error ?: "http=${resp?.code()}"}")
+                removeDigest(lockKey)
+                Log.w(
+                    TAG,
+                    "D1 saveStreamUrl unconfirmed/failed: ${responseBody?.error ?: "http=${resp?.code()}, bodyPresent=${responseBody != null}, dataPresent=${savedRecord != null}"}"
+                )
             }
             succeeded
         }
     }
 
     /**
-     * Removes or invalidates a cached Stream URL entry in D1 (e.g., after playback failure on stale cached link).
+     * Removes or invalidates a cached Stream URL entry in D1 `stream_sources`
+     * (e.g., after playback failure on stale cached link).
      */
     suspend fun invalidateStreamUrl(
         animeId: String,
@@ -453,10 +758,12 @@ class CloudflareD1DataSource(
         return withWriteLock(lockKey) {
             removeDigest(lockKey)
             val id = deterministicRecordId(normAnime, normEpisode, normSource)
-            val resp = executeWithRetry("deleteStreamUrl", isWrite = true) {
-                api.deleteStreamUrl(id)
+            val resp = executeWithRetry("deleteStreamSource", isWrite = true) {
+                api.deleteStreamSource(id)
             }
-            val ok = resp != null && (resp.isSuccessful || resp.code() == 404)
+            val responseBody = resp?.body()
+            val ok = resp != null &&
+                ((resp.isSuccessful && responseBody?.success == true) || resp.code() == 404)
             if (ok) {
                 PlaybackDiagnosticsLogger.log(
                     event = PlaybackDiagnosticEvent.D1_CACHE_INVALIDATED,
@@ -475,13 +782,94 @@ class CloudflareD1DataSource(
     }
 
     private fun digestKey(animeId: String, episodeId: String, sourceId: String): String =
-        "su:$animeId|$episodeId|$sourceId"
+        "ss:$animeId|$episodeId|$sourceId"
+
+    private fun computeMetadataDigest(
+        animeId: String,
+        episodeId: String,
+        sourceId: String,
+        streamUrl: String,
+        expiresAt: String?,
+        safeHeadersJson: String?,
+        contentType: String?,
+        urlType: String
+    ): String = sha256Hex(
+        listOf(
+            animeId,
+            episodeId,
+            sourceId,
+            streamUrl,
+            expiresAt.orEmpty(),
+            safeHeadersJson.orEmpty(),
+            contentType.orEmpty(),
+            urlType
+        ).joinToString("\n")
+    )
+
+    private fun buildWhereJson(vararg fields: Pair<String, String>): String {
+        val json = org.json.JSONObject()
+        fields.forEach { (k, v) -> json.put(k, v) }
+        return json.toString()
+    }
 
     companion object {
         private const val TAG = "CloudflareD1"
+        const val CANONICAL_TABLE = "stream_sources"
+        private const val DEFAULT_PROVIDER_ID = "direct"
+        private const val STATUS_AVAILABLE = "AVAILABLE"
         private const val MAX_RETRIES = 2
         private const val BASE_RETRY_DELAY_MS = 180L
         private const val PERSISTED_DIGEST_MAX_AGE_MS = 10 * 60 * 1000L
+
+        fun resolveEffectiveUrlType(explicitUrlType: String?, url: String, contentType: String? = null): String {
+            val cleanExplicit = explicitUrlType?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            if (cleanExplicit != null && cleanExplicit != "direct") return cleanExplicit
+            return inferUrlType(url, contentType)
+        }
+
+        fun inferUrlType(url: String, contentType: String? = null): String {
+            val ct = contentType?.lowercase().orEmpty()
+            if (ct.contains("mpegurl") || ct.contains("m3u8")) return "hls"
+            if (ct.contains("dash") || ct.contains("mpd")) return "dash"
+
+            val clean = url.substringBefore('?').lowercase()
+            return when {
+                clean.endsWith(".m3u8") -> "hls"
+                clean.endsWith(".mpd") -> "dash"
+                else -> {
+                    val dispositionFilename = extractResponseDispositionFilename(url)?.lowercase().orEmpty()
+                    when {
+                        dispositionFilename.endsWith(".m3u8") -> "hls"
+                        dispositionFilename.endsWith(".mpd") -> "dash"
+                        else -> "direct"
+                    }
+                }
+            }
+        }
+
+        /**
+         * Extracts the filename from signed storage query parameters such as AWS S3 / Cloudflare R2
+         * `response-content-disposition=attachment; filename="Episode_01.mkv"`.
+         * Never guesses from generic arbitrary query params like `?file=...`.
+         */
+        fun extractResponseDispositionFilename(url: String): String? {
+            val query = runCatching { java.net.URI(url).rawQuery }.getOrNull()
+                ?: url.substringAfter('?', "").substringBefore('#').takeIf { it.isNotEmpty() }
+                ?: return null
+            for (pair in query.split('&')) {
+                val eqIdx = pair.indexOf('=')
+                if (eqIdx <= 0) continue
+                val key = runCatching { java.net.URLDecoder.decode(pair.substring(0, eqIdx), "UTF-8") }
+                    .getOrDefault(pair.substring(0, eqIdx)).trim().lowercase()
+                if (key != "response-content-disposition") continue
+                val rawValue = runCatching { java.net.URLDecoder.decode(pair.substring(eqIdx + 1), "UTF-8") }
+                    .getOrDefault(pair.substring(eqIdx + 1))
+                val filenameMatch = Regex("""(?i)filename\*?=(?:UTF-8'')?\"?([^;\"]+)\"?""").find(rawValue)
+                val name = filenameMatch?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+                if (name != null) return name
+            }
+            return null
+        }
 
         fun deterministicRecordId(animeId: String, episodeId: String, sourceId: String): String {
             val raw = "${animeId.trim()}\n${episodeId.trim()}\n${sourceId.trim()}"
