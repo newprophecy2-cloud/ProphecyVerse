@@ -789,6 +789,7 @@ class SourceIdentityAndFastResolutionTest {
 
         val repo = createRepo(api, d1 = d1)
         val first = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
+        println("SCENARIO8 checkpoint=first tier=${first.cacheTier} directCalls=${directCalls.get()}")
         assertEquals("BACKEND_RESOLVE", first.cacheTier)
         assertEquals(1, directCalls.get())
 
@@ -797,11 +798,13 @@ class SourceIdentityAndFastResolutionTest {
         while (d1Store.isEmpty() && System.currentTimeMillis() < saveDeadline) {
             Thread.sleep(20L)
         }
+        println("SCENARIO8 checkpoint=d1-store size=${d1Store.size}")
         assertTrue("D1 stream_urls must cache newly resolved URL", d1Store.isNotEmpty())
 
         // 2nd direct playback resolves strictly from Memory LRU
         val hitsBefore = metricsTracker.snapshot().memoryCacheHits
         val memHit = repo.resolveDirectPlayback("src_800_1", scopeKey = "anime:800:s1:e1").getOrThrow()
+        println("SCENARIO8 checkpoint=memory url=${memHit.playbackUrl} directCalls=${directCalls.get()} memoryHitsBefore=$hitsBefore memoryHitsAfter=${metricsTracker.snapshot().memoryCacheHits}")
         assertEquals("https://cdn.example/cache_800.mp4", memHit.playbackUrl)
         assertTrue(metricsTracker.snapshot().memoryCacheHits > hitsBefore)
         assertEquals(1, directCalls.get())
@@ -809,6 +812,7 @@ class SourceIdentityAndFastResolutionTest {
         // Invalidate Memory -> 3rd resolvePlayableStream hits D1 stream_urls cleanly with ZERO Backend calls!
         memoryCache.invalidatePlayback("src_800_1", "anime:800:s1:e1")
         val d1Hit = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
+        println("SCENARIO8 checkpoint=d1 tier=${d1Hit.cacheTier} url=${d1Hit.directData.playbackUrl} directCalls=${directCalls.get()}")
         assertEquals("D1", d1Hit.cacheTier)
         assertEquals("https://cdn.example/cache_800.mp4", d1Hit.directData.playbackUrl)
         assertEquals(1, directCalls.get())
