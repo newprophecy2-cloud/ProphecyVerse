@@ -204,32 +204,75 @@ class ArchitectureRemakeVerificationTest {
 
         override suspend fun searchAnime(query: String, limit: Int?, cursor: String?): Response<ProphecySearchResponse> {
             searchCalls.incrementAndGet()
-            val items = when {
-                query.contains("Your Name", ignoreCase = true) -> listOf(
-                    ProphecySearchResultItem(
-                        id = "backend-movie-204",
-                        canonicalId = "anilist_204",
-                        title = "Your Name",
-                        mediaType = "movie"
+            return when {
+                query.contains("Frieren", ignoreCase = true) -> {
+                    if (cursor == "cursor_p2") {
+                        Response.success(
+                            ProphecySearchResponse(
+                                results = listOf(
+                                    ProphecySearchResultItem(
+                                        id = "backend-frieren-3",
+                                        canonicalId = "anilist_103",
+                                        title = "Frieren Page2 C",
+                                        mediaType = "anime"
+                                    )
+                                ),
+                                nextCursor = null
+                            )
+                        )
+                    } else {
+                        Response.success(
+                            ProphecySearchResponse(
+                                results = listOf(
+                                    ProphecySearchResultItem(
+                                        id = "backend-frieren-1",
+                                        canonicalId = "anilist_101",
+                                        title = "Frieren Page1 A",
+                                        mediaType = "anime"
+                                    ),
+                                    ProphecySearchResultItem(
+                                        id = "backend-frieren-2",
+                                        canonicalId = "anilist_102",
+                                        title = "Frieren Page1 B",
+                                        mediaType = "anime"
+                                    )
+                                ),
+                                nextCursor = "cursor_p2"
+                            )
+                        )
+                    }
+                }
+                query.contains("Your Name", ignoreCase = true) -> Response.success(
+                    ProphecySearchResponse(
+                        results = listOf(
+                            ProphecySearchResultItem(
+                                id = "backend-movie-204",
+                                canonicalId = "anilist_204",
+                                title = "Your Name",
+                                mediaType = "movie"
+                            )
+                        )
                     )
                 )
-                else -> listOf(
-                    ProphecySearchResultItem(
-                        id = "backend-series-201",
-                        canonicalId = "anilist_201",
-                        title = "Series 201",
-                        mediaType = "anime"
+                else -> Response.success(
+                    ProphecySearchResponse(
+                        results = listOf(
+                            ProphecySearchResultItem(
+                                id = "backend-series-201",
+                                canonicalId = "anilist_201",
+                                title = "Series 201",
+                                mediaType = "anime"
+                            )
+                        )
                     )
                 )
             }
-            return Response.success(ProphecySearchResponse(results = items))
         }
 
         override suspend fun getAnimeDetails(animeId: String): Response<ProphecyAnimeDetailsResponse> {
             detailCalls.incrementAndGet()
-            return if (animeId == "backend-movie-204") {
-                // Simulate backend returning legacy S1 & E1 for a Movie; APK must map flat!
-                Response.success(
+            return when (animeId) {
+                "backend-movie-204" -> Response.success(
                     ProphecyAnimeDetailsResponse(
                         id = animeId,
                         title = "Your Name",
@@ -249,12 +292,43 @@ class ArchitectureRemakeVerificationTest {
                         )
                     )
                 )
-            } else {
-                Response.success(
+                "backend-missing-301" -> Response.success(
+                    ProphecyAnimeDetailsResponse(
+                        id = animeId,
+                        title = "No Episode Count Show",
+                        mediaType = "anime",
+                        seasons = emptyList(),
+                        partial = true
+                    )
+                )
+                "backend-partial-302" -> Response.success(
+                    ProphecyAnimeDetailsResponse(
+                        id = animeId,
+                        title = "Ongoing Show",
+                        mediaType = "anime",
+                        partial = true,
+                        seasons = listOf(
+                            ProphecySeasonDto(
+                                number = 1,
+                                episodes = (1..24).map { ep ->
+                                    ProphecyEpisodeDto(
+                                        id = "backend-302-ep-$ep",
+                                        number = ep,
+                                        season = 1,
+                                        title = "Aired Ep $ep"
+                                    )
+                                }
+                            )
+                        )
+                    )
+                )
+                else -> Response.success(
                     ProphecyAnimeDetailsResponse(
                         id = animeId,
                         title = "Series 201",
                         mediaType = "anime",
+                        partial = false,
+                        status = "FINISHED",
                         seasons = listOf(
                             ProphecySeasonDto(
                                 number = 1,
@@ -275,8 +349,8 @@ class ArchitectureRemakeVerificationTest {
 
         override suspend fun getAnimeEpisodes(animeId: String): Response<List<ProphecyEpisodeDto>> {
             return Response.success(
-                if (animeId == "backend-movie-204") {
-                    listOf(
+                when (animeId) {
+                    "backend-movie-204" -> listOf(
                         ProphecyEpisodeDto(
                             id = "backend-movie-s1e1-id",
                             number = 1,
@@ -284,8 +358,11 @@ class ArchitectureRemakeVerificationTest {
                             title = "S1 & E1"
                         )
                     )
-                } else {
-                    (1..15).map { ep ->
+                    "backend-missing-301" -> emptyList()
+                    "backend-partial-302" -> (1..24).map { ep ->
+                        ProphecyEpisodeDto(id = "backend-302-ep-$ep", number = ep, season = 1, title = "Aired Ep $ep")
+                    }
+                    else -> (1..15).map { ep ->
                         ProphecyEpisodeDto(id = "backend-ep-$ep", number = ep, season = 1, title = "Provider Ep $ep")
                     }
                 }
@@ -386,7 +463,7 @@ class ArchitectureRemakeVerificationTest {
     }
 
     @Test
-    fun paginatedSearchMergesPagesWithoutOverwritingAndNeverCallsBackend() = runTest {
+    fun paginatedSearchUsesBackendAndMergesCursorPagesWithoutAniList() = runTest {
         val (repo, aniList, backend) = createRepository()
 
         val page1 = repo.searchAnimePage("Frieren", page = 1).getOrThrow()
@@ -399,48 +476,50 @@ class ArchitectureRemakeVerificationTest {
         assertFalse(page2.hasNextPage)
         val combined = repo.observeSearchResults("Frieren").first()
         assertEquals(3, combined.size)
-        assertEquals(0, backend.searchCalls.get())
-        assertEquals(2, aniList.searchCalls.get())
+        assertEquals(2, backend.searchCalls.get())
+        assertEquals(0, aniList.searchCalls.get())
     }
 
     @Test
-    fun seriesDetailsGeneratesAniListEpisodeFallbacksWithoutBackendAndHandlesMissingCount() = runTest {
-        val (repo, _, backend) = createRepository()
+    fun seriesDetailsUsesBackendWithoutAniListAndHandlesPartialOrMissingEpisodes() = runTest {
+        val (repo, aniList, backend) = createRepository()
 
-        // Series with 12 episodes on AniList -> Ep 1 uses AniList streamingEpisodes title, Ep 2..12 use "Episode N"
-        val res = repo.refreshAnimeDetails("anilist_201")
+        // Complete series with 15 real episodes on Backend -> uses GET /api/v1/anime/{id} and ZERO AniList calls
+        val res = repo.refreshAnimeDetails("backend-series-201")
         assertTrue(res.isSuccess)
-        assertEquals(0, backend.detailCalls.get())
+        assertEquals(1, backend.detailCalls.get())
+        assertEquals(0, aniList.detailCalls.get())
 
-        val episodes = repo.observeEpisodes("anilist_201", 1).first()
-        assertEquals(12, episodes.size)
-        assertEquals("The Beginning", episodes[0].title)
-        assertEquals("Episode 2", episodes[1].title)
-        assertEquals("Episode 12", episodes[11].title)
+        val episodes = repo.observeEpisodes("backend-series-201", 1).first()
+        assertEquals(15, episodes.size)
+        assertEquals("backend-ep-1", episodes[0].id)
+        assertEquals("Provider Ep 1", episodes[0].title)
+        assertEquals("Provider Ep 15", episodes[14].title)
 
-        // Series with missing episode count -> MISSING_EPISODES and zero fabricated episodes
-        val missingRes = repo.refreshAnimeDetails("anilist_301")
+        // Series with missing episodes -> MISSING_EPISODES and zero fabricated episodes
+        val missingRes = repo.refreshAnimeDetails("backend-missing-301")
         assertTrue(missingRes.isSuccess)
-        val entry301 = database.animeDao().getAnimeById("anilist_301")!!
+        val entry301 = database.animeDao().getAnimeById("backend-missing-301")!!
         assertEquals("MISSING_EPISODES", entry301.metadataCompleteness)
-        assertTrue(repo.observeEpisodes("anilist_301", 1).first().isEmpty())
-        assertEquals(0, backend.detailCalls.get())
+        assertTrue(repo.observeEpisodes("backend-missing-301", 1).first().isEmpty())
 
-        // Ongoing releasing series with episodes = null and nextAiringEpisode = 25 -> 24 aired episodes
-        val airingRes = repo.refreshAnimeDetails("anilist_302")
+        // Ongoing partial series with 24 aired episodes -> PARTIAL
+        val airingRes = repo.refreshAnimeDetails("backend-partial-302")
         assertTrue(airingRes.isSuccess)
-        val entry302 = database.animeDao().getAnimeById("anilist_302")!!
+        val entry302 = database.animeDao().getAnimeById("backend-partial-302")!!
         assertEquals(24, entry302.episodeCount)
         assertEquals("PARTIAL", entry302.metadataCompleteness)
-        val airedEpisodes = repo.observeEpisodes("anilist_302", 1).first()
+        val airedEpisodes = repo.observeEpisodes("backend-partial-302", 1).first()
         assertEquals(24, airedEpisodes.size)
-        assertEquals("Episode 24", airedEpisodes.last().title)
-        assertEquals(0, backend.detailCalls.get())
+        assertEquals("Aired Ep 24", airedEpisodes.last().title)
+        assertEquals(0, aniList.detailCalls.get())
     }
 
     @Test
     fun movieDetailsHasZeroSeasonsOrEpisodesEvenWhenBackendUsesS1E1Internally() = runTest {
         val (repo, _, backend) = createRepository()
+        // Populate catalog entry as Home discovery does before opening details
+        repo.refreshHomeDiscovery(force = true).getOrThrow()
 
         // Seed legacy Season/Episode row for movie to verify Movie queries stay clean
         database.episodeDao().upsertSeasons(listOf(SeasonEntry("legacy_s1", "anilist_204", 1, "Season 1")))
@@ -491,7 +570,17 @@ class ArchitectureRemakeVerificationTest {
     @Test
     fun cacheFirstResolutionReusesRoomUrlSanitizesHeadersAndPreservesValidUrlOnFailure() = runTest {
         val (repo, _, backend) = createRepository()
-        repo.refreshAnimeDetails("anilist_201")
+        database.animeDao().upsertAnime(
+            AnimeEntry(
+                id = "anilist_201",
+                aniListId = 201,
+                preferredTitle = "Series 201",
+                format = "TV",
+                mediaCategory = "ANIME",
+                isPlayable = true
+            )
+        )
+        repo.refreshAnimeDetails("anilist_201").getOrThrow()
         val ep1 = repo.observeEpisodes("anilist_201", 1).first().first()
 
         // First play discovers & resolves once

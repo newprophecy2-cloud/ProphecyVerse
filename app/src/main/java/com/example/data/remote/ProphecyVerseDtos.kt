@@ -63,8 +63,10 @@ data class ProphecyAnimeDetailsResponse(
 
 @JsonClass(generateAdapter = true)
 data class ProphecySeasonDto(
+    @Json(name = "id") val id: String? = null,
     @Json(name = "canonical_id") val canonicalId: String? = null,
     @Json(name = "number") val number: Int,
+    @Json(name = "title") val title: String? = null,
     @Json(name = "episodes") val episodes: List<ProphecyEpisodeDto>? = null
 )
 

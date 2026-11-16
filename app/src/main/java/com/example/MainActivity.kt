@@ -457,7 +457,7 @@ fun MainAppNav(
                 val preferredSourceId = backStackEntry.arguments?.getString("preferredSourceId")
 
                 val playerViewModel = viewModel<PlayerViewModel>(
-                    key = "player_${animeId}_$episodeId",
+                    key = "player_${animeId}_${episodeId}_${preferredSourceId.orEmpty()}",
                     factory = object : androidx.lifecycle.ViewModelProvider.Factory {
                         @Suppress("UNCHECKED_CAST")
                         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {

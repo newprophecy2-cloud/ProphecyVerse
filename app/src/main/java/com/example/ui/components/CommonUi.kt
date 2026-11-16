@@ -335,7 +335,7 @@ fun PlayableBadge(isPlayable: Boolean, modifier: Modifier = Modifier) {
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "AniList Catalog",
+                    text = "ProphecyVerse Catalog",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = PlayableGreen

@@ -181,8 +181,27 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         if (format == null) list else list.filter { it.format.equals(format, ignoreCase = true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    private var lastCompletedNormalizedQuery: String? = null
+
     fun onQueryChange(newQuery: String) {
         _searchQuery.value = newQuery
+        val trimmed = newQuery.trim()
+        val norm = com.example.data.repository.TitleMatcher.normalize(trimmed)
+        if (norm.isBlank()) {
+            searchRequestSequence++
+            searchJob?.cancel()
+            loadMoreJob?.cancel()
+            currentPage = 1
+            _hasNextPage.value = false
+            _isLoadingMore.value = false
+            _isSearching.value = false
+            lastCompletedNormalizedQuery = null
+            return
+        }
+        if (norm == lastCompletedNormalizedQuery && _error.value == null) {
+            return
+        }
+
         val requestId = ++searchRequestSequence
         searchJob?.cancel()
         loadMoreJob?.cancel()
@@ -190,21 +209,19 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         _hasNextPage.value = false
         _isLoadingMore.value = false
 
-        if (newQuery.isBlank()) {
-            _isSearching.value = false
-            return
-        }
-
         searchJob = viewModelScope.launch {
             _isSearching.value = true
             _error.value = null
-            val res = repository.searchAnimePage(newQuery, page = 1)
+            delay(250L)
+            val res = repository.searchAnimePage(trimmed, page = 1)
             if (requestId == searchRequestSequence) {
                 res.onSuccess { pageRes ->
                     currentPage = pageRes.currentPage
                     _hasNextPage.value = pageRes.hasNextPage
+                    lastCompletedNormalizedQuery = norm
                 }.onFailure {
-                    val savedState = repository.getSearchQueryState(newQuery)
+                    lastCompletedNormalizedQuery = null
+                    val savedState = repository.getSearchQueryState(trimmed)
                     _hasNextPage.value = savedState?.hasNextPage ?: false
                     _error.value = "Network search failed. Showing local results."
                 }
@@ -571,6 +588,16 @@ class DetailViewModel(
                 val snapshot = res.getOrNull()
                 if (snapshot != null) {
                     _episodeSources.value = snapshot.sources
+                    snapshot.selectedEpisode?.let { updatedEp ->
+                        val currentSelected = _selectedEpisodeForSources.value ?: episode
+                        _selectedEpisodeForSources.value = currentSelected.copy(
+                            seasonNumber = if (isMovie) 0 else updatedEp.seasonNumber,
+                            episodeNumber = if (isMovie) 1 else updatedEp.episodeNumber,
+                            title = updatedEp.title?.takeIf { it.isNotBlank() } ?: currentSelected.title,
+                            overview = updatedEp.overview?.takeIf { it.isNotBlank() } ?: currentSelected.overview,
+                            sourceEpisodeIds = updatedEp.sourceEpisodeIds ?: currentSelected.sourceEpisodeIds
+                        )
+                    }
                     val state = mapResponseState(snapshot.state)
                     _episodeSourceStates.value = _episodeSourceStates.value + (episode.id to state)
                     if (!snapshot.errorMessage.isNullOrBlank()) {
@@ -896,12 +923,17 @@ class PlayerViewModel(
                             _currentEpisode.value = movieEp
                             startPlaybackForEpisode(movieEp, preferredSourceId = initialPreferredSourceId)
                         } else if (epList.isNotEmpty()) {
-                            val target = epList.firstOrNull { it.id == initialEpisodeId } ?: epList.first()
+                            val target = epList.firstOrNull {
+                                it.id == initialEpisodeId ||
+                                    initialEpisodeId in com.example.data.identity.EpisodeSourceEpisodeIds.read(it)
+                            } ?: epList.first()
+                            val matchesRequestedEpisode = target.id == initialEpisodeId ||
+                                initialEpisodeId in com.example.data.identity.EpisodeSourceEpisodeIds.read(target)
                             _currentEpisode.value = target
                             _selectedSeason.value = target.seasonNumber
                             startPlaybackForEpisode(
                                 target,
-                                preferredSourceId = if (target.id == initialEpisodeId) initialPreferredSourceId else null
+                                preferredSourceId = if (matchesRequestedEpisode) initialPreferredSourceId else null
                             )
                         }
                     } else if (!isMovieTarget && epList.isNotEmpty()) {

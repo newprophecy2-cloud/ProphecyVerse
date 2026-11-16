@@ -598,8 +598,13 @@ class MultiSeasonAndFirestoreFixTest {
             AnimeEntry(
                 id = animeId,
                 aniListId = 195604,
+                canonicalAnimeId = 97940,
+                canonicalTitle = "Black Clover",
+                canonicalSeasonNumber = 2,
+                cumulativeEpisodeOffset = 170,
                 backendAnimeId = "bc_addons_dup",
                 preferredTitle = "Black Clover Season 2",
+                year = "2026",
                 genres = "Action, Fantasy",
                 format = "TV",
                 mediaCategory = "ANIME",
@@ -614,7 +619,7 @@ class MultiSeasonAndFirestoreFixTest {
             PlaybackHistory("h_bc", animeId, "legacy_ep1", 1, 1, "Episode 1", 45_000L, 1_440_000L, false)
         )
 
-        // 1. Refresh details from AniList: UI preserves "Black Clover Season 2", canonical resolves to 97940 ("Black Clover"), Season 2, offset 170
+        // 1. Refresh details from Backend: UI preserves "Black Clover Season 2", canonical stays 97940 ("Black Clover"), Season 2, offset 170
         repo.refreshAnimeDetails(animeId).getOrThrow()
 
         val updatedEntry = database.animeDao().getAnimeById(animeId)!!
@@ -681,7 +686,12 @@ class MultiSeasonAndFirestoreFixTest {
             AnimeEntry(
                 id = "anilist_5003",
                 aniListId = 5003,
+                canonicalAnimeId = 5001,
+                canonicalTitle = "Chrono Blade",
+                canonicalSeasonNumber = 3,
+                cumulativeEpisodeOffset = 36,
                 preferredTitle = "Chrono Blade Season 3",
+                year = "2024",
                 genres = "Action",
                 format = "TV",
                 mediaCategory = "ANIME",
@@ -704,7 +714,12 @@ class MultiSeasonAndFirestoreFixTest {
             AnimeEntry(
                 id = "anilist_5002",
                 aniListId = 5002,
+                canonicalAnimeId = 5001,
+                canonicalTitle = "Chrono Blade",
+                canonicalSeasonNumber = 2,
+                cumulativeEpisodeOffset = 24,
                 preferredTitle = "Chrono Blade Season 2",
+                year = "2022",
                 genres = "Action",
                 format = "TV",
                 mediaCategory = "ANIME",
@@ -757,7 +772,12 @@ class MultiSeasonAndFirestoreFixTest {
             AnimeEntry(
                 id = "anilist_195604",
                 aniListId = 195604,
+                canonicalAnimeId = 97940,
+                canonicalTitle = "Black Clover",
+                canonicalSeasonNumber = 2,
+                cumulativeEpisodeOffset = 170,
                 preferredTitle = "Black Clover Season 2",
+                year = "2026",
                 genres = "Action",
                 format = "TV",
                 mediaCategory = "ANIME",

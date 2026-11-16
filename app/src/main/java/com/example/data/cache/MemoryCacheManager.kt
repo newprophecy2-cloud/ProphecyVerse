@@ -38,7 +38,8 @@ class MemoryCacheManager(
     data class SearchPageCacheValue(
         val results: List<AnimeEntry>,
         val currentPage: Int,
-        val hasNextPage: Boolean
+        val hasNextPage: Boolean,
+        val nextCursor: String? = null
     )
 
     private class BoundedLruMap<V>(private val maxEntries: Int) {

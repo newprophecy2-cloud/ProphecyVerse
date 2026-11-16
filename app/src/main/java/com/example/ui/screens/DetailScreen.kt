@@ -676,7 +676,7 @@ fun DetailScreen(
                                         ) {
                                             CircularProgressIndicator(color = AccentCyan, modifier = Modifier.size(28.dp))
                                             Text(
-                                                text = "Loading episodes from AniList...",
+                                                text = "Loading episodes from ProphecyVerse...",
                                                 color = TextSecondary,
                                                 fontSize = 13.sp
                                             )
@@ -717,7 +717,7 @@ fun DetailScreen(
                                     val emptyTitle = when {
                                         selectedSeasonEpisodeCount > 0 -> "No episodes in this page"
                                         item.status.equals("NOT_YET_RELEASED", ignoreCase = true) -> "Not yet aired"
-                                        catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes listed on AniList"
+                                        catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.CONFIRMED_EMPTY -> "No episodes listed on ProphecyVerse"
                                         catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.COMPLETE -> "No episodes in this season"
                                         catalogRefreshStatus.state == com.example.data.repository.EpisodeCatalogState.FAILED -> "Episode metadata could not be refreshed"
                                         else -> "Episode count not yet available"
@@ -755,9 +755,9 @@ fun DetailScreen(
                                                     text = when {
                                                         selectedSeasonEpisodeCount > 0 -> "No records are in the current page."
                                                         item.status.equals("NOT_YET_RELEASED", ignoreCase = true) ->
-                                                            "AniList lists this anime as upcoming (not yet aired)."
+                                                            "This title is listed as upcoming (not yet aired)."
                                                         else ->
-                                                            catalogRefreshStatus.errorMessage ?: "AniList has not published a confirmed episode count or aired schedule for this title yet."
+                                                            catalogRefreshStatus.errorMessage ?: "ProphecyVerse has not published episode records for this title yet."
                                                     },
                                                     color = TextMuted,
                                                     fontSize = 12.sp,
@@ -776,7 +776,7 @@ fun DetailScreen(
                                                         modifier = Modifier.size(16.dp)
                                                     )
                                                     Spacer(modifier = Modifier.width(6.dp))
-                                                    Text("Refresh AniList Metadata", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                                    Text("Refresh Episode Catalog", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                                 }
                                             }
                                         }
@@ -915,18 +915,41 @@ fun DetailScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
+                            val sheetTitle = if (isMovie) {
+                                "Movie Sources"
+                            } else {
+                                ep.title?.takeIf { it.isNotBlank() }?.let { title ->
+                                    "E${ep.episodeNumber}: $title"
+                                } ?: "Episode ${ep.episodeNumber} Sources"
+                            }
                             Text(
-                                text = if (isMovie) "Movie Sources" else "Episode ${ep.episodeNumber} Sources",
+                                text = sheetTitle,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = TextPrimary
+                                color = TextPrimary,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = if (isMovie) "Select a source candidate returned for this Movie" else "Select a source candidate returned for this Episode",
+                                text = if (isMovie) {
+                                    "Select a source candidate returned for this Movie"
+                                } else {
+                                    "Season ${ep.seasonNumber} • Episode ${ep.episodeNumber} • Available Sources"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextMuted
                             )
+                            if (!ep.overview.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = ep.overview,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                         IconButton(onClick = { viewModel.closeSourceChooser() }) {
                             Icon(imageVector = Icons.Default.Close, contentDescription = "Close", tint = TextSecondary)
@@ -987,7 +1010,7 @@ fun DetailScreen(
                                         source = src,
                                         onClick = {
                                             viewModel.closeSourceChooser()
-                                            onPlayEpisode(anime!!.id, ep.id, src.id)
+                                            onPlayEpisode(anime?.id ?: viewModel.animeId, ep.id, src.id)
                                         }
                                     )
                                 }

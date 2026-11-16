@@ -31,6 +31,7 @@ import com.example.data.remote.ProphecyAnimeDetailsResponse
 import com.example.data.remote.ProphecyEpisodeDto
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySearchResponse
+import com.example.data.remote.ProphecySeasonDto
 import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeCatalogState
@@ -422,6 +423,7 @@ class D1AndCacheOptimizationTest {
         val d1EpisodeQueries = CopyOnWriteArrayList<Int>()
         val d1StreamSourceWrites = AtomicInteger(0)
         val aniListCalls = AtomicInteger(0)
+        val backendDetailCalls = AtomicInteger(0)
         val directPlayCalls = AtomicInteger(0)
         val now = System.currentTimeMillis()
         val simulateD1Down = AtomicBoolean(false)
@@ -523,8 +525,28 @@ class D1AndCacheOptimizationTest {
         val prophecyApi = object : ProphecyVerseApiService {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse(emptyList()))
-            override suspend fun getAnimeDetails(animeId: String) =
-                Response.success(ProphecyAnimeDetailsResponse(id = animeId, title = "Frieren"))
+            override suspend fun getAnimeDetails(animeId: String): Response<ProphecyAnimeDetailsResponse> {
+                backendDetailCalls.incrementAndGet()
+                return Response.success(
+                    ProphecyAnimeDetailsResponse(
+                        id = animeId,
+                        title = "Frieren",
+                        seasons = listOf(
+                            ProphecySeasonDto(
+                                number = 1,
+                                episodes = listOf(
+                                    ProphecyEpisodeDto(
+                                        id = "be-ep-1",
+                                        number = 1,
+                                        season = 1,
+                                        title = "The Journey's End"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            }
             override suspend fun getAnimeEpisodes(animeId: String) =
                 Response.success(emptyList<ProphecyEpisodeDto>())
             override suspend fun getEpisodeFull(animeId: String, episodeId: String) =
@@ -590,9 +612,10 @@ class D1AndCacheOptimizationTest {
         assertEquals(31, page1.first().episodeNumber)
         assertEquals(listOf(0, 30), d1EpisodeQueries.toList())
 
-        // 4. Explicit forceRefresh bypasses cache and hits AniList
+        // 4. Explicit forceRefresh bypasses cache and hits Backend Details (never AniList)
         repo.refreshAnimeDetails("anilist_500", forceRefresh = true).getOrThrow()
-        assertEquals(1, aniListCalls.get())
+        assertEquals(1, backendDetailCalls.get())
+        assertEquals(0, aniListCalls.get())
 
         // 5. Stream discovery reads D1 shared metadata with zero Firestore reads;
         //    resolvePlayableStream invokes POST /api/v1/play/direct and caches only in memory

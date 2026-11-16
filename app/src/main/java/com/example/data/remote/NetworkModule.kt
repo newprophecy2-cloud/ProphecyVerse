@@ -170,16 +170,24 @@ object NetworkModule {
                 "language",
                 "size_bytes",
                 "downloadable",
-                "expires_at"
+                "expires_at",
+                "source_id",
+                "provider_name",
+                "provider",
+                "audio_language"
             )
             return object : JsonAdapter<ProphecySourceDto>() {
                 override fun fromJson(reader: JsonReader): ProphecySourceDto? {
                     if (reader.peek() == JsonReader.Token.NULL) return reader.nextNull()
                     var id = ""
+                    var fallbackSourceId = ""
                     var label: String? = null
+                    var fallbackProviderName: String? = null
+                    var fallbackProvider: String? = null
                     var quality: String? = null
                     var codec: String? = null
                     var language: String? = null
+                    var fallbackLanguage: String? = null
                     var sizeBytes: Long? = null
                     var downloadable: Boolean? = null
                     var expiresAt: String? = null
@@ -200,6 +208,15 @@ object NetworkModule {
                             5 -> sizeBytes = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else longAdapter.fromJson(reader)
                             6 -> downloadable = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else boolAdapter.fromJson(reader)
                             7 -> expiresAt = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
+                            8 -> fallbackSourceId = if (reader.peek() == JsonReader.Token.NULL) {
+                                reader.nextNull<String?>()
+                                ""
+                            } else {
+                                stringAdapter.fromJson(reader)?.trim().orEmpty()
+                            }
+                            9 -> fallbackProviderName = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
+                            10 -> fallbackProvider = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
+                            11 -> fallbackLanguage = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
                             else -> {
                                 reader.skipName()
                                 reader.skipValue()
@@ -208,11 +225,14 @@ object NetworkModule {
                     }
                     reader.endObject()
                     return ProphecySourceDto(
-                        id = id,
-                        label = label,
+                        id = id.ifEmpty { fallbackSourceId },
+                        label = label?.takeIf { it.isNotBlank() }
+                            ?: fallbackProviderName?.takeIf { it.isNotBlank() }
+                            ?: fallbackProvider?.takeIf { it.isNotBlank() },
                         quality = quality,
                         codec = codec,
-                        language = language,
+                        language = language?.takeIf { it.isNotBlank() }
+                            ?: fallbackLanguage?.takeIf { it.isNotBlank() },
                         sizeBytes = sizeBytes,
                         downloadable = downloadable,
                         expiresAt = expiresAt

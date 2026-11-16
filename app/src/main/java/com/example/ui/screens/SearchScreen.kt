@@ -207,12 +207,12 @@ fun SearchScreen(
             if (query.isNotBlank()) {
                 EmptyState(
                     title = "No anime found",
-                    message = if (isSearching) "Searching AniList catalog..." else "Try searching for alternate titles or keywords."
+                    message = if (isSearching) "Searching ProphecyVerse catalog..." else "Try searching for alternate titles or keywords."
                 )
             } else {
                 EmptyState(
                     title = "Discover Anime & Movies",
-                    message = "Search AniList titles above. Results are cached locally in Room."
+                    message = "Search ProphecyVerse catalog above. Results are cached locally in Room."
                 )
             }
         } else {
