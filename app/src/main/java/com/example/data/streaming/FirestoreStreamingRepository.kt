@@ -10,6 +10,7 @@ import com.example.data.local.StreamEpisodeEntity
 import com.example.data.local.StreamProviderEntity
 import com.example.data.local.StreamSeasonEntity
 import com.example.data.local.StreamSourceEntity
+import com.example.data.repository.ExpiryState
 import com.example.data.repository.SourceExpiryTime
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
@@ -56,7 +57,7 @@ class FirestoreStreamingRepository(
     private val metricsTracker: com.example.data.metrics.DatabaseMetricsTracker = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
 ) {
     val usesD1Primary: Boolean
-        get() = d1DataSource != null && cloudStoreProvider == null
+        get() = false
     companion object {
         private const val TAG = "FirestoreStreamingRepo"
         private const val AUDIT_TAG = "FirestoreWriteAudit"
@@ -285,16 +286,6 @@ class FirestoreStreamingRepository(
         preferServer: Boolean = false,
         requirePlayableUrl: Boolean = false
     ): ScopeReadOutcome {
-        if (usesD1Primary) {
-            return fetchAndSyncScopeFromD1(
-                contentKey = contentKey,
-                isMovie = isMovie,
-                seasonNumber = seasonNumber,
-                episodeNumber = episodeNumber,
-                catalogEpisodeId = catalogEpisodeId,
-                requirePlayableUrl = requirePlayableUrl
-            )
-        }
         val store = resolveCloudStore() ?: return ScopeReadOutcome(
             data = null,
             status = ScopeReadStatus.UNAVAILABLE,
@@ -311,12 +302,11 @@ class FirestoreStreamingRepository(
                 readScopeSnapshot(store, scopeDocPath, scopeKey, contentKey, isMovie, seasonNumber, episodeNumber, catalogEpisodeId, preferCache = true)
             }.getOrNull()
             MonotonicMetrics.recordDuration("firestore_cache_read_ms", cacheStarted, "hit=${cacheResult != null}")
-            val cacheHasValidUrl = cacheResult != null && cacheResult.sources.any {
-                it.status != "REMOVED" && it.deletedAt == null &&
-                    SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
+            val cacheHasValidSource = cacheResult != null && cacheResult.sources.any {
+                it.status == StreamRecordStatus.AVAILABLE.name && it.deletedAt == null &&
                     !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
             }
-            if (cacheHasValidUrl) {
+            if (cacheHasValidSource) {
                 return ScopeReadOutcome(data = cacheResult, status = ScopeReadStatus.HIT)
             }
         }
@@ -344,8 +334,7 @@ class FirestoreStreamingRepository(
             if (data == null) {
                 ScopeReadOutcome(data = null, status = ScopeReadStatus.NOT_FOUND)
             } else if (requirePlayableUrl && data.sources.none {
-                    it.status != "REMOVED" && it.deletedAt == null &&
-                        SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
+                    it.status == StreamRecordStatus.AVAILABLE.name && it.deletedAt == null &&
                         !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
                 }
             ) {
@@ -458,10 +447,6 @@ class FirestoreStreamingRepository(
         episodeNumber: Int = 1,
         catalogEpisodeId: String? = null
     ): Flow<ScopeStreamingData> = callbackFlow {
-        if (usesD1Primary) {
-            awaitClose { }
-            return@callbackFlow
-        }
         val store = resolveCloudStore()
         if (store == null) {
             awaitClose { }
@@ -648,11 +633,7 @@ class FirestoreStreamingRepository(
             existingContainer.discoveryStatus != DiscoveryStatus.NOT_DISCOVERED.name &&
             !outboxMap().containsKey(discoveryOutboxKey)
         ) {
-            if (usesD1Primary) {
-                metricsTracker.recordD1WriteSkipped()
-            } else {
-                metricsTracker.recordFirestoreWriteSkipped()
-            }
+            metricsTracker.recordFirestoreWriteSkipped()
             lastWriteRejectionReason = null
             lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
             return true
@@ -661,24 +642,6 @@ class FirestoreStreamingRepository(
         val now = persisted.now
         val effectiveVersion = persisted.container.version
         val startedAt = System.currentTimeMillis()
-        if (usesD1Primary) {
-            listenerSyncScope.launch {
-                runCatching {
-                    d1DataSource!!.publishScopedStreamingIfChanged(
-                        container = persisted.container,
-                        season = persisted.season,
-                        episode = persisted.episode,
-                        providers = persisted.providers,
-                        sources = persisted.sources
-                    )
-                }.onFailure { err ->
-                    Log.w(TAG, "Background D1 stream discovery publish deferred: ${err.message}")
-                }
-            }
-            lastWriteRejectionReason = null
-            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
-            return true
-        }
         val store = resolveCloudStore()
         if (store == null) {
             val reason = "Firestore instance unavailable."
@@ -919,24 +882,21 @@ class FirestoreStreamingRepository(
             val resolvedContentType = contentType ?: sourceEntity.contentType
             val resolvedExpiresAt = expiresAt ?: sourceEntity.expiresAt
             val sanitizedJson = SafePlaybackHeaders.toJson(safeHeaders)
-            val urlChanged = existing == null ||
-                existing.streamUrl != normalizedStreamUrl ||
+            val metaChanged = existing == null ||
                 existing.urlType != urlType ||
                 existing.contentType != resolvedContentType ||
-                existing.safeHeadersJson != sanitizedJson ||
                 existing.expiresAt != resolvedExpiresAt ||
                 existing.status != StreamRecordStatus.AVAILABLE.name
 
-            val updatedEntity = if (!urlChanged && existing != null) {
+            // Room stores Anime/Source metadata only — never Stream URLs or headers.
+            val updatedEntity = if (!metaChanged && existing != null) {
                 metricsTracker.recordRoomWriteSkipped()
                 existing
             } else {
                 val nextVersion = maxOf(sourceEntity.version, existing?.version ?: 0L) + 1L
                 sourceEntity.copy(
-                    streamUrl = normalizedStreamUrl,
                     urlType = urlType,
                     contentType = resolvedContentType,
-                    safeHeadersJson = sanitizedJson,
                     expiresAt = resolvedExpiresAt,
                     status = StreamRecordStatus.AVAILABLE.name,
                     version = nextVersion,
@@ -949,15 +909,6 @@ class FirestoreStreamingRepository(
             }
             val nextVersion = updatedEntity.version
 
-            if (usesD1Primary) {
-                // Temporary playback URLs and headers live strictly in Memory LRU & local Room.
-                // Never push null-URL writes or speculative playback timestamps to D1 on resolve/pre-resolve;
-                // actual playback verification is reported via recordPlaybackSuccess when ExoPlayer starts playing.
-                lastWriteRejectionReason = null
-                lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
-                return@withLock true
-            }
-
             val existingContainer = streamCacheDao.getContainer(ContentIdentityHelper.containerScopeKey(contentKey, isMovie))
             val resolvedTitle = canonicalTitle?.takeIf { it.isNotBlank() } ?: existingContainer?.canonicalTitle
             val resolvedBackendId = backendId?.takeIf { it.isNotBlank() } ?: existingContainer?.backendId
@@ -967,8 +918,7 @@ class FirestoreStreamingRepository(
                 normalizedStreamUrl, urlType, resolvedContentType.orEmpty(),
                 sanitizedJson.orEmpty(), resolvedExpiresAt.orEmpty(), StreamRecordStatus.AVAILABLE.name
             ).joinToString("|")
-            if (!urlChanged &&
-                publishedUrlDigests[targetPath] == urlPayloadDigest &&
+            if (publishedUrlDigests[targetPath] == urlPayloadDigest &&
                 !outboxMap().containsKey(urlOutboxKey)
             ) {
                 metricsTracker.recordFirestoreWriteSkipped()
@@ -1072,7 +1022,9 @@ class FirestoreStreamingRepository(
                     path = targetPath,
                     data = buildSourceFirestorePayload(
                         src = updatedEntity.copy(version = effectiveVersion),
-                        providerName = providerName
+                        providerName = providerName,
+                        streamUrl = normalizedStreamUrl,
+                        safeHeaders = safeHeaders
                     )
                 )
                 Unit to (parentWrites + sourceWrite)
@@ -1166,10 +1118,15 @@ class FirestoreStreamingRepository(
         canonicalTitle: String? = null,
         backendId: String? = null
     ): Boolean {
-        if (!SafePlaybackHeaders.isValidStreamUrl(sourceEntity.streamUrl) ||
+        if (sourceEntity.status in setOf(
+                StreamRecordStatus.REMOVED.name,
+                StreamRecordStatus.FAILED.name,
+                StreamRecordStatus.EXPIRED.name
+            ) ||
+            sourceEntity.deletedAt != null ||
             SourceExpiryTime.isExpiredOrInvalid(sourceEntity.expiresAt)
         ) {
-            val reason = "Playback success ignored: source has no valid, unexpired stream URL."
+            val reason = "Playback success ignored: source is removed, failed, or expired."
             lastWriteRejectionReason = reason
             lastWriteOutcome = WriteOutcome(WriteOutcomeState.FAILED, reason)
             Log.w(TAG, "$reason provider=${sourceEntity.providerId} source=${sourceEntity.sourceId}")
@@ -1213,13 +1170,6 @@ class FirestoreStreamingRepository(
             canonicalTitle = canonicalTitle,
             backendId = backendId
         )
-
-        if (usesD1Primary) {
-            val ok = runCatching { d1DataSource!!.reportPlaybackSuccessMetadata(sourceEntity) }.getOrDefault(false)
-            lastWriteRejectionReason = null
-            lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
-            return@withLock ok
-        }
 
         if (recentlyVerified && !outboxMap().containsKey(outboxKey)) {
             metricsTracker.recordFirestoreWriteSkipped()
@@ -1379,13 +1329,6 @@ class FirestoreStreamingRepository(
                 backendId = backendId
             )
 
-            if (usesD1Primary) {
-                val ok = runCatching { d1DataSource!!.softDeleteSourceMetadata(sourceEntity) }.getOrDefault(false)
-                lastWriteRejectionReason = null
-                lastWriteOutcome = WriteOutcome(WriteOutcomeState.SUCCEEDED)
-                return@withLock ok
-            }
-
             val store = resolveCloudStore()
             if (store == null) {
                 val reason = "Firestore instance unavailable."
@@ -1524,12 +1467,6 @@ class FirestoreStreamingRepository(
         val existingLocal = localLocks[lockKey]
         if (existingLocal != null && existingLocal.expiresAtMs > now && existingLocal.ownerId != ownerId) {
             return null
-        }
-
-        if (usesD1Primary) {
-            val lease = ResolveLease(lockKey, ownerId, acquiredRemote = false, expiresAtMs = expiresAt)
-            localLocks[lockKey] = lease
-            return lease
         }
 
         val store = resolveCloudStore()
@@ -2004,94 +1941,19 @@ class FirestoreStreamingRepository(
         }
     }
 
-    private suspend fun fetchAndSyncScopeFromD1(
-        contentKey: String,
-        isMovie: Boolean,
-        seasonNumber: Int,
-        episodeNumber: Int,
-        catalogEpisodeId: String?,
-        requirePlayableUrl: Boolean
-    ): ScopeReadOutcome {
-        val d1 = d1DataSource ?: return ScopeReadOutcome(null, ScopeReadStatus.UNAVAILABLE, "D1 unavailable", true)
-        val bundle = runCatching {
-            d1.fetchScopedStreaming(contentKey, isMovie, seasonNumber, episodeNumber)
-        }.getOrNull() ?: return ScopeReadOutcome(null, ScopeReadStatus.NOT_FOUND)
-
-        val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
-        val existingRoomSources = streamCacheDao.getAllSources(scopeKey).associateBy { it.sourceDocKey }
-        val mergedSources = bundle.sources.map { remote ->
-            val local = existingRoomSources[remote.sourceDocKey]
-            val localUrl = local?.streamUrl?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) }
-            val localExpired = local?.status == StreamRecordStatus.EXPIRED.name ||
-                SourceExpiryTime.isExpiredOrInvalid(local?.expiresAt)
-            remote.copy(
-                streamUrl = if (localUrl != null && !localExpired) localUrl else null,
-                safeHeadersJson = if (localUrl != null && !localExpired) local?.safeHeadersJson else null,
-                expiresAt = local?.expiresAt ?: remote.expiresAt,
-                status = when {
-                    remote.deletedAt != null || remote.status == StreamRecordStatus.REMOVED.name -> StreamRecordStatus.REMOVED.name
-                    localUrl != null && !localExpired -> StreamRecordStatus.AVAILABLE.name
-                    localUrl != null || local?.status == StreamRecordStatus.EXPIRED.name -> StreamRecordStatus.EXPIRED.name
-                    else -> StreamRecordStatus.MISSING_URL.name
-                }
-            )
-        }
-
-        val status = bundle.episode?.discoveryStatus ?: bundle.container?.discoveryStatus ?: DiscoveryStatus.COMPLETED.name
-        val version = maxOf(bundle.episode?.version ?: 1L, bundle.container?.version ?: 1L)
-        val updatedAt = bundle.episode?.updatedAt ?: bundle.container?.updatedAt ?: System.currentTimeMillis()
-        persistScopeToRoom(
-            contentKey = contentKey,
-            canonicalTitle = bundle.container?.canonicalTitle,
-            isMovie = isMovie,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-            catalogEpisodeId = catalogEpisodeId ?: bundle.episode?.catalogEpisodeId,
-            backendId = bundle.container?.backendId,
-            backendEpisodeId = bundle.episode?.backendEpisodeId,
-            anilistId = bundle.container?.anilistId ?: contentKey.toIntOrNull(),
-            seasonCount = bundle.container?.seasonCount,
-            totalEpisodeCount = bundle.container?.totalEpisodeCount,
-            seasonEpisodeCount = bundle.season?.episodeCount ?: 0,
-            discoveryStatus = status,
-            version = version,
-            providers = bundle.providers,
-            sources = mergedSources,
-            authoritativeComplete = status == DiscoveryStatus.COMPLETED.name
-        )
-
-        val scopeData = ScopeStreamingData(
-            discoveryStatus = status,
-            backendId = bundle.container?.backendId ?: bundle.episode?.backendEpisodeId,
-            providers = bundle.providers,
-            sources = mergedSources,
-            version = version,
-            updatedAt = updatedAt,
-            fromFirestoreServer = false
-        )
-        if (requirePlayableUrl && mergedSources.none {
-                it.status != StreamRecordStatus.REMOVED.name &&
-                    it.deletedAt == null &&
-                    SafePlaybackHeaders.isValidStreamUrl(it.streamUrl) &&
-                    !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt)
-            }
-        ) {
-            return ScopeReadOutcome(scopeData, ScopeReadStatus.CACHE_MISS)
-        }
-        return ScopeReadOutcome(scopeData, ScopeReadStatus.HIT)
-    }
-
     internal fun buildSourceFirestorePayload(
         src: StreamSourceEntity,
-        providerName: String? = null
+        providerName: String? = null,
+        streamUrl: String? = null,
+        safeHeaders: List<List<String>> = emptyList()
     ): Map<String, Any?> = buildMap {
         put("provider_id", src.providerId)
         put("provider_name", providerName?.takeIf { it.isNotBlank() } ?: src.sourceName)
         put("source_id", src.sourceId)
         put("source_name", src.sourceName)
         src.backendEpisodeId?.let { put("backend_episode_id", it) }
-        if (SafePlaybackHeaders.isValidStreamUrl(src.streamUrl)) {
-            put("stream_url", src.streamUrl)
+        if (SafePlaybackHeaders.isValidStreamUrl(streamUrl)) {
+            put("stream_url", streamUrl!!.trim())
         }
         put("url_type", src.urlType)
         src.contentType?.let { put("content_type", it) }
@@ -2100,7 +1962,7 @@ class FirestoreStreamingRepository(
         src.audioLanguage?.let { put("audio_language", it) }
         src.downloadable?.let { put("downloadable", it) }
         src.sizeBytes?.let { put("size_bytes", it) }
-        val safeHeadersMap = SafePlaybackHeaders.toSafeMap(SafePlaybackHeaders.fromJson(src.safeHeadersJson))
+        val safeHeadersMap = SafePlaybackHeaders.toSafeMap(safeHeaders)
         if (safeHeadersMap.isNotEmpty()) {
             put("safe_headers", safeHeadersMap)
         }
@@ -2134,18 +1996,14 @@ class FirestoreStreamingRepository(
         val sourceId = doc.data.stringValue("source_id")?.takeIf { it.isNotBlank() } ?: doc.id
         val rawUrl = doc.data.stringValue("stream_url")?.takeIf { SafePlaybackHeaders.isValidStreamUrl(it) }
         val expiresAt = doc.data.stringValue("expires_at")
+        val recordExpired = SourceExpiryTime.evaluateExpiry(expiresAt) == ExpiryState.EXPIRED
         val urlExpired = rawUrl != null && SourceExpiryTime.isExpiredOrInvalid(expiresAt)
-        val effectiveUrl = if (urlExpired) null else rawUrl
-        val rawHeaders = if (effectiveUrl != null) {
-            (doc.data["safe_headers"] as? Map<*, *>)?.let { SafePlaybackHeaders.fromSafeMap(it) }.orEmpty()
-        } else {
-            emptyList()
-        }
+        val effectiveUrl = if (recordExpired || urlExpired) null else rawUrl
         val remoteStatus = doc.data.stringValue("status")
         val deletedAt = doc.data.longValue("deleted_at")
         val effectiveStatus = when {
             deletedAt != null || remoteStatus == StreamRecordStatus.REMOVED.name -> StreamRecordStatus.REMOVED.name
-            urlExpired || remoteStatus == StreamRecordStatus.EXPIRED.name -> StreamRecordStatus.EXPIRED.name
+            recordExpired || urlExpired || remoteStatus == StreamRecordStatus.EXPIRED.name -> StreamRecordStatus.EXPIRED.name
             effectiveUrl != null -> remoteStatus ?: StreamRecordStatus.AVAILABLE.name
             remoteStatus == StreamRecordStatus.AVAILABLE.name -> StreamRecordStatus.MISSING_URL.name
             else -> remoteStatus ?: StreamRecordStatus.MISSING_URL.name
@@ -2159,7 +2017,6 @@ class FirestoreStreamingRepository(
                 ?: doc.data.stringValue("provider_name")?.takeIf { it.isNotBlank() }
                 ?: "Unknown provider",
             backendEpisodeId = doc.data.stringValue("backend_episode_id"),
-            streamUrl = effectiveUrl,
             urlType = doc.data.stringValue("url_type") ?: "direct",
             contentType = doc.data.stringValue("content_type"),
             quality = doc.data.stringValue("quality"),
@@ -2167,7 +2024,6 @@ class FirestoreStreamingRepository(
             audioLanguage = doc.data.stringValue("audio_language"),
             downloadable = doc.data["downloadable"] as? Boolean,
             sizeBytes = doc.data.longValue("size_bytes"),
-            safeHeadersJson = if (effectiveUrl != null) SafePlaybackHeaders.toJson(rawHeaders) else null,
             expiresAt = expiresAt,
             status = effectiveStatus,
             version = doc.data.longValue("version") ?: 1L,

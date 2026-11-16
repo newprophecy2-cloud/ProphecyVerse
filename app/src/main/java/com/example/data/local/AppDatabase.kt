@@ -31,7 +31,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         StreamProviderEntity::class,
         StreamSourceEntity::class
     ],
-    version = 12,
+    version = 13,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -397,6 +397,56 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `stream_sources_new` (
+                        `sourceDocKey` TEXT NOT NULL,
+                        `scopeKey` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `sourceId` TEXT NOT NULL,
+                        `sourceName` TEXT NOT NULL,
+                        `backendEpisodeId` TEXT,
+                        `urlType` TEXT NOT NULL,
+                        `contentType` TEXT,
+                        `quality` TEXT,
+                        `codec` TEXT,
+                        `audioLanguage` TEXT,
+                        `downloadable` INTEGER,
+                        `sizeBytes` INTEGER,
+                        `expiresAt` TEXT,
+                        `status` TEXT NOT NULL,
+                        `version` INTEGER NOT NULL,
+                        `lastVerifiedAt` INTEGER,
+                        `lastPlaybackSuccessAt` INTEGER,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER,
+                        PRIMARY KEY(`sourceDocKey`)
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    INSERT INTO `stream_sources_new` (
+                        `sourceDocKey`, `scopeKey`, `providerId`, `sourceId`, `sourceName`,
+                        `backendEpisodeId`, `urlType`, `contentType`, `quality`, `codec`,
+                        `audioLanguage`, `downloadable`, `sizeBytes`, `expiresAt`, `status`,
+                        `version`, `lastVerifiedAt`, `lastPlaybackSuccessAt`, `updatedAt`, `deletedAt`
+                    )
+                    SELECT
+                        `sourceDocKey`, `scopeKey`, `providerId`, `sourceId`, `sourceName`,
+                        `backendEpisodeId`, `urlType`, `contentType`, `quality`, `codec`,
+                        `audioLanguage`, `downloadable`, `sizeBytes`, `expiresAt`, `status`,
+                        `version`, `lastVerifiedAt`, `lastPlaybackSuccessAt`, `updatedAt`, `deletedAt`
+                    FROM `stream_sources`
+                """.trimIndent())
+                db.execSQL("DROP TABLE IF EXISTS `stream_sources`")
+                db.execSQL("ALTER TABLE `stream_sources_new` RENAME TO `stream_sources`")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_scopeKey` ON `stream_sources` (`scopeKey`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_providerId` ON `stream_sources` (`providerId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_sourceId` ON `stream_sources` (`sourceId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_status` ON `stream_sources` (`status`)")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -415,7 +465,8 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_8_9,
                         MIGRATION_9_10,
                         MIGRATION_10_11,
-                        MIGRATION_11_12
+                        MIGRATION_11_12,
+                        MIGRATION_12_13
                     )
                     .build()
                 INSTANCE = instance

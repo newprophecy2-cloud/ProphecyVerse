@@ -604,20 +604,20 @@ class ArchitectureRemakeVerificationTest {
         assertTrue(headerKeys.contains("cookie"))
         assertTrue(headerKeys.contains("x-api-key"))
 
-        // Second play hits Room cache with ZERO Discovery and ZERO Resolve calls!
+        // Second play hits Memory cache with ZERO Discovery and ZERO Resolve calls!
         val second = repo.resolvePlayableStream(
             animeId = "anilist_201",
             seasonNumber = ep1.seasonNumber,
             episodeNumber = ep1.episodeNumber,
             catalogEpisodeId = ep1.id
         ).getOrThrow()
-        assertEquals("ROOM", second.cacheTier)
+        assertEquals("MEMORY", second.cacheTier)
         assertEquals(1, backend.episodeCalls.get())
         assertEquals(1, backend.resolveCalls.get())
 
-        // Simulate forced fresh resolve failure -> cached Room streamUrl MUST NOT be wiped!
+        // Simulate forced fresh resolve failure -> Room metadata must remain intact!
         backend.resolveShouldFail = true
-        repo.resolvePlayableStream(
+        val failedFresh = repo.resolvePlayableStream(
             animeId = "anilist_201",
             seasonNumber = ep1.seasonNumber,
             episodeNumber = ep1.episodeNumber,
@@ -625,12 +625,13 @@ class ArchitectureRemakeVerificationTest {
             preferredSourceId = first.source.id,
             forceResolveFresh = true
         )
+        assertTrue(failedFresh.isFailure)
         val cachedSources = database.streamCacheDao().getActiveSources("anime:201:s1:e1")
-        assertTrue(cachedSources.any { it.streamUrl == "https://cdn.example.com/streams/direct_1080p.m3u8" })
+        assertTrue(cachedSources.any { it.sourceId == first.source.id })
     }
 
     @Test
-    fun streamCacheDaoVersioningSoftDeletePreventsResurrectionAndPreservesUrls() = runTest {
+    fun streamCacheDaoVersioningSoftDeletePreventsResurrectionAndPreservesMetadata() = runTest {
         val dao = database.streamCacheDao()
         val scope = "anime:500:s1:e1"
         val provId = ContentIdentityHelper.deterministicProviderId("MegaCloud")
@@ -645,14 +646,14 @@ class ArchitectureRemakeVerificationTest {
                     providerId = provId,
                     sourceId = "s1",
                     sourceName = "MegaCloud",
-                    streamUrl = "https://cdn.example.com/ep1.m3u8",
+                    quality = "1080p",
                     version = 2
                 )
             ),
             authoritativeComplete = false
         )
 
-        // Incoming metadata-only update with version 3 must preserve existing valid streamUrl
+        // Incoming metadata update with version 3 preserves metadata cleanly
         dao.syncScopeRecords(
             scopeKey = scope,
             incomingProviders = listOf(StreamProviderEntity("$scope|p|$provId", scope, provId, "MegaCloud", version = 3)),
@@ -663,14 +664,13 @@ class ArchitectureRemakeVerificationTest {
                     providerId = provId,
                     sourceId = "s1",
                     sourceName = "MegaCloud 1080p",
-                    streamUrl = null,
                     version = 3
                 )
             ),
             authoritativeComplete = false
         )
         val preserved = dao.getActiveSources(scope).single()
-        assertEquals("https://cdn.example.com/ep1.m3u8", preserved.streamUrl)
+        assertEquals("1080p", preserved.quality)
         assertEquals("MegaCloud 1080p", preserved.sourceName)
 
         // Soft delete with version 4
@@ -688,7 +688,6 @@ class ArchitectureRemakeVerificationTest {
                     providerId = provId,
                     sourceId = "s1",
                     sourceName = "MegaCloud Stale",
-                    streamUrl = "https://cdn.example.com/ep1.m3u8",
                     version = 3L
                 )
             ),

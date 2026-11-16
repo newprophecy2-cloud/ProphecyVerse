@@ -569,20 +569,25 @@ class MultiSeasonAndFirestoreFixTest {
         db: AppDatabase = database,
         backend: BlackCloverBackendFake = BlackCloverBackendFake(),
         cloudStore: InMemoryCloudStore? = InMemoryCloudStore(),
-        writeAuthorized: Boolean = true
+        writeAuthorized: Boolean = true,
+        d1DataSource: com.example.data.d1.CloudflareD1DataSource? = null,
+        metricsTracker: com.example.data.metrics.DatabaseMetricsTracker = com.example.data.metrics.DatabaseMetricsTracker()
     ): Triple<AnimeRepository, BlackCloverBackendFake, FirestoreStreamingRepository> {
         val streamingRepo = FirestoreStreamingRepository(
             streamCacheDao = db.streamCacheDao(),
             firestoreProvider = { null },
             isClientWriteAuthorized = { writeAuthorized },
-            cloudStoreProvider = { cloudStore }
+            cloudStoreProvider = { cloudStore },
+            metricsTracker = metricsTracker
         )
         val repo = AnimeRepository(
             database = db,
             prophecyApi = backend,
             aniListApi = blackCloverAniListService(),
             applicationContext = context,
-            streamingRepository = streamingRepo
+            streamingRepository = streamingRepo,
+            d1DataSource = d1DataSource,
+            metricsTracker = metricsTracker
         )
         return Triple(repo, backend, streamingRepo)
     }
@@ -859,36 +864,66 @@ class MultiSeasonAndFirestoreFixTest {
     }
 
     @Test
-    fun secondOpen_reusesFirestoreWithoutBackendDiscoveryOrResolve() = runTest {
+    fun secondOpen_reusesFirestoreMetadataWithoutDiscovery_andReusesSharedD1StreamUrl() = runTest {
         val sharedCloud = InMemoryCloudStore()
-
-        // Device A discovers & resolves Black Clover Season 2
-        val (repoA, backendA, _) = createRepo(cloudStore = sharedCloud)
-        database.animeDao().upsertAnime(
-            AnimeEntry(
-                id = "anilist_195604",
-                aniListId = 195604,
-                canonicalAnimeId = 97940,
-                canonicalTitle = "Black Clover",
-                canonicalSeasonNumber = 2,
-                cumulativeEpisodeOffset = 170,
-                preferredTitle = "Black Clover Season 2",
-                genres = "Action",
-                format = "TV",
-                mediaCategory = "ANIME",
-                episodeCount = 6,
-                isPlayable = true
-            )
+        val d1Store = ConcurrentHashMap<String, String>()
+        val server = com.sun.net.httpserver.HttpServer.create(
+            java.net.InetSocketAddress(java.net.InetAddress.getByName("127.0.0.1"), 0),
+            0
         )
-        val resA = repoA.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1).getOrThrow()
-        assertEquals("BACKEND_RESOLVE", resA.cacheTier)
-        assertEquals(1, backendA.resolveRequests.get())
-
-        // Device B starts with empty Room DB pointing to the SAME Firestore store
-        val dbB = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).allowMainThreadQueries().build()
+        server.createContext("/v1/") { exchange ->
+            val path = exchange.requestURI.path
+            val method = exchange.requestMethod
+            when {
+                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
+                    val key = path.removePrefix("/v1/tables/stream_urls/")
+                    val raw = d1Store[key]
+                    if (raw == null) {
+                        val b = """{"success":false,"error":"Not found"}""".toByteArray()
+                        exchange.responseHeaders.add("Content-Type", "application/json")
+                        exchange.sendResponseHeaders(404, b.size.toLong())
+                        exchange.responseBody.use { it.write(b) }
+                    } else {
+                        val b = """{"success":true,"data":$raw}""".toByteArray()
+                        exchange.responseHeaders.add("Content-Type", "application/json")
+                        exchange.sendResponseHeaders(200, b.size.toLong())
+                        exchange.responseBody.use { it.write(b) }
+                    }
+                }
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    if (recId.isNotEmpty()) d1Store[recId] = body
+                    val b = """{"success":true}""".toByteArray()
+                    exchange.responseHeaders.add("Content-Type", "application/json")
+                    exchange.sendResponseHeaders(200, b.size.toLong())
+                    exchange.responseBody.use { it.write(b) }
+                }
+                else -> {
+                    val b = """{"success":false}""".toByteArray()
+                    exchange.sendResponseHeaders(404, b.size.toLong())
+                    exchange.responseBody.use { it.write(b) }
+                }
+            }
+        }
+        server.start()
         try {
-            val (repoB, backendB, _) = createRepo(db = dbB, cloudStore = sharedCloud)
-            dbB.animeDao().upsertAnime(
+            val moshi = com.squareup.moshi.Moshi.Builder()
+                .add(com.example.data.d1.D1BooleanAdapterFactory)
+                .addLast(com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory())
+                .build()
+            val d1Api = retrofit2.Retrofit.Builder()
+                .baseUrl("http://127.0.0.1:${server.address.port}/v1/")
+                .client(okhttp3.OkHttpClient.Builder().connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS).build())
+                .addConverterFactory(retrofit2.converter.moshi.MoshiConverterFactory.create(moshi))
+                .build()
+                .create(com.example.data.d1.CloudflareD1ApiService::class.java)
+            val sharedMetrics = com.example.data.metrics.DatabaseMetricsTracker()
+            val sharedD1 = com.example.data.d1.CloudflareD1DataSource(d1Api, sharedMetrics)
+
+            // Device A discovers & resolves Black Clover Season 2
+            val (repoA, backendA, _) = createRepo(cloudStore = sharedCloud, d1DataSource = sharedD1, metricsTracker = sharedMetrics)
+            database.animeDao().upsertAnime(
                 AnimeEntry(
                     id = "anilist_195604",
                     aniListId = 195604,
@@ -904,15 +939,45 @@ class MultiSeasonAndFirestoreFixTest {
                     isPlayable = true
                 )
             )
-            val resB = repoB.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1).getOrThrow()
-            assertEquals("FIRESTORE", resB.cacheTier)
-            assertTrue(resB.fromCache)
-            assertEquals(backendA.resolveUrl, resB.directData.playbackUrl)
-            assertEquals(0, backendB.searchQueries.size)
-            assertEquals(0, backendB.episodeFullRequests.size)
-            assertEquals(0, backendB.resolveRequests.get())
+            val resA = repoA.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1).getOrThrow()
+            assertEquals("BACKEND_RESOLVE", resA.cacheTier)
+            assertEquals(1, backendA.resolveRequests.get())
+
+            val d1SaveDeadline = System.currentTimeMillis() + 2000L
+            while (d1Store.isEmpty() && System.currentTimeMillis() < d1SaveDeadline) Thread.sleep(20L)
+
+            // Device B starts with empty Room DB pointing to the SAME shared D1 stream_urls store
+            val dbB = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).allowMainThreadQueries().build()
+            try {
+                val (repoB, backendB, _) = createRepo(db = dbB, cloudStore = sharedCloud, d1DataSource = sharedD1, metricsTracker = sharedMetrics)
+                dbB.animeDao().upsertAnime(
+                    AnimeEntry(
+                        id = "anilist_195604",
+                        aniListId = 195604,
+                        canonicalAnimeId = 97940,
+                        canonicalTitle = "Black Clover",
+                        canonicalSeasonNumber = 2,
+                        cumulativeEpisodeOffset = 170,
+                        preferredTitle = "Black Clover Season 2",
+                        genres = "Action",
+                        format = "TV",
+                        mediaCategory = "ANIME",
+                        episodeCount = 6,
+                        isPlayable = true
+                    )
+                )
+                val resB = repoB.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1).getOrThrow()
+                assertEquals("D1", resB.cacheTier)
+                assertTrue(resB.fromCache)
+                assertEquals(backendA.resolveUrl, resB.directData.playbackUrl)
+                assertEquals(0, backendB.searchQueries.size)
+                assertEquals(0, backendB.episodeFullRequests.size)
+                assertEquals(0, backendB.resolveRequests.get())
+            } finally {
+                dbB.close()
+            }
         } finally {
-            dbB.close()
+            server.stop(0)
         }
     }
 
@@ -939,12 +1004,12 @@ class MultiSeasonAndFirestoreFixTest {
             )
         )
 
-        // 1. Seed initial expired stream URL in Firestore + Room
+        // 1. Seed initial expired source metadata in Firestore + Room
         backend.resolveUrl = "https://cdn.dramachi.example/old.m3u8"
         backend.resolveExpiresAt = "2020-01-01T00:00:00Z" // already expired
         repo.discoverStreamsForScope("anilist_195604", seasonNumber = 2, episodeNumber = 1).getOrThrow()
 
-        // Valid future resolve updates Firestore and increments version
+        // Valid future resolve increments Firestore metadata version and returns fresh URL
         backend.resolveUrl = "https://cdn.dramachi.example/fresh_v2.m3u8"
         backend.resolveExpiresAt = "2099-01-01T00:00:00Z"
         val fresh = repo.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1, forceResolveFresh = true).getOrThrow()
@@ -954,13 +1019,13 @@ class MultiSeasonAndFirestoreFixTest {
         val docId = ContentIdentityHelper.sourceDocId("provider/dramachi/ep171")
         val sourcePath = "anime_streams/97940/seasons/season_2/episodes/ep_1/providers/$provId/sources/$docId"
         val versionAfterFresh = (cloud.docs[sourcePath]!!["version"] as Number).toLong()
-        assertEquals("https://cdn.dramachi.example/fresh_v2.m3u8", cloud.docs[sourcePath]!!["stream_url"])
+        assertEquals("AVAILABLE", cloud.docs[sourcePath]!!["status"])
 
-        // 2. Failed force-resolve MUST NOT overwrite valid stream_url
+        // 2. Failed force-resolve MUST NOT overwrite valid source status or cached D1/memory entry
         backend.resolveShouldFail = true
         val failedResolve = repo.resolvePlayableStream("anilist_195604", seasonNumber = 2, episodeNumber = 1, forceResolveFresh = true)
         assertTrue(failedResolve.isFailure)
-        assertEquals("https://cdn.dramachi.example/fresh_v2.m3u8", cloud.docs[sourcePath]!!["stream_url"])
+        assertEquals("AVAILABLE", cloud.docs[sourcePath]!!["status"])
         backend.resolveShouldFail = false
 
         // 3. Temporary 503 outage MUST NOT soft-delete sources in Firestore or emit REMOVE audit log

@@ -1,40 +1,25 @@
 package com.example.data.d1
 
 import android.util.Log
-import com.example.data.local.AnimeAlias
-import com.example.data.local.AnimeEntry
-import com.example.data.local.CatalogMapping
-import com.example.data.local.EpisodeEntry
-import com.example.data.local.SeasonEntry
-import com.example.data.local.StreamContainerEntity
-import com.example.data.local.StreamEpisodeEntity
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSeasonEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
-import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.DiscoveryStatus
+import com.example.data.repository.ExpiryState
+import com.example.data.repository.SourceExpiryTime
 import com.example.data.streaming.MonotonicMetrics
-import com.example.data.streaming.StreamRecordStatus
+import com.example.data.streaming.SafePlaybackHeaders
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
-import org.json.JSONArray
 import org.json.JSONObject
 import retrofit2.Response
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 
@@ -107,28 +92,26 @@ class SharedPreferencesD1DigestStore(context: android.content.Context) : D1Diges
 
 /**
  * Cloudflare D1 REST Data Source backed by the Prophecy-verse-DB Worker API.
- * Implements strict page-based indexed reads, single-flight coalescing, bounded retries
- * with exponential backoff + jitter, duplicate-alias prevention, and persistent diff-checked writes.
+ * Strictly stores and validates resolved Stream URLs only, keyed by (anime_id, episode_id, source_id),
+ * storing expires_at only when actual expiry is known.
  */
 class CloudflareD1DataSource(
     private val api: CloudflareD1ApiService,
     private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance(),
     @Volatile private var digestStore: D1DigestStore = InMemoryD1DigestStore()
 ) {
-    data class D1ScopedStreamingBundle(
-        val container: StreamContainerEntity?,
-        val season: StreamSeasonEntity?,
-        val episode: StreamEpisodeEntity?,
-        val providers: List<StreamProviderEntity>,
-        val sources: List<StreamSourceEntity>
+    data class CachedStreamUrl(
+        val animeId: String,
+        val episodeId: String,
+        val sourceId: String,
+        val streamUrl: String,
+        val expiresAt: String? = null
     )
 
     private val singleFlightScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlightReads = ConcurrentHashMap<String, CompletableDeferred<Any?>>()
     private val writtenDigests = ConcurrentHashMap<String, String>()
     private val writeMutexes = ConcurrentHashMap<String, Mutex>()
-    private val knownAliasesByAnime = ConcurrentHashMap<String, MutableSet<String>>()
-    private val lastSuccessReportAt = ConcurrentHashMap<String, Long>()
 
     fun attachDigestStore(store: D1DigestStore) {
         digestStore = store
@@ -142,14 +125,9 @@ class CloudflareD1DataSource(
         digestStore.put(key, digest)
     }
 
-    private fun readSuccessAt(sourceDocKey: String): Long =
-        lastSuccessReportAt[sourceDocKey]
-            ?: digestStore.getLong("succ:$sourceDocKey")?.also { lastSuccessReportAt[sourceDocKey] = it }
-            ?: 0L
-
-    private fun saveSuccessAt(sourceDocKey: String, timestampMs: Long) {
-        lastSuccessReportAt[sourceDocKey] = timestampMs
-        digestStore.putLong("succ:$sourceDocKey", timestampMs)
+    private fun removeDigest(key: String) {
+        writtenDigests.remove(key)
+        digestStore.remove(key)
     }
 
     private suspend fun <T> withWriteLock(key: String, block: suspend () -> T): T {
@@ -212,7 +190,8 @@ class CloudflareD1DataSource(
                 val transient = code == 429 || code in 500..599
                 if (!transient || attempt >= MAX_RETRIES) {
                     metricsTracker.recordD1Error(elapsed)
-                    Log.w(TAG, "D1 $operationName failed with HTTP $code")
+                    val errBody = runCatching { response.errorBody()?.string()?.take(180) }.getOrNull()
+                    Log.w(TAG, "D1 $operationName failed with HTTP $code ${errBody.orEmpty()}".trim())
                     return response
                 }
             } catch (cancelled: CancellationException) {
@@ -248,644 +227,185 @@ class CloudflareD1DataSource(
     }
 
     suspend fun verifyHealth(): Boolean {
-        val response = executeWithRetry("list_tables") { api.listTables() } ?: return false
-        return response.isSuccessful && response.body()?.success == true
+        val resp = executeWithRetry("verifyHealth") { api.listTables() } ?: return false
+        return resp.isSuccessful && resp.body()?.success == true
     }
 
-    suspend fun fetchHomeSection(
-        sectionColumn: String,
-        limit: Int = 25,
-        offset: Int = 0
-    ): List<D1AnimeEntryDto> {
-        val boundedLimit = limit.coerceIn(1, 100)
-        val safeOffset = offset.coerceAtLeast(0)
-        val whereJson = when (sectionColumn) {
-            "isTrending" -> buildWhereJson("isTrending" to 1)
-            "isSeasonal" -> buildWhereJson("isSeasonal" to 1)
-            "isPopular" -> buildWhereJson("isPopular" to 1)
-            "MOVIE" -> buildWhereJson("mediaCategory" to "MOVIE")
-            else -> return emptyList()
-        }
-        return coalesceRead("home:$sectionColumn:$boundedLimit:$safeOffset") {
-            val response = executeWithRetry("home_$sectionColumn") {
-                api.listAnimeEntries(
-                    where = whereJson,
-                    sort = "updatedAt",
-                    order = "DESC",
-                    limit = boundedLimit,
-                    offset = safeOffset
-                )
-            }
-            val list = response?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            list.forEach { rememberAnimeDigest(it) }
-            list
-        }
-    }
-
-    suspend fun fetchAnimeById(animeId: String): D1AnimeEntryDto? {
-        if (animeId.isBlank()) return null
-        return coalesceRead("anime:$animeId") {
-            val response = executeWithRetry("get_anime") { api.getAnimeEntry(animeId) }
-            val dto = response?.takeIf { it.isSuccessful }?.body()?.data
-            if (dto != null) rememberAnimeDigest(dto)
-            dto
-        }
-    }
-
-    suspend fun fetchAnimeByAniListId(aniListId: Int): D1AnimeEntryDto? {
-        if (aniListId <= 0) return null
-        return coalesceRead("anime_anilist:$aniListId") {
-            val response = executeWithRetry("get_anime_by_anilist") {
-                api.listAnimeEntries(
-                    where = buildWhereJson("aniListId" to aniListId),
-                    limit = 1,
-                    offset = 0
-                )
-            }
-            val dto = response?.takeIf { it.isSuccessful }?.body()?.data?.firstOrNull()
-            if (dto != null) rememberAnimeDigest(dto)
-            dto
-        }
-    }
-
-    suspend fun searchAnimeByAliasPage(
-        normalizedQuery: String,
-        limit: Int = 25,
-        offset: Int = 0
-    ): List<D1AnimeEntryDto> {
-        val q = normalizedQuery.trim().lowercase()
-        if (q.isBlank()) return emptyList()
-        val boundedLimit = limit.coerceIn(1, 100)
-        val safeOffset = offset.coerceAtLeast(0)
-        return coalesceRead("search_alias:$q:$boundedLimit:$safeOffset") {
-            val aliasResp = executeWithRetry("search_aliases") {
-                api.listAnimeAliases(
-                    where = buildWhereJson("alias" to q),
-                    limit = boundedLimit,
-                    offset = safeOffset
-                )
-            }
-            val animeIds = aliasResp?.takeIf { it.isSuccessful }?.body()?.data
-                ?.map { it.animeId }
-                ?.distinct()
-                ?.take(100)
-                .orEmpty()
-            if (animeIds.isEmpty()) return@coalesceRead emptyList()
-
-            val animeResp = executeWithRetry("search_anime_batch") {
-                api.listAnimeEntries(
-                    where = buildWhereInJson("id", animeIds),
-                    limit = animeIds.size,
-                    offset = 0
-                )
-            }
-            val rows = animeResp?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            rows.forEach { rememberAnimeDigest(it) }
-            rows
-        }
-    }
-
-    suspend fun fetchSeasonsForAnime(
+    /**
+     * Looks up a cached Stream URL from D1 by exact (anime_id, episode_id, source_id).
+     * Validates URL scheme/host and expiry; treats expired, invalid, or unavailable entries as misses.
+     */
+    suspend fun getValidStreamUrl(
         animeId: String,
-        limit: Int = 50,
-        offset: Int = 0
-    ): List<D1SeasonEntryDto> {
-        if (animeId.isBlank()) return emptyList()
-        return coalesceRead("seasons:$animeId:$limit:$offset") {
-            val response = executeWithRetry("list_seasons") {
-                api.listSeasonEntries(
-                    where = buildWhereJson("animeId" to animeId),
-                    sort = "seasonNumber",
-                    order = "ASC",
-                    limit = limit.coerceIn(1, 200),
-                    offset = offset.coerceAtLeast(0)
-                )
+        episodeId: String,
+        sourceId: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): CachedStreamUrl? {
+        val normAnime = animeId.trim()
+        val normEpisode = episodeId.trim()
+        val normSource = sourceId.trim()
+        if (normAnime.isEmpty() || normEpisode.isEmpty() || normSource.isEmpty()) return null
+
+        val lockKey = digestKey(normAnime, normEpisode, normSource)
+        val recordId = deterministicRecordId(normAnime, normEpisode, normSource)
+        val flightKey = "stream_url:$normAnime|$normEpisode|$normSource"
+        return coalesceRead(flightKey) {
+            val resp = executeWithRetry("getStreamUrl") {
+                api.getStreamUrl(recordId)
             }
-            val rows = response?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            rows.forEach { saveDigest("season:${it.id}", it.stableDigest()) }
-            rows
-        }
-    }
-
-    suspend fun fetchEpisodesPage(
-        animeId: String,
-        seasonNumber: Int,
-        limit: Int = 30,
-        offset: Int = 0
-    ): List<D1EpisodeEntryDto> {
-        if (animeId.isBlank()) return emptyList()
-        val boundedLimit = limit.coerceIn(1, 100)
-        val safeOffset = offset.coerceAtLeast(0)
-        return coalesceRead("episodes:$animeId:s$seasonNumber:$boundedLimit:$safeOffset") {
-            val response = executeWithRetry("list_episodes") {
-                api.listEpisodeEntries(
-                    where = buildWhereJson("animeId" to animeId, "seasonNumber" to seasonNumber),
-                    sort = "episodeNumber",
-                    order = "ASC",
-                    limit = boundedLimit,
-                    offset = safeOffset
-                )
+            if (resp == null || !resp.isSuccessful) {
+                return@coalesceRead null
             }
-            val rows = response?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-            rows.forEach { saveDigest("episode:${it.id}", it.stableDigest()) }
-            rows
-        }
-    }
-
-    suspend fun fetchCatalogMapping(aniListId: Int): D1CatalogMappingDto? {
-        if (aniListId <= 0) return null
-        return coalesceRead("mapping:$aniListId") {
-            val response = executeWithRetry("get_mapping") { api.getCatalogMapping(aniListId) }
-            val dto = response?.takeIf { it.isSuccessful }?.body()?.data
-            if (dto != null) saveDigest("mapping:${dto.aniListId}", dto.stableDigest())
-            dto
-        }
-    }
-
-    suspend fun fetchScopedStreaming(
-        contentKey: String,
-        isMovie: Boolean,
-        seasonNumber: Int,
-        episodeNumber: Int
-    ): D1ScopedStreamingBundle? {
-        if (contentKey.isBlank()) return null
-        val containerScopeKey = buildContainerD1ScopeKey(contentKey, isMovie)
-        val scopeKey = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
-        return coalesceRead("stream_scope:$scopeKey") {
-            coroutineScope {
-                val containerDeferred = async {
-                    executeWithRetry("get_stream_container") {
-                        api.getStreamContainer(containerScopeKey)
-                    }?.takeIf { it.isSuccessful }?.body()?.data
-                }
-                val seasonDeferred = if (!isMovie) {
-                    async {
-                        val seasonDocKey = "$contentKey:s$seasonNumber"
-                        executeWithRetry("list_stream_seasons") {
-                            api.listStreamSeasons(
-                                where = buildWhereJson("seasonDocKey" to seasonDocKey),
-                                limit = 1
-                            )
-                        }?.takeIf { it.isSuccessful }?.body()?.data?.firstOrNull()
-                    }
-                } else null
-                val episodeDeferred = if (!isMovie) {
-                    async {
-                        val episodeDocKey = "$contentKey:s$seasonNumber:e$episodeNumber"
-                        executeWithRetry("list_stream_episodes") {
-                            api.listStreamEpisodes(
-                                where = buildWhereJson("episodeDocKey" to episodeDocKey),
-                                limit = 1
-                            )
-                        }?.takeIf { it.isSuccessful }?.body()?.data?.firstOrNull()
-                    }
-                } else null
-                val providersDeferred = async {
-                    executeWithRetry("list_stream_providers") {
-                        api.listStreamProviders(
-                            where = buildWhereJson("scopeKey" to scopeKey),
-                            limit = 100
-                        )
-                    }?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-                }
-                val sourcesDeferred = async {
-                    executeWithRetry("list_stream_sources") {
-                        api.listStreamSources(
-                            where = buildWhereJson("scopeKey" to scopeKey),
-                            limit = 200
-                        )
-                    }?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-                }
-
-                val containerDto = containerDeferred.await()
-                val seasonDto = seasonDeferred?.await()
-                val episodeDto = episodeDeferred?.await()
-                val providerDtos = providersDeferred.await()
-                val sourceDtos = sourcesDeferred.await()
-
-                containerDto?.let { saveDigest("sc:${it.scopeKey}", it.stableDigest()) }
-                seasonDto?.let { saveDigest("ss:${it.seasonDocKey}", it.stableDigest()) }
-                episodeDto?.let { saveDigest("se:${it.episodeDocKey}", it.stableDigest()) }
-                providerDtos.forEach { saveDigest("sp:${it.providerDocKey}", it.stableDigest()) }
-                sourceDtos.forEach { saveDigest("ssrc:${it.sourceDocKey}", it.stableDigest()) }
-
-                val activeProviders = providerDtos
-                    .filter { it.deletedAt == null && it.status != StreamRecordStatus.REMOVED.name }
-                    .map { it.toRoomEntity() }
-                val activeSources = sourceDtos
-                    .filter { it.deletedAt == null && it.status != StreamRecordStatus.REMOVED.name }
-                    .map { it.toRoomEntity() }
-
-                if (containerDto == null && episodeDto == null && activeProviders.isEmpty() && activeSources.isEmpty()) {
-                    return@coroutineScope null
-                }
-
-                D1ScopedStreamingBundle(
-                    container = containerDto?.takeIf { it.deletedAt == null }?.toRoomEntity(),
-                    season = seasonDto?.takeIf { it.deletedAt == null }?.toRoomEntity(),
-                    episode = episodeDto?.takeIf { it.deletedAt == null }?.toRoomEntity(),
-                    providers = activeProviders,
-                    sources = activeSources
-                )
+            val body = resp.body()
+            if (body == null || !body.success) {
+                Log.w(TAG, "D1 getStreamUrl unsuccessful response: ${body?.error ?: "empty body"}")
+                return@coalesceRead null
             }
-        }
-    }
+            val record = body.data ?: return@coalesceRead null
 
-    suspend fun upsertAnimeIfChanged(entry: AnimeEntry): Boolean {
-        val dto = entry.toD1Dto()
-        val key = "anime:${dto.id}"
-        val digest = dto.stableDigest()
-        if (readDigest(key) == digest) {
-            metricsTracker.recordD1WriteSkipped()
-            return true
-        }
-        return withWriteLock(key) {
-            if (readDigest(key) == digest) {
-                metricsTracker.recordD1WriteSkipped()
-                return@withWriteLock true
+            if (record.animeId.trim() != normAnime ||
+                record.episodeId.trim() != normEpisode ||
+                record.sourceId.trim() != normSource
+            ) {
+                removeDigest(lockKey)
+                return@coalesceRead null
             }
-            val response = executeWithRetry("upsert_anime", isWrite = true) { api.upsertAnimeEntry(dto) }
-            val ok = response?.isSuccessful == true && response.body()?.success == true
-            if (ok) saveDigest(key, digest)
-            ok
-        }
-    }
-
-    suspend fun upsertAnimeBatchIfChanged(entries: List<AnimeEntry>): Int {
-        var written = 0
-        for (entry in entries) {
-            if (upsertAnimeIfChanged(entry)) written++
-        }
-        return written
-    }
-
-    suspend fun insertMissingAliases(animeId: String, desiredAliases: List<AnimeAlias>): Int {
-        if (animeId.isBlank() || desiredAliases.isEmpty()) return 0
-        return withWriteLock("aliases:$animeId") {
-            val existingSet = knownAliasesByAnime[animeId] ?: run {
-                val remoteAliases = executeWithRetry("list_existing_aliases") {
-                    api.listAnimeAliases(
-                        where = buildWhereJson("animeId" to animeId),
-                        limit = 200
+            val candidateUrl = record.streamUrl.trim()
+            if (!SafePlaybackHeaders.isValidStreamUrl(candidateUrl)) {
+                removeDigest(lockKey)
+                return@coalesceRead null
+            }
+            val rawExpiry = record.expiresAt?.trim()?.takeIf { it.isNotEmpty() }
+            when (SourceExpiryTime.evaluateExpiry(rawExpiry, nowMs)) {
+                ExpiryState.EXPIRED, ExpiryState.INVALID -> {
+                    removeDigest(lockKey)
+                    null
+                }
+                ExpiryState.MISSING -> {
+                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n"))
+                    CachedStreamUrl(
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource,
+                        streamUrl = candidateUrl,
+                        expiresAt = null
                     )
-                }?.takeIf { it.isSuccessful }?.body()?.data.orEmpty()
-                ConcurrentHashMap.newKeySet<String>().apply {
-                    remoteAliases.forEach { add("${it.animeId}::${it.alias}") }
-                    knownAliasesByAnime[animeId] = this
+                }
+                ExpiryState.VALID -> {
+                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n${rawExpiry.orEmpty()}"))
+                    CachedStreamUrl(
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource,
+                        streamUrl = candidateUrl,
+                        expiresAt = rawExpiry
+                    )
                 }
             }
-            val missing = desiredAliases
-                .filter { it.animeId == animeId && it.alias.isNotBlank() }
-                .distinctBy { it.alias }
-                .filter { "${it.animeId}::${it.alias}" !in existingSet }
-            if (missing.isEmpty()) {
-                metricsTracker.recordD1WriteSkipped()
-                return@withWriteLock 0
-            }
-            var inserted = 0
-            for (alias in missing) {
-                val response = executeWithRetry("insert_alias", isWrite = true) {
-                    api.createAnimeAlias(alias.toD1InsertDto())
-                }
-                if (response?.isSuccessful == true) {
-                    existingSet.add("${alias.animeId}::${alias.alias}")
-                    inserted++
-                }
-            }
-            inserted
         }
     }
 
-    suspend fun upsertCatalogMappingIfChanged(mapping: CatalogMapping): Boolean {
-        val dto = mapping.toD1Dto()
-        val key = "mapping:${dto.aniListId}"
-        val digest = dto.stableDigest()
-        if (readDigest(key) == digest) {
-            metricsTracker.recordD1WriteSkipped()
-            return true
+    /**
+     * Saves a validated resolved Stream URL to D1 keyed by (anime_id, episode_id, source_id).
+     * Stores expires_at ONLY when actual valid expiry is known; never stores invalid or already-expired URLs.
+     */
+    suspend fun saveStreamUrl(
+        animeId: String,
+        episodeId: String,
+        sourceId: String,
+        streamUrl: String,
+        expiresAt: String? = null,
+        nowMs: Long = System.currentTimeMillis()
+    ): Boolean {
+        val normAnime = animeId.trim()
+        val normEpisode = episodeId.trim()
+        val normSource = sourceId.trim()
+        val normUrl = streamUrl.trim()
+        if (normAnime.isEmpty() || normEpisode.isEmpty() || normSource.isEmpty()) return false
+        if (!SafePlaybackHeaders.isValidStreamUrl(normUrl)) return false
+
+        val normalizedExpiry: String? = expiresAt?.trim()?.takeIf { it.isNotEmpty() }?.let { rawExp ->
+            when (SourceExpiryTime.evaluateExpiry(rawExp, nowMs)) {
+                ExpiryState.VALID -> rawExp
+                ExpiryState.EXPIRED -> return false
+                ExpiryState.INVALID, ExpiryState.MISSING -> null
+            }
         }
-        return withWriteLock(key) {
-            if (readDigest(key) == digest) {
+
+        val lockKey = digestKey(normAnime, normEpisode, normSource)
+        return withWriteLock(lockKey) {
+            val digest = sha256Hex("$normAnime\n$normEpisode\n$normSource\n$normUrl\n${normalizedExpiry.orEmpty()}")
+            if (readDigest(lockKey) == digest) {
                 metricsTracker.recordD1WriteSkipped()
                 return@withWriteLock true
             }
-            val response = executeWithRetry("upsert_mapping", isWrite = true) { api.upsertCatalogMapping(dto) }
-            val ok = response?.isSuccessful == true && response.body()?.success == true
-            if (ok) saveDigest(key, digest)
-            ok
-        }
-    }
 
-    suspend fun upsertSeasonsIfChanged(seasons: List<SeasonEntry>): Int {
-        var written = 0
-        for (season in seasons.distinctBy { it.animeId to it.seasonNumber }.distinctBy { it.id }) {
-            val dto = season.toD1Dto()
-            val key = "season:${dto.id}"
-            val digest = dto.stableDigest()
-            if (readDigest(key) == digest) {
-                metricsTracker.recordD1WriteSkipped()
-                continue
-            }
-            val wrote = withWriteLock(key) {
-                if (readDigest(key) == digest) {
-                    metricsTracker.recordD1WriteSkipped()
-                    return@withWriteLock false
-                }
-                val resp = executeWithRetry("upsert_season", isWrite = true) { api.upsertSeasonEntry(dto) }
-                if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                    saveDigest(key, digest)
-                    true
-                } else {
-                    false
-                }
-            }
-            if (wrote) written++
-        }
-        return written
-    }
-
-    suspend fun upsertEpisodesIfChanged(episodes: List<EpisodeEntry>): Int {
-        var written = 0
-        val dedupedEpisodes = episodes
-            .distinctBy { Triple(it.animeId, it.seasonNumber, it.episodeNumber) }
-            .distinctBy { it.id }
-        for (episode in dedupedEpisodes) {
-            val dto = episode.toD1Dto()
-            val key = "episode:${dto.id}"
-            val digest = dto.stableDigest()
-            if (readDigest(key) == digest) {
-                metricsTracker.recordD1WriteSkipped()
-                continue
-            }
-            val wrote = withWriteLock(key) {
-                if (readDigest(key) == digest) {
-                    metricsTracker.recordD1WriteSkipped()
-                    return@withWriteLock false
-                }
-                val resp = executeWithRetry("upsert_episode", isWrite = true) { api.upsertEpisodeEntry(dto) }
-                if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                    saveDigest(key, digest)
-                    true
-                } else {
-                    false
-                }
-            }
-            if (wrote) written++
-        }
-        return written
-    }
-
-    suspend fun publishScopedStreamingIfChanged(
-        container: StreamContainerEntity,
-        season: StreamSeasonEntity?,
-        episode: StreamEpisodeEntity?,
-        providers: List<StreamProviderEntity>,
-        sources: List<StreamSourceEntity>
-    ): Boolean = coroutineScope {
-        val gate = Semaphore(4)
-        val tasks = mutableListOf<kotlinx.coroutines.Deferred<Boolean>>()
-
-        val containerDto = container.toD1Dto()
-        val cKey = "sc:${containerDto.scopeKey}"
-        val cDigest = containerDto.stableDigest()
-        if (readDigest(cKey) == cDigest) {
-            metricsTracker.recordD1WriteSkipped()
-        } else {
-            tasks += async {
-                gate.withPermit {
-                    withWriteLock(cKey) {
-                        if (readDigest(cKey) == cDigest) {
-                            metricsTracker.recordD1WriteSkipped()
-                            return@withWriteLock true
-                        }
-                        val resp = executeWithRetry("upsert_stream_container", isWrite = true) {
-                            api.upsertStreamContainer(containerDto)
-                        }
-                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                            saveDigest(cKey, cDigest)
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
-        }
-
-        if (season != null) {
-            val seasonDto = season.toD1Dto()
-            val sKey = "ss:${seasonDto.seasonDocKey}"
-            val sDigest = seasonDto.stableDigest()
-            if (readDigest(sKey) == sDigest) {
-                metricsTracker.recordD1WriteSkipped()
-            } else {
-                tasks += async {
-                    gate.withPermit {
-                        withWriteLock(sKey) {
-                            if (readDigest(sKey) == sDigest) {
-                                metricsTracker.recordD1WriteSkipped()
-                                return@withWriteLock true
-                            }
-                            val resp = executeWithRetry("upsert_stream_season", isWrite = true) {
-                                api.upsertStreamSeason(seasonDto)
-                            }
-                            if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                                saveDigest(sKey, sDigest)
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (episode != null) {
-            val epDto = episode.toD1Dto()
-            val eKey = "se:${epDto.episodeDocKey}"
-            val eDigest = epDto.stableDigest()
-            if (readDigest(eKey) == eDigest) {
-                metricsTracker.recordD1WriteSkipped()
-            } else {
-                tasks += async {
-                    gate.withPermit {
-                        withWriteLock(eKey) {
-                            if (readDigest(eKey) == eDigest) {
-                                metricsTracker.recordD1WriteSkipped()
-                                return@withWriteLock true
-                            }
-                            val resp = executeWithRetry("upsert_stream_episode", isWrite = true) {
-                                api.upsertStreamEpisode(epDto)
-                            }
-                            if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                                saveDigest(eKey, eDigest)
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (provider in providers.distinctBy { it.providerDocKey }) {
-            val pDto = provider.toD1Dto()
-            val pKey = "sp:${pDto.providerDocKey}"
-            val pDigest = pDto.stableDigest()
-            if (readDigest(pKey) == pDigest) {
-                metricsTracker.recordD1WriteSkipped()
-                continue
-            }
-            tasks += async {
-                gate.withPermit {
-                    withWriteLock(pKey) {
-                        if (readDigest(pKey) == pDigest) {
-                            metricsTracker.recordD1WriteSkipped()
-                            return@withWriteLock true
-                        }
-                        val resp = executeWithRetry("upsert_stream_provider", isWrite = true) {
-                            api.upsertStreamProvider(pDto)
-                        }
-                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                            saveDigest(pKey, pDigest)
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
-        }
-
-        val dedupedSources = sources
-            .map { src ->
-                val trimmed = src.sourceId.trim()
-                if (trimmed == src.sourceId) src else src.copy(sourceId = trimmed)
-            }
-            .distinctBy { it.providerId to it.sourceId }
-            .distinctBy { it.sourceDocKey }
-
-        for (source in dedupedSources) {
-            val sDto = source.toD1MetadataDto()
-            val srcKey = "ssrc:${sDto.sourceDocKey}"
-            val srcDigest = sDto.stableDigest()
-            if (readDigest(srcKey) == srcDigest) {
-                metricsTracker.recordD1WriteSkipped()
-                continue
-            }
-            tasks += async {
-                gate.withPermit {
-                    withWriteLock(srcKey) {
-                        if (readDigest(srcKey) == srcDigest) {
-                            metricsTracker.recordD1WriteSkipped()
-                            return@withWriteLock true
-                        }
-                        val resp = executeWithRetry("upsert_stream_source", isWrite = true) {
-                            api.upsertStreamSource(sDto)
-                        }
-                        if (resp?.isSuccessful == true && resp.body()?.success == true) {
-                            saveDigest(srcKey, srcDigest)
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
-        }
-
-        if (tasks.isEmpty()) true else tasks.awaitAll().all { it }
-    }
-
-    suspend fun reportPlaybackSuccessMetadata(sourceEntity: StreamSourceEntity): Boolean {
-        return withWriteLock("succ:${sourceEntity.sourceDocKey}") {
-            val now = System.currentTimeMillis()
-            val lastAt = maxOf(
-                readSuccessAt(sourceEntity.sourceDocKey),
-                sourceEntity.lastPlaybackSuccessAt ?: 0L
+            val record = D1StreamUrlRecordDto(
+                id = deterministicRecordId(normAnime, normEpisode, normSource),
+                animeId = normAnime,
+                episodeId = normEpisode,
+                sourceId = normSource,
+                streamUrl = normUrl,
+                expiresAt = normalizedExpiry
             )
-            if (lastAt > 0L && (now - lastAt < PLAYBACK_SUCCESS_REPORT_COOLDOWN_MS)) {
-                metricsTracker.recordD1WriteSkipped()
-                return@withWriteLock true
+            val resp = executeWithRetry("upsertStreamUrl", isWrite = true) {
+                api.upsertStreamUrl(record)
             }
-            val dto = sourceEntity.toD1MetadataDto().copy(
-                status = StreamRecordStatus.AVAILABLE.name,
-                lastVerifiedAt = now,
-                lastPlaybackSuccessAt = now,
-                updatedAt = now,
-                version = maxOf(sourceEntity.version, 1L) + 1L
-            )
-            val resp = executeWithRetry("upsert_stream_source_success", isWrite = true) {
-                api.upsertStreamSource(dto)
+            val succeeded = resp != null && resp.isSuccessful && (resp.body()?.success != false)
+            if (succeeded) {
+                saveDigest(lockKey, digest)
+            } else {
+                Log.w(TAG, "D1 saveStreamUrl failed: ${resp?.body()?.error ?: "http=${resp?.code()}"}")
             }
-            val ok = resp?.isSuccessful == true && resp.body()?.success == true
-            if (ok) {
-                saveSuccessAt(sourceEntity.sourceDocKey, now)
-                saveDigest("ssrc:${dto.sourceDocKey}", dto.stableDigest())
-            }
-            ok
+            succeeded
         }
     }
 
-    suspend fun softDeleteSourceMetadata(sourceEntity: StreamSourceEntity): Boolean {
-        val now = System.currentTimeMillis()
-        val dto = sourceEntity.toD1MetadataDto().copy(
-            status = StreamRecordStatus.REMOVED.name,
-            deletedAt = now,
-            updatedAt = now,
-            version = sourceEntity.version + 1L
-        )
-        val key = "ssrc:${dto.sourceDocKey}"
-        val digest = dto.stableDigest()
-        if (readDigest(key) == digest) {
-            metricsTracker.recordD1WriteSkipped()
-            return true
-        }
-        return withWriteLock(key) {
-            if (readDigest(key) == digest) {
-                metricsTracker.recordD1WriteSkipped()
-                return@withWriteLock true
-            }
-            val resp = executeWithRetry("soft_delete_stream_source", isWrite = true) {
-                api.upsertStreamSource(dto)
-            }
-            val ok = resp?.isSuccessful == true && resp.body()?.success == true
-            if (ok) saveDigest(key, digest)
-            ok
-        }
-    }
+    /**
+     * Removes or invalidates a cached Stream URL entry in D1 (e.g., after playback failure on stale cached link).
+     */
+    suspend fun invalidateStreamUrl(
+        animeId: String,
+        episodeId: String,
+        sourceId: String
+    ): Boolean {
+        val normAnime = animeId.trim()
+        val normEpisode = episodeId.trim()
+        val normSource = sourceId.trim()
+        if (normAnime.isEmpty() || normEpisode.isEmpty() || normSource.isEmpty()) return false
 
-    private fun rememberAnimeDigest(dto: D1AnimeEntryDto) {
-        saveDigest("anime:${dto.id}", dto.stableDigest())
+        val lockKey = digestKey(normAnime, normEpisode, normSource)
+        return withWriteLock(lockKey) {
+            removeDigest(lockKey)
+            val id = deterministicRecordId(normAnime, normEpisode, normSource)
+            val resp = executeWithRetry("deleteStreamUrl", isWrite = true) {
+                api.deleteStreamUrl(id)
+            }
+            resp != null && (resp.isSuccessful || resp.code() == 404)
+        }
     }
 
     fun clearDigestCache() {
         writtenDigests.clear()
-        knownAliasesByAnime.clear()
-        lastSuccessReportAt.clear()
         digestStore.clear()
     }
 
-    companion object {
-        private const val TAG = "CloudflareD1DataSource"
-        private const val MAX_RETRIES = 2
-        private const val BASE_RETRY_DELAY_MS = 250L
-        private const val PLAYBACK_SUCCESS_REPORT_COOLDOWN_MS = 5 * 60 * 1000L
+    private fun digestKey(animeId: String, episodeId: String, sourceId: String): String =
+        "su:$animeId|$episodeId|$sourceId"
 
-        fun buildWhereJson(vararg pairs: Pair<String, Any?>): String {
-            val obj = JSONObject()
-            for ((k, v) in pairs) {
-                obj.put(k, v ?: JSONObject.NULL)
-            }
-            return obj.toString()
+    companion object {
+        private const val TAG = "CloudflareD1"
+        private const val MAX_RETRIES = 2
+        private const val BASE_RETRY_DELAY_MS = 180L
+
+        fun deterministicRecordId(animeId: String, episodeId: String, sourceId: String): String {
+            val raw = "${animeId.trim()}\n${episodeId.trim()}\n${sourceId.trim()}"
+            return "su_" + sha256Hex(raw).take(32)
         }
 
-        fun buildWhereInJson(column: String, values: List<Any>): String {
-            val arr = JSONArray()
-            values.take(100).forEach { arr.put(it) }
-            return JSONObject().apply { put(column, arr) }.toString()
+        private fun sha256Hex(value: String): String {
+            val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
         }
     }
 }

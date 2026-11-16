@@ -69,15 +69,6 @@ interface StreamCacheDao {
     @Query("SELECT * FROM stream_sources WHERE scopeKey = :scopeKey AND providerId = :providerId AND TRIM(sourceId) = :sourceId AND status != 'REMOVED' AND deletedAt IS NULL ORDER BY updatedAt DESC LIMIT 1")
     suspend fun getLatestActiveSourceForProviderInScope(scopeKey: String, providerId: String, sourceId: String): StreamSourceEntity?
 
-    @Query("UPDATE stream_sources SET streamUrl = NULL, safeHeadersJson = NULL, status = 'MISSING_URL', updatedAt = :updatedAt WHERE scopeKey = :scopeKey AND TRIM(sourceId) = :sourceId AND status != 'REMOVED'")
-    suspend fun invalidateCachedStreamUrl(scopeKey: String, sourceId: String, updatedAt: Long)
-
-    @Query("UPDATE stream_sources SET streamUrl = NULL, safeHeadersJson = NULL, status = 'MISSING_URL', updatedAt = :updatedAt WHERE scopeKey = :scopeKey AND providerId = :providerId AND TRIM(sourceId) = :sourceId AND status != 'REMOVED'")
-    suspend fun invalidateCachedStreamUrlForProvider(scopeKey: String, providerId: String, sourceId: String, updatedAt: Long)
-
-    @Query("UPDATE stream_sources SET streamUrl = NULL, safeHeadersJson = NULL, status = 'EXPIRED', updatedAt = :updatedAt WHERE sourceDocKey = :sourceDocKey AND status != 'REMOVED'")
-    suspend fun evictExpiredStreamUrl(sourceDocKey: String, updatedAt: Long)
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSource(source: StreamSourceEntity)
 
@@ -162,7 +153,7 @@ interface StreamCacheDao {
         val mergedSources = dedupedIncomingSources.mapNotNull { incoming ->
             val aliasMatches = existingByProviderAndTrimmedId[incoming.providerId to incoming.sourceId].orEmpty()
             val prev = existingSources[incoming.sourceDocKey]
-                ?: aliasMatches.firstOrNull { !it.streamUrl.isNullOrBlank() && it.status != "REMOVED" }
+                ?: aliasMatches.firstOrNull { it.status != "REMOVED" }
                 ?: aliasMatches.firstOrNull()
             aliasMatches.forEach { alias ->
                 if (alias.sourceDocKey != incoming.sourceDocKey) {
@@ -175,37 +166,7 @@ interface StreamCacheDao {
             }
             if (incoming.status == "REMOVED" || incoming.deletedAt != null) {
                 incoming.copy(status = "REMOVED", deletedAt = incoming.deletedAt ?: now)
-            } else if (incoming.streamUrl.isNullOrBlank() && prev?.streamUrl?.isNotBlank() == true && prev.status != "REMOVED") {
-                val effectiveExpiresAt = incoming.expiresAt ?: prev.expiresAt
-                val validUrl = prev.streamUrl.takeIf { com.example.data.streaming.SafePlaybackHeaders.isValidStreamUrl(it) }
-                val isExpired = prev.status == "EXPIRED" ||
-                    com.example.data.repository.SourceExpiryTime.isExpiredOrInvalid(effectiveExpiresAt)
-                if (validUrl != null && !isExpired) {
-                    // Preserve a still-valid unexpired cached URL when incoming metadata lacks a URL
-                    incoming.copy(
-                        streamUrl = validUrl,
-                        urlType = prev.urlType,
-                        contentType = incoming.contentType ?: prev.contentType,
-                        safeHeadersJson = prev.safeHeadersJson,
-                        expiresAt = effectiveExpiresAt,
-                        status = "AVAILABLE",
-                        lastVerifiedAt = incoming.lastVerifiedAt ?: prev.lastVerifiedAt,
-                        lastPlaybackSuccessAt = incoming.lastPlaybackSuccessAt ?: prev.lastPlaybackSuccessAt
-                    )
-                } else {
-                    // Evict expired or invalid cached URL cleanly rather than retaining stale AVAILABLE state
-                    incoming.copy(
-                        streamUrl = null,
-                        urlType = prev.urlType,
-                        contentType = incoming.contentType ?: prev.contentType,
-                        safeHeadersJson = null,
-                        expiresAt = effectiveExpiresAt,
-                        status = if (validUrl != null) "EXPIRED" else "MISSING_URL",
-                        lastVerifiedAt = incoming.lastVerifiedAt ?: prev.lastVerifiedAt,
-                        lastPlaybackSuccessAt = incoming.lastPlaybackSuccessAt ?: prev.lastPlaybackSuccessAt
-                    )
-                }
-            } else if (prev != null && incoming.streamUrl.isNullOrBlank() && prev.status != "REMOVED") {
+            } else if (prev != null && prev.status != "REMOVED") {
                 incoming.copy(
                     backendEpisodeId = incoming.backendEpisodeId ?: prev.backendEpisodeId,
                     urlType = incoming.urlType.ifBlank { prev.urlType },
@@ -258,7 +219,6 @@ interface StreamCacheDao {
                     prev.sourceId != candidate.sourceId ||
                     prev.sourceName != candidate.sourceName ||
                     prev.backendEpisodeId != candidate.backendEpisodeId ||
-                    prev.streamUrl != candidate.streamUrl ||
                     prev.urlType != candidate.urlType ||
                     prev.contentType != candidate.contentType ||
                     prev.quality != candidate.quality ||
@@ -266,7 +226,6 @@ interface StreamCacheDao {
                     prev.audioLanguage != candidate.audioLanguage ||
                     prev.downloadable != candidate.downloadable ||
                     prev.sizeBytes != candidate.sizeBytes ||
-                    prev.safeHeadersJson != candidate.safeHeadersJson ||
                     prev.expiresAt != candidate.expiresAt ||
                     prev.status != candidate.status ||
                     prev.deletedAt != candidate.deletedAt ||

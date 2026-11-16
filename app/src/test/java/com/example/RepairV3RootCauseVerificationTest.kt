@@ -269,23 +269,71 @@ class RepairV3RootCauseVerificationTest {
                 AppDatabase.MIGRATION_8_9,
                 AppDatabase.MIGRATION_9_10,
                 AppDatabase.MIGRATION_10_11,
-                AppDatabase.MIGRATION_11_12
+                AppDatabase.MIGRATION_11_12,
+                AppDatabase.MIGRATION_12_13
             )
             .build()
         try {
             val anime = migrated.animeDao().getAnimeById("anilist_1")
-            assertNotNull("Migrated anime must survive v$startVersion -> v11", anime)
+            assertNotNull("Migrated anime must survive v$startVersion -> v13", anime)
             assertEquals("Cowboy Bebop", anime!!.preferredTitle)
 
             val watchlist = migrated.watchlistDao().getWatchlistEntry("anilist_1")
-            assertNotNull("Migrated watchlist must survive v$startVersion -> v11", watchlist)
+            assertNotNull("Migrated watchlist must survive v$startVersion -> v13", watchlist)
             assertTrue(watchlist!!.isFavorite)
 
             val history = migrated.playbackHistoryDao().getHistoryForEpisode("anilist_1", "ep1")
-            assertNotNull("Migrated history must survive v$startVersion -> v11", history)
+            assertNotNull("Migrated history must survive v$startVersion -> v13", history)
             assertEquals(50000L, history!!.positionMs)
         } finally {
             migrated.close()
+            dbFile.delete()
+        }
+    }
+
+    @Test
+    fun roomV12ToV13_dropsStreamUrlAndSafeHeaders_whilePreservingSourceMetadata() = runTest {
+        val dbName = "migration_12_13_stream_sources_test.db"
+        val dbFile = context.getDatabasePath(dbName)
+        dbFile.delete()
+        File("${dbFile.path}-wal").delete()
+        File("${dbFile.path}-shm").delete()
+
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(12) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_sources` (`sourceDocKey` TEXT NOT NULL, `scopeKey` TEXT NOT NULL, `providerId` TEXT NOT NULL, `sourceId` TEXT NOT NULL, `sourceName` TEXT NOT NULL, `backendEpisodeId` TEXT, `streamUrl` TEXT, `urlType` TEXT NOT NULL, `contentType` TEXT, `quality` TEXT, `codec` TEXT, `audioLanguage` TEXT, `downloadable` INTEGER, `sizeBytes` INTEGER, `safeHeadersJson` TEXT, `expiresAt` TEXT, `status` TEXT NOT NULL, `version` INTEGER NOT NULL, `lastVerifiedAt` INTEGER, `lastPlaybackSuccessAt` INTEGER, `updatedAt` INTEGER NOT NULL, `deletedAt` INTEGER, PRIMARY KEY(`sourceDocKey`))")
+                        db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_scopeKey` ON `stream_sources` (`scopeKey`)")
+                        db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_providerId` ON `stream_sources` (`providerId`)")
+                        db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_sourceId` ON `stream_sources` (`sourceId`)")
+                        db.execSQL("CREATE INDEX IF NOT EXISTS `index_stream_sources_status` ON `stream_sources` (`status`)")
+                        db.execSQL(
+                            "INSERT INTO stream_sources VALUES ('anime:1:s1:e1|p|pahe|s|s1', 'anime:1:s1:e1', 'pahe', 's1', 'Pahe 1080p', 'be_ep_1', 'https://legacy.cdn/ep1.m3u8', 'hls', 'application/x-mpegURL', '1080p', 'EAC3', 'ja', 1, 1024, '[[\"Referer\",\"https://legacy.host/\"]]', '2099-01-01T00:00:00Z', 'AVAILABLE', 2, 1000, 1500, 2000, NULL)"
+                        )
+                    }
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+                })
+                .build()
+        )
+        val sqlDb = helper.writableDatabase
+        try {
+            AppDatabase.MIGRATION_12_13.migrate(sqlDb)
+            sqlDb.query("SELECT sourceName, quality, codec FROM stream_sources WHERE scopeKey = 'anime:1:s1:e1'").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("Pahe 1080p", cursor.getString(0))
+                assertEquals("1080p", cursor.getString(1))
+                assertEquals("EAC3", cursor.getString(2))
+            }
+            sqlDb.query("PRAGMA table_info(`stream_sources`)").use { cursor ->
+                val cols = mutableSetOf<String>()
+                while (cursor.moveToNext()) cols += cursor.getString(1)
+                assertFalse("streamUrl column must be dropped in v13", cols.contains("streamUrl"))
+                assertFalse("safeHeadersJson column must be dropped in v13", cols.contains("safeHeadersJson"))
+            }
+        } finally {
+            sqlDb.close()
             dbFile.delete()
         }
     }
@@ -544,8 +592,7 @@ class RepairV3RootCauseVerificationTest {
                 scopeKey = "anime:999:s1:e1",
                 providerId = "prov1",
                 sourceId = "src1",
-                sourceName = "Provider 1",
-                streamUrl = "https://cdn.example/video.mp4"
+                sourceName = "Provider 1"
             )
             val publishedWhileUnauth = streamingRepo.publishResolvedStreamUrl(
                 sourceEntity = src,

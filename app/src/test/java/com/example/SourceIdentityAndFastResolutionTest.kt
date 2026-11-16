@@ -72,6 +72,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
@@ -500,8 +501,7 @@ class SourceIdentityAndFastResolutionTest {
             providerId = "pahe",
             sourceId = sharedSourceId,
             sourceName = "Pahe",
-            streamUrl = "https://cdn.example/wrong_ep2.mp4",
-            status = StreamRecordStatus.AVAILABLE.name,
+            status = StreamRecordStatus.MISSING_URL.name,
             expiresAt = "2099-01-01T00:00:00Z"
         )
 
@@ -725,15 +725,36 @@ class SourceIdentityAndFastResolutionTest {
         assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (mismatchRes as SourceValidationResult.Invalid).code)
     }
 
-    // Scenario 8: Cache-first hit from Memory and Room -> zero redundant backend calls
+    // Scenario 8: Cache-first hit from Memory and D1 (stream_urls) -> zero redundant backend calls
     @Test
-    fun scenario8_cacheFirstHitsMemoryThenRoom_withZeroExtraHttpCalls() = runTest {
+    fun scenario8_cacheFirstHitsMemoryThenD1_withZeroExtraHttpCalls() = runTest {
         val animeId = "anilist_800"
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 800, backendAnimeId = "be_800", preferredTitle = "Cache Show", format = "TV", isPlayable = true)
         )
         val ep1 = EpisodeEntry("ep_800_1", animeId, 1, 1)
         db.episodeDao().upsertEpisodes(listOf(ep1))
+
+        val d1Store = ConcurrentHashMap<String, String>()
+        val d1 = startMockD1Server { exchange ->
+            val path = exchange.requestURI.path
+            val method = exchange.requestMethod
+            when {
+                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                    val raw = d1Store[id]
+                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
+                    else sendJson(exchange, 200, """{"success":true,"data":$raw}""")
+                }
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    if (recId.isNotEmpty()) d1Store[recId] = body
+                    sendJson(exchange, 200, """{"success":true}""")
+                }
+                else -> sendJson(exchange, 404, """{"success":false}""")
+            }
+        }
 
         val directCalls = AtomicInteger(0)
         val api = object : ProphecyVerseApiService {
@@ -764,10 +785,17 @@ class SourceIdentityAndFastResolutionTest {
             }
         }
 
-        val repo = createRepo(api)
+        val repo = createRepo(api, d1 = d1)
         val first = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
         assertEquals("BACKEND_RESOLVE", first.cacheTier)
         assertEquals(1, directCalls.get())
+
+        // Wait briefly for non-blocking D1 save to complete
+        val saveDeadline = System.currentTimeMillis() + 2000L
+        while (d1Store.isEmpty() && System.currentTimeMillis() < saveDeadline) {
+            Thread.sleep(20L)
+        }
+        assertTrue("D1 stream_urls must cache newly resolved URL", d1Store.isNotEmpty())
 
         // 2nd direct playback resolves strictly from Memory LRU
         val hitsBefore = metricsTracker.snapshot().memoryCacheHits
@@ -776,23 +804,49 @@ class SourceIdentityAndFastResolutionTest {
         assertTrue(metricsTracker.snapshot().memoryCacheHits > hitsBefore)
         assertEquals(1, directCalls.get())
 
-        // Invalidate Memory -> 3rd resolvePlayableStream hits Room persistent cache cleanly
+        // Invalidate Memory -> 3rd resolvePlayableStream hits D1 stream_urls cleanly with ZERO Backend calls!
         memoryCache.invalidatePlayback("src_800_1", "anime:800:s1:e1")
-        val roomHit = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
-        assertEquals("ROOM", roomHit.cacheTier)
-        assertEquals("https://cdn.example/cache_800.mp4", roomHit.directData.playbackUrl)
+        val d1Hit = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
+        assertEquals("D1", d1Hit.cacheTier)
+        assertEquals("https://cdn.example/cache_800.mp4", d1Hit.directData.playbackUrl)
         assertEquals(1, directCalls.get())
     }
 
-    // Scenario 9: Cached URL failure invalidates broken URL and resolves fresh URL cleanly
+    // Scenario 9: Cached URL failure invalidates broken URL across Memory & D1 and resolves fresh URL cleanly
     @Test
-    fun scenario9_cachedUrlPlaybackFailure_invalidatesBadUrlAndUpdatesCacheWithFreshUrl() = runTest {
+    fun scenario9_cachedUrlPlaybackFailure_invalidatesBadUrlAndUpdatesD1WithFreshUrl() = runTest {
         val animeId = "anilist_900"
         val scope = "anime:900:s1:e1"
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 900, backendAnimeId = "be_900", preferredTitle = "Refresh Show", format = "TV", isPlayable = true)
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_900_1", animeId, 1, 1)))
+
+        val d1Store = ConcurrentHashMap<String, String>()
+        val d1 = startMockD1Server { exchange ->
+            val path = exchange.requestURI.path
+            val method = exchange.requestMethod
+            when {
+                method == "GET" && path.startsWith("/v1/tables/stream_urls/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                    val raw = d1Store[id]
+                    if (raw == null) sendJson(exchange, 404, """{"success":false,"error":"Not found"}""")
+                    else sendJson(exchange, 200, """{"success":true,"data":$raw}""")
+                }
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                    val body = exchange.requestBody.bufferedReader().readText()
+                    val recId = Regex(""""id"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1) ?: ""
+                    if (recId.isNotEmpty()) d1Store[recId] = body
+                    sendJson(exchange, 200, """{"success":true}""")
+                }
+                method == "DELETE" && path.startsWith("/v1/tables/stream_urls/") -> {
+                    val id = path.removePrefix("/v1/tables/stream_urls/")
+                    d1Store.remove(id)
+                    sendJson(exchange, 200, """{"success":true}""")
+                }
+                else -> sendJson(exchange, 404, """{"success":false}""")
+            }
+        }
 
         val resolveVersion = AtomicInteger(0)
         val api = object : ProphecyVerseApiService {
@@ -816,26 +870,29 @@ class SourceIdentityAndFastResolutionTest {
             }
         }
 
-        val repo = createRepo(api)
+        val repo = createRepo(api, d1 = d1)
         val initial = repo.resolvePlayableStream(animeId, 1, 1, "ep_900_1", preferredSourceId = "src_900_1").getOrThrow()
         assertEquals("https://cdn.example/broken_v1.mp4", initial.directData.playbackUrl)
 
-        // Simulate ExoPlayer playback failure -> invalidate cached URL
-        repo.invalidateFailedCachedPlayback(animeId, 1, 1, "src_900_1")
-        val clearedEntity = db.streamCacheDao().getLatestActiveSourceInScope(scope, "src_900_1")!!
-        assertNull(clearedEntity.streamUrl)
-        assertEquals("MISSING_URL", clearedEntity.status)
-        assertNull(memoryCache.getResolvedPlayback("src_900_1", scope))
+        val save1Deadline = System.currentTimeMillis() + 2000L
+        while (d1Store.isEmpty() && System.currentTimeMillis() < save1Deadline) Thread.sleep(20L)
 
-        // Next resolution fetches fresh URL cleanly and updates cache
+        // Simulate ExoPlayer playback failure -> invalidate cached URL in Memory + D1
+        repo.invalidateFailedCachedPlayback(animeId, 1, 1, "src_900_1")
+        assertNull(memoryCache.getResolvedPlayback("src_900_1", scope))
+        assertTrue("Failed cached URL must be deleted from D1", d1Store.isEmpty())
+
+        // Next resolution fetches fresh URL cleanly and updates D1 cache
         val refreshed = repo.resolvePlayableStream(animeId, 1, 1, "ep_900_1", preferredSourceId = "src_900_1").getOrThrow()
         assertEquals("BACKEND_RESOLVE", refreshed.cacheTier)
         assertEquals("https://cdn.example/fresh_v2.mp4", refreshed.directData.playbackUrl)
         assertEquals(2, resolveVersion.get())
-        assertEquals(
-            "https://cdn.example/fresh_v2.mp4",
-            db.streamCacheDao().getLatestActiveSourceInScope(scope, "src_900_1")?.streamUrl
-        )
+
+        val save2Deadline = System.currentTimeMillis() + 2000L
+        while (d1Store.values.none { it.contains("fresh_v2.mp4") } && System.currentTimeMillis() < save2Deadline) {
+            Thread.sleep(20L)
+        }
+        assertTrue(d1Store.values.any { it.contains("fresh_v2.mp4") })
     }
 
     // Scenario 10: Concurrent bounded resolution beats slow/failing providers and cancels slower siblings
@@ -991,44 +1048,26 @@ class SourceIdentityAndFastResolutionTest {
         assertEquals(1, directCalls.get())
     }
 
-    // Scenario 12: D1 metadata hit (streamUrl == null) triggers POST /api/v1/play/direct; D1 publish is non-blocking
+    // Scenario 12: Expired D1 stream_urls entry is treated as cache miss, sends (anime_id, episode_id, source_id) to Backend, and non-blocking D1 save does not delay return
     @Test
-    fun scenario12_d1MetadataHitTriggersDirectPlay_andBackgroundD1WriteDoesNotBlockResolution() = runTest {
-        val now = System.currentTimeMillis()
+    fun scenario12_expiredD1StreamUrlTreatsAsMiss_sendsCorrectDirectPlayRequest_andNonBlockingD1Save() = runTest {
         val d1UpsertCalls = AtomicInteger(0)
-        val d1SourceReads = AtomicInteger(0)
+        val d1Reads = AtomicInteger(0)
+        val recId = CloudflareD1DataSource.deterministicRecordId("be_1200", "be_ep_1200", "src_d1_only")
 
         val d1 = startMockD1Server { exchange ->
             val path = exchange.requestURI.path
             val method = exchange.requestMethod
             when {
-                method == "GET" && path == "/v1/tables/stream_sources" -> {
-                    d1SourceReads.incrementAndGet()
-                    // Even if D1 had a stale URL string, toRoomEntity MUST strip it and force direct-play
+                method == "GET" && path == "/v1/tables/stream_urls/$recId" -> {
+                    d1Reads.incrementAndGet()
+                    // Return an expired stream_url -> client MUST reject it and resolve via Backend!
                     sendJson(
                         exchange, 200,
-                        """{"success":true,"data":[{"sourceDocKey":"anime:1200:s1:e1|p|pahe|s|src_d1_only","scopeKey":"anime:1200:s1:e1","providerId":"pahe","sourceId":"src_d1_only","sourceName":"Pahe 1080p","backendEpisodeId":"be_ep_1200","streamUrl":"https://untrusted.d1.url/stale.mp4","urlType":"direct","quality":"1080p","status":"AVAILABLE","version":1,"updatedAt":$now}]}"""
+                        """{"success":true,"data":{"id":"$recId","anime_id":"be_1200","episode_id":"be_ep_1200","source_id":"src_d1_only","stream_url":"https://untrusted.d1.url/expired.mp4","expires_at":"2020-01-01T00:00:00Z"}}"""
                     )
                 }
-                method == "GET" && path == "/v1/tables/stream_providers" -> {
-                    sendJson(
-                        exchange, 200,
-                        """{"success":true,"data":[{"providerDocKey":"anime:1200:s1:e1|p|pahe","scopeKey":"anime:1200:s1:e1","providerId":"pahe","providerName":"Pahe 1080p","status":"AVAILABLE","sourceCount":1,"version":1,"updatedAt":$now}]}"""
-                    )
-                }
-                method == "GET" && path.startsWith("/v1/tables/stream_containers/") -> {
-                    sendJson(
-                        exchange, 200,
-                        """{"success":true,"data":{"scopeKey":"anime:1200","contentKey":"1200","anilistId":1200,"contentType":"ANIME","backendId":"be_1200","discoveryStatus":"COMPLETED","version":1,"updatedAt":$now}}"""
-                    )
-                }
-                method == "GET" && path == "/v1/tables/stream_seasons" -> {
-                    sendJson(exchange, 200, """{"success":true,"data":[{"seasonDocKey":"1200:s1","contentKey":"1200","seasonId":"season_1","seasonNumber":1,"episodeCount":1,"discoveryStatus":"COMPLETED","version":1,"updatedAt":$now}]}""")
-                }
-                method == "GET" && path == "/v1/tables/stream_episodes" -> {
-                    sendJson(exchange, 200, """{"success":true,"data":[{"episodeDocKey":"1200:s1:e1","contentKey":"1200","seasonId":"season_1","episodeId":"ep_1200_1","seasonNumber":1,"episodeNumber":1,"backendEpisodeId":"be_ep_1200","providerCount":1,"sourceCount":1,"discoveryStatus":"COMPLETED","version":1,"updatedAt":$now}]}""")
-                }
-                method == "POST" -> {
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
                     // Simulate slow 350ms D1 write to verify resolution returns immediately without blocking!
                     Thread.sleep(350L)
                     d1UpsertCalls.incrementAndGet()
@@ -1042,23 +1081,29 @@ class SourceIdentityAndFastResolutionTest {
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 1200, backendAnimeId = "be_1200", preferredTitle = "D1 Show", format = "TV", isPlayable = true)
         )
-        db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_1200_1", animeId, 1, 1)))
+        db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_1200_1", animeId, 1, 1, sourceEpisodeIds = "10:be_ep_1200")))
 
         val directCalls = AtomicInteger(0)
         val fullCalls = AtomicInteger(0)
+        var capturedRequest: DirectPlayRequest? = null
         val api = object : ProphecyVerseApiService {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
                 Response.success(ProphecyAnimeDetailsResponse(id = "be_1200", title = "D1 Show"))
             override suspend fun getAnimeEpisodes(animeId: String) =
-                Response.success(emptyList<ProphecyEpisodeDto>())
+                Response.success(listOf(ProphecyEpisodeDto(id = "be_ep_1200", season = 1, number = 1)))
             override suspend fun getEpisodeFull(animeId: String, episodeId: String): Response<ProphecyEpisodeFullResponse> {
                 fullCalls.incrementAndGet()
-                return Response.success(ProphecyEpisodeFullResponse())
+                return Response.success(
+                    ProphecyEpisodeFullResponse(
+                        sources = listOf(ProphecySourceDto(id = "src_d1_only", label = "Pahe 1080p", quality = "1080p"))
+                    )
+                )
             }
             override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> {
                 directCalls.incrementAndGet()
+                capturedRequest = request
                 return Response.success(
                     DirectPlayResponse(
                         success = true,
@@ -1074,7 +1119,7 @@ class SourceIdentityAndFastResolutionTest {
         val repo = createRepo(api, d1 = d1)
         val discovery = repo.discoverStreamsForScope(animeId, 1, 1, "ep_1200_1").getOrThrow()
         assertEquals(listOf("src_d1_only"), discovery.sources.map { it.id })
-        assertEquals(0, fullCalls.get())
+        assertEquals(1, fullCalls.get())
         assertEquals(0, directCalls.get())
 
         val resolveStartedMs = System.nanoTime() / 1_000_000
@@ -1082,9 +1127,12 @@ class SourceIdentityAndFastResolutionTest {
         val resolveElapsedMs = (System.nanoTime() / 1_000_000) - resolveStartedMs
 
         assertEquals(1, directCalls.get())
+        assertEquals("be_1200", capturedRequest?.animeId)
+        assertEquals("be_ep_1200", capturedRequest?.episodeId)
+        assertEquals("src_d1_only", capturedRequest?.sourceId)
         assertEquals("https://verified.direct.example/1200.mp4", resolved.directData.playbackUrl)
         assertTrue("Resolution should not wait for 350ms background D1 upsert (took ${resolveElapsedMs}ms)", resolveElapsedMs < 280L)
-        assertTrue(d1SourceReads.get() >= 1)
+        assertTrue("D1 must be checked before Backend resolution", d1Reads.get() == 1)
     }
 
     // Scenario 13 (+ PlayerViewModel generation guard): Resolution failure cleanly exits resolving state
@@ -1151,7 +1199,12 @@ class SourceIdentityAndFastResolutionTest {
         val deadline = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline) {
             shadowOf(android.os.Looper.getMainLooper()).idle()
-            if (!vm.isResolving.value && vm.resolutionError.value != null) break
+            if (!vm.isResolving.value &&
+                vm.resolutionError.value != null &&
+                !EpisodeResolutionCoordinator.isForegroundResolutionActive()
+            ) {
+                break
+            }
             Thread.sleep(25L)
         }
 

@@ -293,4 +293,100 @@ class Eac3PlaybackAudioTest {
         assertTrue(aacTrack.isSelected)
         assertFalse(eac3Track.isSelected)
     }
+
+    @Test
+    fun playerManager_ffmpegPreferredMimeTypes_andSelectiveSelector_coverAc3DtsTrueHdAndPreserveNative() {
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_E_AC3))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_E_AC3_JOC))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_AC3))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_DTS))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_DTS_HD))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_DTS_X))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_TRUEHD))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_ALAC))
+        assertTrue(PlayerManager.isFfmpegPreferredAudioMimeType("audio/mp2"))
+
+        // Standard native hardware/platform codecs remain untouched
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_AAC))
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_MPEG))
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_OPUS))
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_VORBIS))
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_FLAC))
+        assertFalse(PlayerManager.isFfmpegPreferredAudioMimeType(MimeTypes.AUDIO_RAW))
+
+        val dummyDecoder = MediaCodecInfo.newInstance(
+            "c2.android.aac.decoder",
+            "audio/mp4a-latm",
+            "audio/mp4a-latm",
+            null,
+            false,
+            false,
+            false,
+            false,
+            false
+        )
+        val selector = PlayerManager.createSelectiveMediaCodecSelector(
+            delegate = MediaCodecSelector { _, _, _ -> listOf(dummyDecoder) },
+            preferFfmpegForExtendedCodecs = true
+        )
+        assertTrue(selector.getDecoderInfos(MimeTypes.AUDIO_E_AC3, false, false).isEmpty())
+        assertTrue(selector.getDecoderInfos(MimeTypes.AUDIO_AC3, false, false).isEmpty())
+        assertTrue(selector.getDecoderInfos(MimeTypes.AUDIO_DTS, false, false).isEmpty())
+        assertTrue(selector.getDecoderInfos(MimeTypes.AUDIO_TRUEHD, false, false).isEmpty())
+        assertEquals(1, selector.getDecoderInfos(MimeTypes.AUDIO_AAC, false, false).size)
+    }
+
+    @Test
+    fun playerManager_extractTracksFromMedia3_detectsLanguagesDecodersAndUnsupportedAudio() {
+        val jaEac3 = Format.Builder()
+            .setId("a1")
+            .setSampleMimeType(MimeTypes.AUDIO_E_AC3)
+            .setLanguage("jpn")
+            .setChannelCount(6)
+            .build()
+        val enAac = Format.Builder()
+            .setId("a2")
+            .setSampleMimeType(MimeTypes.AUDIO_AAC)
+            .setLanguage("en")
+            .setChannelCount(2)
+            .build()
+        val unsupportedUnknown = Format.Builder()
+            .setId("a3")
+            .setSampleMimeType("audio/x-proprietary-exotic")
+            .setLanguage("fr")
+            .build()
+
+        val tracks = Tracks(
+            listOf(
+                Tracks.Group(TrackGroup(jaEac3), false, intArrayOf(C.FORMAT_HANDLED), booleanArrayOf(true)),
+                Tracks.Group(TrackGroup(enAac), false, intArrayOf(C.FORMAT_HANDLED), booleanArrayOf(false)),
+                Tracks.Group(TrackGroup(unsupportedUnknown), false, intArrayOf(C.FORMAT_UNSUPPORTED_SUBTYPE), booleanArrayOf(false))
+            )
+        )
+
+        val extracted = PlayerManager.extractTracksFromMedia3(tracks)
+        assertEquals(4, extracted.audioTracks.size) // Default + 3 tracks
+        val jaTrack = extracted.audioTracks.first { it.sampleMimeType == MimeTypes.AUDIO_E_AC3 }
+        val enTrack = extracted.audioTracks.first { it.sampleMimeType == MimeTypes.AUDIO_AAC }
+        val unsupportedTrack = extracted.audioTracks.first { it.sampleMimeType == "audio/x-proprietary-exotic" }
+
+        assertTrue(jaTrack.label.contains("Japanese"))
+        assertTrue(jaTrack.label.contains("FFmpeg"))
+        assertTrue(jaTrack.isSelected)
+        assertTrue(jaTrack.isSupported)
+        assertTrue(enTrack.label.contains("English"))
+        assertEquals("MediaCodec", enTrack.decoderType)
+        assertFalse(unsupportedTrack.isSupported)
+        assertTrue(unsupportedTrack.label.contains("Unsupported"))
+        assertEquals("FFmpeg Audio Renderer (Software)", extracted.selectedAudioDecoderLabel)
+        assertFalse(extracted.hasUnsupportedAudioOnly)
+
+        // When ALL audio tracks in the stream are unsupported, flag must trigger a clear UI error
+        val allUnsupported = PlayerManager.extractTracksFromMedia3(
+            Tracks(listOf(Tracks.Group(TrackGroup(unsupportedUnknown), false, intArrayOf(C.FORMAT_UNSUPPORTED_SUBTYPE), booleanArrayOf(false))))
+        )
+        assertTrue(allUnsupported.hasUnsupportedAudioOnly)
+        assertEquals("Japanese", PlayerManager.getDisplayLanguage("jpn"))
+        assertEquals("Audio", PlayerManager.getDisplayLanguage("und"))
+    }
 }

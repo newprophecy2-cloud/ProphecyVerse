@@ -457,7 +457,7 @@ class DetailViewModel(
         _selectedSeason.value = seasonNumber
         _episodeWindowStart.value = 0
         viewModelScope.launch {
-            repository.loadEpisodePageFromD1(animeId, seasonNumber, offset = 0, limit = 30)
+            repository.loadEpisodePage(animeId, seasonNumber, offset = 0, limit = 30)
         }
     }
 
@@ -467,7 +467,7 @@ class DetailViewModel(
             _episodeWindowStart.value = nextOffset
             val season = _selectedSeason.value
             viewModelScope.launch {
-                repository.loadEpisodePageFromD1(animeId, season, offset = nextOffset, limit = 30)
+                repository.loadEpisodePage(animeId, season, offset = nextOffset, limit = 30)
             }
         }
     }
@@ -852,17 +852,29 @@ class PlayerViewModel(
         _activeSource,
         playerManager.availableAudioTracks
     ) { sources, active, embeddedTracks ->
+        val inStreamTracks = embeddedTracks.filterNot { it.id == "auto_audio" }
+        val autoOption = embeddedTracks.firstOrNull { it.id == "auto_audio" }
+        val inStreamLanguages = inStreamTracks.map {
+            it.label.substringBefore(" (").substringBefore(" [").trim().lowercase()
+        }.toSet()
         val sourceTracks = sources.mapNotNull { source ->
             val language = source.language?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            if (inStreamTracks.isNotEmpty() && language.lowercase() in inStreamLanguages && source.id == active?.id) {
+                return@mapNotNull null
+            }
             PlayerManager.TrackOption(
                 id = "source_audio:${source.id}",
                 label = "$language • ${source.label ?: source.id}",
-                isSelected = source.id == active?.id,
+                isSelected = source.id == active?.id && inStreamTracks.none { it.isSelected },
                 isSupported = true
             )
-        }.distinctBy { it.label.substringBefore(" • ").trim().lowercase() }
-        val inStreamTracks = embeddedTracks.filterNot { it.id == "auto_audio" }
-        (sourceTracks + inStreamTracks).distinctBy { it.label.substringBefore(" • ").trim().lowercase() }
+        }.distinctBy { it.id }
+        val combined = buildList {
+            if (autoOption != null && inStreamTracks.isNotEmpty()) add(autoOption)
+            addAll(inStreamTracks)
+            addAll(sourceTracks)
+        }
+        combined.distinctBy { it.id }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
@@ -1470,7 +1482,18 @@ class PlayerViewModel(
                                         requestGeneration = requestGeneration
                                     )
                                 } else {
-                                    _resolutionError.value = "All available sources failed to start playback. Select Retry to try source discovery again."
+                                    val diagCategory = playerManager.playbackDiagnostics.value.failureCategory
+                                    val existingPlayerError = playerManager.errorMessage.value
+                                    val unsupportedError = when (diagCategory) {
+                                        PlayerManager.PlaybackFailureCategory.AUDIO_DECODER,
+                                        PlayerManager.PlaybackFailureCategory.DECODER,
+                                        PlayerManager.PlaybackFailureCategory.CONTAINER,
+                                        PlayerManager.PlaybackFailureCategory.CONTENT_TYPE -> existingPlayerError
+                                            ?: "The media format or codec is not supported on this device."
+                                        else -> null
+                                    }
+                                    _resolutionError.value = unsupportedError
+                                        ?: "All available sources failed to start playback. Select Retry to try source discovery again."
                                     _isResolving.value = false
                                     _resolutionStage.value = ResolutionStage.IDLE
                                     playerManager.clearErrorState()

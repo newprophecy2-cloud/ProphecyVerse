@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import android.util.Base64
 import android.util.Log
+import com.example.data.d1.D1StreamUrlRecordDto
 import com.example.data.local.AnimeEntry
 import com.example.data.local.StreamSourceEntity
 import com.example.data.remote.DirectPlayData
@@ -244,7 +245,8 @@ object SourceIdentityValidator {
     }
 
     /**
-     * Validates a cached Room [StreamSourceEntity] before using its stream URL in [expectedScopeKey].
+     * Validates a cached Room [StreamSourceEntity] metadata record in [expectedScopeKey].
+     * Room stores source metadata only; stream URLs reside in Cloudflare D1.
      */
     fun validateCachedSourceEntity(
         entity: StreamSourceEntity,
@@ -332,10 +334,56 @@ object SourceIdentityValidator {
                 "Cached source '$normEntitySourceId' is expired."
             )
         }
-        if (!SafePlaybackHeaders.isValidStreamUrl(entity.streamUrl)) {
+        return SourceValidationResult.Valid
+    }
+
+    /**
+     * Validates a Cloudflare D1 Stream URL record keyed by (anime_id, episode_id, source_id).
+     */
+    fun validateD1StreamUrlRecord(
+        record: D1StreamUrlRecordDto,
+        expectedAnimeId: String,
+        expectedEpisodeId: String,
+        expectedSourceId: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): SourceValidationResult {
+        val normExpectedAnime = normalizeId(expectedAnimeId)
+        val normExpectedEp = normalizeId(expectedEpisodeId)
+        val normExpectedSrc = normalizeId(expectedSourceId)
+        if (normExpectedAnime.isEmpty() || normExpectedEp.isEmpty() || normExpectedSrc.isEmpty()) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
-                "Cached source '$normEntitySourceId' lacks a valid stream URL."
+                "Expected D1 stream URL identity key is incomplete."
+            )
+        }
+        if (normalizeId(record.animeId) != normExpectedAnime) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.ANIME_ID_MISMATCH,
+                "D1 anime_id '${record.animeId}' did not match '$normExpectedAnime'."
+            )
+        }
+        if (normalizeId(record.episodeId) != normExpectedEp) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.EPISODE_ID_MISMATCH,
+                "D1 episode_id '${record.episodeId}' did not match '$normExpectedEp'."
+            )
+        }
+        if (normalizeId(record.sourceId) != normExpectedSrc) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
+                "D1 source_id '${record.sourceId}' did not match '$normExpectedSrc'."
+            )
+        }
+        if (!SafePlaybackHeaders.isValidStreamUrl(record.streamUrl)) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
+                "D1 cached stream_url failed scheme/validity verification."
+            )
+        }
+        if (SourceExpiryTime.isExpiredOrInvalid(record.expiresAt, nowMs)) {
+            return SourceValidationResult.Invalid(
+                SourceDiagnosticCode.SOURCE_EXPIRED,
+                "D1 cached stream_url for '$normExpectedSrc' is expired or has invalid expiry."
             )
         }
         return SourceValidationResult.Valid

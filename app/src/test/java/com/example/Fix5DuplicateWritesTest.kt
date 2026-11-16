@@ -162,144 +162,96 @@ class Fix5DuplicateWritesTest {
 
     @Test
     fun fix5_d1DigestPersistsAcrossRestart_andSkipsUnchangedWrites() = runBlocking {
-        val animeWrites = AtomicInteger(0)
-        val mappingWrites = AtomicInteger(0)
-        val seasonWrites = AtomicInteger(0)
-        val episodeWrites = AtomicInteger(0)
+        val streamUrlWrites = AtomicInteger(0)
 
         val api = startMockD1Server { exchange ->
             val method = exchange.requestMethod
             val path = exchange.requestURI.path
             when {
-                method == "POST" && path == "/v1/tables/anime_entries/upsert" -> {
-                    animeWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/catalog_mappings/upsert" -> {
-                    mappingWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/season_entries/upsert" -> {
-                    seasonWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/episode_entries/upsert" -> {
-                    episodeWrites.incrementAndGet()
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
+                    streamUrlWrites.incrementAndGet()
                     sendJson(exchange, 200, """{"success":true}""")
                 }
                 else -> sendJson(exchange, 200, """{"success":true,"data":[]}""")
             }
         }
 
-        val entry = AnimeEntry(
-            id = "anilist_501",
-            aniListId = 501,
-            backendAnimeId = "b_501",
-            titleRomaji = "Fix5 Test Show",
-            preferredTitle = "Fix5 Test Show",
-            genres = "Action",
-            isPopular = true
-        )
-        val mapping = CatalogMapping(
-            aniListId = 501,
-            backendAnimeId = "b_501",
-            confidence = 0.99f
-        )
-        val season = SeasonEntry(
-            id = "anilist_501_s1",
-            animeId = "anilist_501",
-            seasonNumber = 1,
-            title = "Season 1"
-        )
-        val episode = EpisodeEntry(
-            id = "anilist_501_s1_e1",
-            animeId = "anilist_501",
-            seasonNumber = 1,
-            episodeNumber = 1,
-            title = "Episode 1",
-            sourceEpisodeIds = "b_ep_1"
-        )
-
         val store1 = SharedPreferencesD1DigestStore(context)
         val ds1 = CloudflareD1DataSource(api, metricsTracker, store1)
-        assertTrue(ds1.upsertAnimeIfChanged(entry))
-        assertTrue(ds1.upsertCatalogMappingIfChanged(mapping))
-        assertEquals(1, ds1.upsertSeasonsIfChanged(listOf(season)))
-        assertEquals(1, ds1.upsertEpisodesIfChanged(listOf(episode)))
-
-        assertEquals(1, animeWrites.get())
-        assertEquals(1, mappingWrites.get())
-        assertEquals(1, seasonWrites.get())
-        assertEquals(1, episodeWrites.get())
+        assertTrue(
+            ds1.saveStreamUrl(
+                animeId = "be_501",
+                episodeId = "ep_501_1",
+                sourceId = "src_501",
+                streamUrl = "https://cdn.example.com/501/ep1.m3u8",
+                expiresAt = "2099-01-01T00:00:00Z"
+            )
+        )
+        assertEquals(1, streamUrlWrites.get())
 
         // Simulate fresh app restart: brand new CloudflareD1DataSource backed by SharedPreferencesD1DigestStore
         val store2 = SharedPreferencesD1DigestStore(context)
         val ds2 = CloudflareD1DataSource(api, metricsTracker, store2)
-        assertTrue(ds2.upsertAnimeIfChanged(entry))
-        assertTrue(ds2.upsertCatalogMappingIfChanged(mapping))
-        assertEquals(0, ds2.upsertSeasonsIfChanged(listOf(season)))
-        assertEquals(0, ds2.upsertEpisodesIfChanged(listOf(episode)))
+        assertTrue(
+            ds2.saveStreamUrl(
+                animeId = "be_501",
+                episodeId = "ep_501_1",
+                sourceId = "src_501",
+                streamUrl = "https://cdn.example.com/501/ep1.m3u8",
+                expiresAt = "2099-01-01T00:00:00Z"
+            )
+        )
+        assertEquals("Restart with persisted digest must not re-write unchanged stream URL", 1, streamUrlWrites.get())
+        assertTrue(metricsTracker.snapshot().d1WriteSkipsUnchanged >= 1)
 
-        assertEquals("Restart with persisted digest must not re-write anime", 1, animeWrites.get())
-        assertEquals("Restart with persisted digest must not re-write mapping", 1, mappingWrites.get())
-        assertEquals("Restart with persisted digest must not re-write season", 1, seasonWrites.get())
-        assertEquals("Restart with persisted digest must not re-write episode", 1, episodeWrites.get())
-        assertTrue(metricsTracker.snapshot().d1WriteSkipsUnchanged >= 4)
-
-        // Mutating a real field still triggers an updated D1 write
-        assertTrue(ds2.upsertAnimeIfChanged(entry.copy(preferredTitle = "Updated Title")))
-        assertEquals(2, animeWrites.get())
+        // Mutating stream_url still triggers an updated D1 write
+        assertTrue(
+            ds2.saveStreamUrl(
+                animeId = "be_501",
+                episodeId = "ep_501_1",
+                sourceId = "src_501",
+                streamUrl = "https://cdn.example.com/501/ep1_v2.m3u8",
+                expiresAt = "2099-01-01T00:00:00Z"
+            )
+        )
+        assertEquals(2, streamUrlWrites.get())
 
         // Clearing digest cache resets persisted digests cleanly
         ds2.clearDigestCache()
-        assertTrue(ds2.upsertCatalogMappingIfChanged(mapping))
-        assertEquals(2, mappingWrites.get())
+        assertTrue(
+            ds2.saveStreamUrl(
+                animeId = "be_501",
+                episodeId = "ep_501_1",
+                sourceId = "src_501",
+                streamUrl = "https://cdn.example.com/501/ep1_v2.m3u8",
+                expiresAt = "2099-01-01T00:00:00Z"
+            )
+        )
+        assertEquals(3, streamUrlWrites.get())
     }
 
     @Test
-    fun fix5_concurrentIdenticalD1WritesCoalesceUnderPerKeyLock() = runBlocking {
-        val animeWrites = AtomicInteger(0)
-        val aliasWrites = AtomicInteger(0)
-        val containerWrites = AtomicInteger(0)
-        val providerWrites = AtomicInteger(0)
-        val sourceWrites = AtomicInteger(0)
-        val playbackSuccessWrites = AtomicInteger(0)
+    fun fix5_concurrentIdenticalD1ReadsAndWritesCoalesceUnderPerKeyLock() = runBlocking {
+        val streamUrlReads = AtomicInteger(0)
+        val streamUrlWrites = AtomicInteger(0)
+        val recId = CloudflareD1DataSource.deterministicRecordId("be_502", "ep_502_1", "s1")
 
         val api = startMockD1Server { exchange ->
             val method = exchange.requestMethod
             val path = exchange.requestURI.path
             when {
-                method == "POST" && path == "/v1/tables/anime_entries/upsert" -> {
+                method == "GET" && path == "/v1/tables/stream_urls/$recId" -> {
+                    Thread.sleep(20)
+                    streamUrlReads.incrementAndGet()
+                    sendJson(
+                        exchange,
+                        200,
+                        """{"success":true,"data":{"id":"$recId","anime_id":"be_502","episode_id":"ep_502_1","source_id":"s1","stream_url":"https://cdn.example.com/a.m3u8","expires_at":"2099-01-01T00:00:00Z"}}"""
+                    )
+                }
+                method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
                     Thread.sleep(15)
-                    animeWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/anime_aliases" -> {
-                    Thread.sleep(15)
-                    aliasWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "GET" && path == "/v1/tables/anime_aliases" -> {
-                    sendJson(exchange, 200, """{"success":true,"data":[]}""")
-                }
-                method == "POST" && path == "/v1/tables/stream_containers/upsert" -> {
-                    Thread.sleep(10)
-                    containerWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/stream_providers/upsert" -> {
-                    Thread.sleep(10)
-                    providerWrites.incrementAndGet()
-                    sendJson(exchange, 200, """{"success":true}""")
-                }
-                method == "POST" && path == "/v1/tables/stream_sources/upsert" -> {
-                    Thread.sleep(10)
-                    val body = exchange.requestBody.bufferedReader().readText()
-                    if (body.contains("lastPlaybackSuccessAt")) {
-                        playbackSuccessWrites.incrementAndGet()
-                    } else {
-                        sourceWrites.incrementAndGet()
-                    }
+                    streamUrlWrites.incrementAndGet()
                     sendJson(exchange, 200, """{"success":true}""")
                 }
                 else -> sendJson(exchange, 200, """{"success":true}""")
@@ -307,35 +259,25 @@ class Fix5DuplicateWritesTest {
         }
 
         val ds = CloudflareD1DataSource(api, metricsTracker, SharedPreferencesD1DigestStore(context))
-        val entry = AnimeEntry(id = "anilist_502", aniListId = 502, titleRomaji = "Concurrent Show", preferredTitle = "Concurrent Show")
-        val aliases = listOf(AnimeAlias(animeId = "anilist_502", alias = "concurrent show", originalAlias = "Concurrent Show"))
-        val scopeKey = "anime:502:s1:e1"
-        val container = StreamContainerEntity("anime:502", "502", 502, "ANIME", "b_502", "Concurrent Show", 1, 12, 1, 1, DiscoveryStatus.COMPLETED.name, 1L, 1000L)
-        val season = StreamSeasonEntity("502:s1", "502", "season_1", 1, null, 12, DiscoveryStatus.COMPLETED.name, 1L, 1000L)
-        val episode = StreamEpisodeEntity("502:s1:e1", "502", "season_1", "ep_1", "c_ep_1", 1, 1, "b_ep_1", null, 1, 1, DiscoveryStatus.COMPLETED.name, 1L, 1000L)
-        val provider = StreamProviderEntity("$scopeKey|p|pahe", scopeKey, "pahe", "AnimePahe", "AVAILABLE", 1, 1L, 1000L)
-        val source = StreamSourceEntity("$scopeKey|p|pahe|s|s1", scopeKey, "pahe", "s1", "Pahe 1080p", status = StreamRecordStatus.AVAILABLE.name, streamUrl = "https://cdn.example.com/a.m3u8", expiresAt = "2099-01-01T00:00:00Z", updatedAt = 1000L)
 
-        // Fire 6 parallel writes for the same anime, aliases, streaming bundle, and playback success
-        val animeResults = (1..6).map { async { ds.upsertAnimeIfChanged(entry) } }.awaitAll()
-        val aliasCounts = (1..6).map { async { ds.insertMissingAliases("anilist_502", aliases) } }.awaitAll()
-        val streamResults = (1..6).map {
-            async { ds.publishScopedStreamingIfChanged(container, season, episode, listOf(provider), listOf(source)) }
-        }.awaitAll()
-        val successResults = (1..6).map {
-            async { ds.reportPlaybackSuccessMetadata(source) }
-        }.awaitAll()
+        // Fire 6 parallel reads & 6 parallel identical writes for the same (anime_id, episode_id, source_id)
+        val readResults = (1..6).map { async { ds.getValidStreamUrl("be_502", "ep_502_1", "s1") } }.awaitAll()
+        assertTrue(readResults.all { it?.streamUrl == "https://cdn.example.com/a.m3u8" })
+        assertEquals("Concurrent D1 GETs must single-flight coalesce to 1 request", 1, streamUrlReads.get())
 
-        assertTrue(animeResults.all { it })
-        assertTrue(streamResults.all { it })
-        assertTrue(successResults.all { it })
-        assertEquals("Concurrent anime writes must coalesce to 1 D1 HTTP PUT", 1, animeWrites.get())
-        assertEquals("Concurrent alias inserts must coalesce to 1 POST", 1, aliasWrites.get())
-        assertEquals("Only first caller should report inserted=1", 1, aliasCounts.sum())
-        assertEquals("Concurrent streaming container writes must coalesce to 1", 1, containerWrites.get())
-        assertEquals("Concurrent streaming provider writes must coalesce to 1", 1, providerWrites.get())
-        assertEquals("Concurrent streaming source writes must coalesce to 1", 1, sourceWrites.get())
-        assertEquals("Concurrent playback success reports must coalesce to 1 within cooldown", 1, playbackSuccessWrites.get())
+        val writeResults = (1..6).map {
+            async {
+                ds.saveStreamUrl(
+                    animeId = "be_502",
+                    episodeId = "ep_502_1",
+                    sourceId = "s1",
+                    streamUrl = "https://cdn.example.com/b.m3u8",
+                    expiresAt = "2099-01-01T00:00:00Z"
+                )
+            }
+        }.awaitAll()
+        assertTrue(writeResults.all { it })
+        assertEquals("Concurrent identical D1 stream_url writes must coalesce to 1 POST", 1, streamUrlWrites.get())
     }
 
     @Test

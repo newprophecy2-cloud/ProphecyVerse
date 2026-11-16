@@ -111,7 +111,6 @@ data class StreamSourceEntity(
     val sourceId: String,
     val sourceName: String,
     val backendEpisodeId: String? = null,   // Internal backend compatibility (e.g. Movie S1E1 id)
-    val streamUrl: String? = null,
     val urlType: String = "direct",
     val contentType: String? = null,
     val quality: String? = null,
@@ -119,7 +118,6 @@ data class StreamSourceEntity(
     val audioLanguage: String? = null,
     val downloadable: Boolean? = null,
     val sizeBytes: Long? = null,
-    val safeHeadersJson: String? = null,
     val expiresAt: String? = null,
     val status: String = "AVAILABLE",       // AVAILABLE, MISSING_URL, EXPIRED, FAILED, TEMPORARILY_UNAVAILABLE, REMOVED
     val version: Long = 1L,

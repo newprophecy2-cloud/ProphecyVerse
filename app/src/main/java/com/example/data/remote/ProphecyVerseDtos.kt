@@ -126,6 +126,8 @@ data class ProphecySourceDto(
 
 @JsonClass(generateAdapter = true)
 data class DirectPlayRequest(
+    @Json(name = "anime_id") val animeId: String = "",
+    @Json(name = "episode_id") val episodeId: String = "",
     @Json(name = "source_id") val sourceId: String
 )
 

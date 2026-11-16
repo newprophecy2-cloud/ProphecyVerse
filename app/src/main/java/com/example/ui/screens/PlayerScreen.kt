@@ -2227,10 +2227,10 @@ private fun TechInfoDialog(
                 val aCodec = audioFormat?.sampleMimeType ?: audioFormat?.codecs ?: "EAC3 / AAC"
                 TechInfoRow("Audio Codec", aCodec)
 
-                val isEac3 = aCodec.contains("eac3", ignoreCase = true) || aCodec.contains("eac3-joc", ignoreCase = true)
+                val isFfmpegCodec = com.example.player.PlayerManager.isFfmpegPreferredAudioMimeType(aCodec)
                 val decText = when {
                     activeAudioDecoder != null -> activeAudioDecoder
-                    isEac3 -> "FFmpeg Audio Renderer (Software)"
+                    isFfmpegCodec -> "FFmpeg Audio Renderer (Software)"
                     else -> "MediaCodec Hardware Audio Renderer"
                 }
                 TechInfoRow("Audio Decoder", decText)

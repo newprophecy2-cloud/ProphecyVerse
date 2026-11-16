@@ -133,8 +133,7 @@ class Fix3IdentityValidationTest {
             sourceId = sharedSourceId,
             sourceName = "Pahe",
             backendEpisodeId = "be_ep_1",
-            streamUrl = "https://pahe.example/video.mp4",
-            status = StreamRecordStatus.AVAILABLE.name,
+            status = StreamRecordStatus.MISSING_URL.name,
             expiresAt = "2099-01-01T00:00:00Z"
         )
         val entityB = StreamSourceEntity(
@@ -144,8 +143,7 @@ class Fix3IdentityValidationTest {
             sourceId = sharedSourceId,
             sourceName = "MegaCloud",
             backendEpisodeId = "be_ep_1",
-            streamUrl = "https://megacloud.example/video.mp4",
-            status = StreamRecordStatus.AVAILABLE.name,
+            status = StreamRecordStatus.MISSING_URL.name,
             expiresAt = "2099-01-01T00:00:00Z"
         )
         db.streamCacheDao().upsertProviders(
@@ -196,7 +194,6 @@ class Fix3IdentityValidationTest {
             sourceId = "src_1",
             sourceName = "Pahe",
             backendEpisodeId = "be_s1_e2",
-            streamUrl = "https://cdn.example/valid.mp4",
             status = StreamRecordStatus.AVAILABLE.name,
             expiresAt = "2099-01-01T00:00:00Z"
         )
@@ -214,6 +211,20 @@ class Fix3IdentityValidationTest {
         val wrongProviderResult = SourceIdentityValidator.validateCachedSourceEntity(base, scopeTarget, "src_1", expectedProviderId = provMega)
         assertTrue(wrongProviderResult is SourceValidationResult.Invalid)
         assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (wrongProviderResult as SourceValidationResult.Invalid).code)
+
+        // Validate D1 stream_urls identity checks (anime_id, episode_id, source_id, URL, expiry)
+        val validD1 = com.example.data.d1.D1StreamUrlRecordDto(
+            id = "r1",
+            animeId = "be_3002",
+            episodeId = "be_s1_e2",
+            sourceId = "src_1",
+            streamUrl = "https://cdn.example/s1e2.m3u8",
+            expiresAt = "2099-01-01T00:00:00Z"
+        )
+        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_1").isValid)
+        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_9999", "be_s1_e2", "src_1") is SourceValidationResult.Invalid)
+        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e1", "src_1") is SourceValidationResult.Invalid)
+        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_other") is SourceValidationResult.Invalid)
     }
 
     @Test
@@ -227,8 +238,7 @@ class Fix3IdentityValidationTest {
             sourceId = "src_3",
             sourceName = "Pahe",
             backendEpisodeId = "be_ep_3",
-            streamUrl = "https://cdn.example/ep3.mp4",
-            status = StreamRecordStatus.AVAILABLE.name,
+            status = StreamRecordStatus.MISSING_URL.name,
             expiresAt = "2099-01-01T00:00:00Z"
         )
         assertTrue(
@@ -289,7 +299,7 @@ class Fix3IdentityValidationTest {
             AnimeEntry(id = animeId, aniListId = 3004, backendAnimeId = "be_3004", preferredTitle = "No Cross-Merge", format = "TV", isPlayable = true)
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_3004_1", animeId, 1, 1, "Ep 1")))
-        // Seed OldProvider with shared sourceId and cached URL
+        // Seed OldProvider with shared sourceId in Room + Memory
         db.streamCacheDao().upsertProviders(listOf(StreamProviderEntity("$scope|p|$oldProv", scope, oldProv, "OldProvider", sourceCount = 1)))
         db.streamCacheDao().upsertSources(
             listOf(
@@ -300,12 +310,12 @@ class Fix3IdentityValidationTest {
                     sourceId = sharedSourceId,
                     sourceName = "OldProvider",
                     backendEpisodeId = "old_be_ep",
-                    streamUrl = "https://old-provider.example/old.mp4",
-                    status = StreamRecordStatus.AVAILABLE.name,
+                    status = StreamRecordStatus.MISSING_URL.name,
                     expiresAt = "2099-01-01T00:00:00Z"
                 )
             )
         )
+        memoryCache.putResolvedPlayback(sharedSourceId, DirectPlayData(sourceId = sharedSourceId, playbackUrl = "https://old-provider.example/old.mp4"), scope, oldProv)
 
         val directCalls = AtomicInteger(0)
         val api = object : ProphecyVerseApiService {
@@ -337,7 +347,7 @@ class Fix3IdentityValidationTest {
 
         val newEntity = db.streamCacheDao().getLatestActiveSourceForProviderInScope(scope, newProv, sharedSourceId)
         assertNotNull(newEntity)
-        assertNull("Discovery must NOT inherit streamUrl from a different provider sharing sourceId", newEntity!!.streamUrl)
+        assertEquals("NewProvider", newEntity!!.sourceName)
         assertEquals(StreamRecordStatus.MISSING_URL.name, newEntity.status)
 
         // Playing via NewProvider must resolve fresh URL, never OldProvider's cached URL
@@ -367,8 +377,7 @@ class Fix3IdentityValidationTest {
                     sourceId = sharedSourceId,
                     sourceName = "ProviderA",
                     backendEpisodeId = "be_ep_3005",
-                    streamUrl = "https://provA.example/video.mp4",
-                    status = StreamRecordStatus.AVAILABLE.name,
+                    status = StreamRecordStatus.MISSING_URL.name,
                     expiresAt = "2099-01-01T00:00:00Z"
                 ),
                 StreamSourceEntity(
@@ -378,8 +387,7 @@ class Fix3IdentityValidationTest {
                     sourceId = sharedSourceId,
                     sourceName = "ProviderB",
                     backendEpisodeId = "be_ep_3005",
-                    streamUrl = "https://provB.example/video.mp4",
-                    status = StreamRecordStatus.AVAILABLE.name,
+                    status = StreamRecordStatus.MISSING_URL.name,
                     expiresAt = "2099-01-01T00:00:00Z"
                 )
             )
@@ -390,16 +398,8 @@ class Fix3IdentityValidationTest {
         val repo = createRepo(noOpApi())
         repo.invalidateFailedCachedPlayback(animeId, 1, 1, sharedSourceId, providerId = provA)
 
-        // ProviderA invalidated in Memory + Room
+        // ProviderA invalidated in Memory without disturbing ProviderB in Memory!
         assertNull(memoryCache.getResolvedPlayback(sharedSourceId, scope, provA))
-        val clearedA = db.streamCacheDao().getLatestActiveSourceForProviderInScope(scope, provA, sharedSourceId)!!
-        assertNull(clearedA.streamUrl)
-        assertEquals(StreamRecordStatus.MISSING_URL.name, clearedA.status)
-
-        // ProviderB completely untouched in Memory + Room!
         assertEquals("https://provB.example/video.mp4", memoryCache.getResolvedPlayback(sharedSourceId, scope, provB)?.playbackUrl)
-        val intactB = db.streamCacheDao().getLatestActiveSourceForProviderInScope(scope, provB, sharedSourceId)!!
-        assertEquals("https://provB.example/video.mp4", intactB.streamUrl)
-        assertEquals(StreamRecordStatus.AVAILABLE.name, intactB.status)
     }
 }

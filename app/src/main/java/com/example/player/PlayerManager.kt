@@ -30,6 +30,7 @@ import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
+import androidx.media3.decoder.ffmpeg.FfmpegLibrary
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
@@ -120,6 +121,7 @@ class PlayerManager(
     val isPlaybackEnded: StateFlow<Boolean> = _isPlaybackEnded.asStateFlow()
 
     private var retryCount = 0
+    private var hasUnsupportedTrackError = false
     private var onRetryRequested: (() -> Unit)? = null
     private var onPlaybackFailedCallback: (() -> Unit)? = null
     private var lastWorkingTrackSelectionParams: androidx.media3.common.TrackSelectionParameters? = null
@@ -178,11 +180,13 @@ class PlayerManager(
         resolveDurationMs: Long = 0L
     ): ExoPlayer {
         release()
+        val cleanPlaybackUrl = directData.playbackUrl.trim()
         val generation = playbackGeneration
         activeSession = sessionIdentity?.copy(generation = generation)
         onRetryRequested = onRetryNeeded
         onPlaybackFailedCallback = onPlaybackFailed
         retryCount = 0
+        hasUnsupportedTrackError = false
         _errorMessage.value = null
         _activeAudioDecoder.value = null
         _isPlaybackEnded.value = false
@@ -287,12 +291,19 @@ class PlayerManager(
                 eventListener: AudioRendererEventListener,
                 out: ArrayList<Renderer>
             ) {
-                // 1. MediaCodecAudioRenderer for all formats supported by platform MediaCodec.
-                // Standard mediaCodecSelector queries all available platform codecs (AAC, MP3, Opus, FLAC, Vorbis, and EAC3 if supported by the device).
+                val ffmpegAvailable = isFfmpegLibraryAvailable()
+                val selectiveSelector = createSelectiveMediaCodecSelector(
+                    delegate = mediaCodecSelector,
+                    preferFfmpegForExtendedCodecs = ffmpegAvailable
+                )
+
+                // 1. Native platform MediaCodecAudioRenderer preserved for AAC, HE-AAC, MP3, Opus,
+                // FLAC, Vorbis, PCM, etc., while yielding FFmpeg-handled codecs (EAC3, AC3, DTS,
+                // TrueHD, WMA, ALAC) when FFmpeg native library is loaded.
                 out.add(
                     MediaCodecAudioRenderer(
                         context,
-                        mediaCodecSelector,
+                        selectiveSelector,
                         enableDecoderFallback,
                         eventHandler,
                         eventListener,
@@ -300,18 +311,22 @@ class PlayerManager(
                     )
                 )
 
-                // 2. FFmpeg Audio Decoder fallback (for EAC3, AC3, Opus, FLAC, Vorbis, etc.):
-                try {
-                    out.add(
-                        FfmpegAudioRenderer(
-                            eventHandler,
-                            eventListener,
-                            audioSink
+                // 2. FFmpeg Audio Decoder extension for EAC3/EAC3-JOC, AC3, DTS, TrueHD, etc.
+                if (ffmpegAvailable) {
+                    try {
+                        out.add(
+                            FfmpegAudioRenderer(
+                                eventHandler,
+                                eventListener,
+                                audioSink
+                            )
                         )
-                    )
-                    Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
-                } catch (t: Throwable) {
-                    Log.w(TAG, "FFmpeg audio decoder registration failed: ${t.message}")
+                        Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "FFmpeg audio decoder registration failed: ${t.message}")
+                    }
+                } else {
+                    Log.w(TAG, "FFmpeg native library unavailable; falling back to platform audio decoders.")
                 }
             }
         }.apply {
@@ -341,10 +356,15 @@ class PlayerManager(
         // Cloudflare R2 / S3 URLs and CDN token URLs often end with a hash or query string
         // without a clear file extension, or return application/octet-stream.
         // We explicitly detect HLS, DASH, MKV, MP4 from url_type, content_type, and URL patterns.
-        val inferredMimeType = detectMimeType(directData)
+        val normalizedDirectData = if (cleanPlaybackUrl == directData.playbackUrl) {
+            directData
+        } else {
+            directData.copy(playbackUrl = cleanPlaybackUrl)
+        }
+        val inferredMimeType = detectMimeType(normalizedDirectData)
 
         val mediaItemBuilder = MediaItem.Builder()
-            .setUri(directData.playbackUrl)
+            .setUri(cleanPlaybackUrl)
 
         if (inferredMimeType != null) {
             mediaItemBuilder.setMimeType(inferredMimeType)
@@ -397,7 +417,9 @@ class PlayerManager(
                     }
                     Player.STATE_READY -> {
                         _isBuffering.value = false
-                        _errorMessage.value = null
+                        if (!hasUnsupportedTrackError) {
+                            _errorMessage.value = null
+                        }
                         val dur = player.duration
                         if (dur > 0 && dur != C.TIME_UNSET) {
                             _duration.value = dur
@@ -475,14 +497,16 @@ class PlayerManager(
                 // If track switching failed due to unsupported decoder on selected track, recover smoothly
                 if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
                     error.errorCode == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED ||
-                    error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED) {
+                    error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+                ) {
                     val prev = lastWorkingTrackSelectionParams
                     if (prev != null) {
                         Log.w(TAG, "Selected track decoder initialization failed. Reverting to previous working track.")
                         lastWorkingTrackSelectionParams = null
                         val currentPos = player.currentPosition
                         player.trackSelectionParameters = prev
-                        _errorMessage.value = "Selected audio track cannot be decoded on this device. Reverted to previous working track."
+                        _errorMessage.value = "Selected audio track format or codec is not supported on this device. Reverted to previous track."
                         if (currentPos > 0) {
                             player.seekTo(currentPos)
                         }
@@ -494,7 +518,16 @@ class PlayerManager(
 
                 val isResolvableHttp = error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
                         error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
                         error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
+
+                val formatOrCodecMsg = when (failureCategory) {
+                    PlaybackFailureCategory.CONTENT_TYPE -> "Unsupported stream content type."
+                    PlaybackFailureCategory.CONTAINER -> "Media container format is not supported on this device."
+                    PlaybackFailureCategory.AUDIO_DECODER -> "Audio format or codec is not supported on this device."
+                    PlaybackFailureCategory.DECODER -> "Video or audio codec is not supported on this device."
+                    else -> null
+                }
 
                 if (isResolvableHttp && retryCount < 1) {
                     retryCount++
@@ -502,20 +535,21 @@ class PlayerManager(
                     _errorMessage.value = "Playback link expired or connection dropped. Refreshing..."
                     onRetryRequested?.invoke()
                 } else if (onPlaybackFailedCallback != null) {
-                    // Automatically fallback to alternative candidate source if available
-                    _errorMessage.value = "Source failed to play. Trying alternative source..."
+                    if (formatOrCodecMsg != null) {
+                        hasUnsupportedTrackError = true
+                        _errorMessage.value = formatOrCodecMsg
+                    } else {
+                        _errorMessage.value = "Source failed to play. Trying alternative source..."
+                    }
                     onPlaybackFailedCallback?.invoke()
                 } else {
-                    val msg = when (failureCategory) {
+                    val msg = formatOrCodecMsg ?: when (failureCategory) {
                         PlaybackFailureCategory.HTTP -> "The stream request was rejected by the server (HTTP error)."
                         PlaybackFailureCategory.NETWORK_TIMEOUT -> "The stream request timed out. Check the connection and retry."
                         PlaybackFailureCategory.NETWORK -> "The stream could not be reached. Check the connection and retry."
-                        PlaybackFailureCategory.CONTENT_TYPE -> "The server returned a content type Media3 could not use."
-                        PlaybackFailureCategory.CONTAINER -> "The media container is not supported by this device."
-                        PlaybackFailureCategory.AUDIO_DECODER -> "The audio codec could not be decoded on this device."
-                        PlaybackFailureCategory.DECODER -> "The media codec could not be decoded on this device."
                         PlaybackFailureCategory.MANIFEST -> "The HLS/DASH manifest could not be parsed."
                         PlaybackFailureCategory.OTHER -> "Playback failed. Please select another source."
+                        else -> "Playback failed. Please select another source."
                     }
                     _errorMessage.value = msg
                 }
@@ -539,122 +573,24 @@ class PlayerManager(
     }
 
     private fun extractTracks(tracks: Tracks, providerDiagnostic: String) {
-        val audioList = mutableListOf<TrackOption>()
-        val subList = mutableListOf<TrackOption>()
-        val qualityList = mutableListOf<TrackOption>()
+        val extracted = extractTracksFromMedia3(tracks, providerDiagnostic)
 
-        var anyAudioSelected = false
-        var anySubSelected = false
-        var anyVideoSelected = false
-
-        for ((groupIndex, groupInfo) in tracks.groups.withIndex()) {
-                val trackGroup = groupInfo.mediaTrackGroup
-                val type = trackGroup.type
-
-            for (i in 0 until trackGroup.length) {
-                val format = trackGroup.getFormat(i)
-                val isSelected = groupInfo.isTrackSelected(i)
-                val isSupported = groupInfo.isTrackSupported(i)
-                if (type == C.TRACK_TYPE_AUDIO || type == C.TRACK_TYPE_VIDEO) {
-                    Log.i(
-                        TAG,
-                        "media3_track provider=${providerDiagnostic} type=${if (type == C.TRACK_TYPE_VIDEO) "video" else "audio"} " +
-                            "sample_mime=${format.sampleMimeType ?: "unknown"} codec=${format.codecs ?: "unknown"}"
-                    )
-                }
-
-                when (type) {
-                    C.TRACK_TYPE_AUDIO -> {
-                        val lang = getDisplayLanguage(format.language)
-                        val mime = format.sampleMimeType ?: ""
-                        val isEac3 = isEac3MimeType(mime)
-                        val isAc3 = mime.contains("ac3", ignoreCase = true)
-                        val codec = when {
-                            isEac3 -> "EAC3"
-                            isAc3 -> "AC3"
-                            mime.contains("mp4a", ignoreCase = true) || mime.contains("aac", ignoreCase = true) -> "AAC"
-                            mime.contains("opus", ignoreCase = true) -> "OPUS"
-                            mime.contains("flac", ignoreCase = true) -> "FLAC"
-                            mime.contains("vorbis", ignoreCase = true) -> "VORBIS"
-                            else -> mime.substringAfterLast('/').uppercase()
-                        }
-                        val channelsStr = if (format.channelCount > 0) " (${format.channelCount}ch)" else ""
-                        val decoderType = when {
-                            !isSupported -> "Unsupported"
-                            isEac3 || isAc3 -> "FFmpeg"
-                            else -> "MediaCodec"
-                        }
-                        val decoderBadge = when {
-                            !isSupported -> " [Unsupported]"
-                            decoderType == "FFmpeg" -> " [FFmpeg]"
-                            else -> ""
-                        }
-                        val label = (if (codec.isNotBlank()) "$lang ($codec$channelsStr)" else lang) + decoderBadge
-                        val uniqueId = "audio_${groupIndex}_${i}"
-                        if (isSelected && isSupported) {
-                            anyAudioSelected = true
-                            val decoderLabel = if (decoderType == "FFmpeg") "FFmpeg Audio Renderer (Software)" else "MediaCodec Hardware Audio Renderer"
-                            _activeAudioDecoder.value = decoderLabel
-                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderLabel)
-                        }
-                        audioList.add(
-                            TrackOption(
-                                id = uniqueId,
-                                label = label,
-                                isSelected = isSelected,
-                                trackGroup = trackGroup,
-                                trackIndex = i,
-                                sampleMimeType = mime,
-                                isEac3 = isEac3,
-                                decoderType = decoderType,
-                                isSupported = isSupported
-                            )
-                        )
-                    }
-                    C.TRACK_TYPE_TEXT -> {
-                        val lang = getDisplayLanguage(format.language)
-                        val uniqueId = "sub_${groupIndex}_${i}"
-                        if (isSelected) anySubSelected = true
-                        subList.add(TrackOption(uniqueId, lang, isSelected, trackGroup, i, isSupported = isSupported))
-                    }
-                    C.TRACK_TYPE_VIDEO -> {
-                        if (format.height > 0) {
-                            val label = "${format.height}p" + (if (format.frameRate > 0) " (${format.frameRate.toInt()}fps)" else "")
-                            val uniqueId = "video_${groupIndex}_${i}"
-                            if (isSelected) anyVideoSelected = true
-                            qualityList.add(TrackOption(uniqueId, label, isSelected, trackGroup, i, isSupported = isSupported))
-                        }
-                    }
-                }
-            }
+        extracted.selectedAudioDecoderLabel?.let { decoderLabel ->
+            _activeAudioDecoder.value = decoderLabel
+            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderLabel)
         }
 
-        val hasSupportedAudio = audioList.any { it.isSupported }
-        if (!hasSupportedAudio && audioList.isNotEmpty()) {
-            _errorMessage.value = "Audio format is not supported by device decoders."
+        if (extracted.hasUnsupportedAudioOnly) {
+            hasUnsupportedTrackError = true
+            _errorMessage.value = "Audio format or codec is not supported on this device."
+        } else if (hasUnsupportedTrackError && extracted.hasSupportedAudio) {
+            hasUnsupportedTrackError = false
+            _errorMessage.value = null
         }
 
-        // Add Auto/Default options at the front with guaranteed unique IDs
-        audioList.add(0, TrackOption("auto_audio", "Default Audio", isSelected = !anyAudioSelected, isSupported = hasSupportedAudio))
-        subList.add(0, TrackOption("off_sub", "Subtitles Off", isSelected = !anySubSelected))
-        qualityList.add(0, TrackOption("auto_video", "Auto Quality", isSelected = !anyVideoSelected))
-
-        _availableAudioTracks.value = audioList
-        _availableSubtitles.value = subList
-        _availableQualities.value = qualityList
-    }
-
-    private fun getDisplayLanguage(langCode: String?): String {
-        return when (langCode?.lowercase()) {
-            "jpn", "ja", "japanese" -> "Japanese"
-            "eng", "en", "english" -> "English"
-            "hin", "hi", "hindi" -> "Hindi"
-            "tam", "ta", "tamil" -> "Tamil"
-            "tel", "te", "telugu" -> "Telugu"
-            "spa", "es", "spanish" -> "Spanish"
-            null, "" -> "Audio"
-            else -> langCode.uppercase()
-        }
+        _availableAudioTracks.value = extracted.audioTracks
+        _availableSubtitles.value = extracted.subtitleTracks
+        _availableQualities.value = extracted.videoQualities
     }
 
     fun selectTrack(option: TrackOption) {
@@ -665,9 +601,12 @@ class PlayerManager(
                 lastWorkingTrackSelectionParams = player.trackSelectionParameters
                 player.trackSelectionParameters = player.trackSelectionParameters
                     .buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
                     .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
                     .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
                     .build()
+                hasUnsupportedTrackError = false
+                _errorMessage.value = null
                 _availableAudioTracks.value = _availableAudioTracks.value.map {
                     it.copy(isSelected = it.id == "auto_audio")
                 }
@@ -694,7 +633,7 @@ class PlayerManager(
             else -> {
                 if (option.trackGroup != null) {
                     if (option.id.startsWith("audio_") && !option.isSupported) {
-                        _errorMessage.value = "Audio track '${option.label}' cannot be decoded on this device. Keeping current track."
+                        _errorMessage.value = "Audio format '${option.label}' is not supported on this device."
                         return
                     }
                     val override = TrackSelectionOverride(option.trackGroup, listOf(option.trackIndex))
@@ -703,18 +642,24 @@ class PlayerManager(
                         lastWorkingTrackSelectionParams = previousParams
                     }
                     val builder = player.trackSelectionParameters.buildUpon()
-                    if (option.id.startsWith("sub_")) {
+                    if (option.id.startsWith("audio_")) {
+                        builder.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                    } else if (option.id.startsWith("sub_")) {
                         builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
                     }
                     builder.setOverrideForType(override)
                     try {
                         player.trackSelectionParameters = builder.build()
                         if (option.id.startsWith("audio_")) {
-                            _activeAudioDecoder.value = if (option.isEac3 || option.decoderType == "FFmpeg") {
+                            hasUnsupportedTrackError = false
+                            _errorMessage.value = null
+                            val decLabel = if (option.isEac3 || option.decoderType == "FFmpeg") {
                                 "FFmpeg Audio Renderer (Software)"
                             } else {
                                 "MediaCodec Hardware Audio Renderer"
                             }
+                            _activeAudioDecoder.value = decLabel
+                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decLabel)
                             _availableAudioTracks.value = _availableAudioTracks.value.map {
                                 it.copy(isSelected = it.id == option.id)
                             }
@@ -830,10 +775,14 @@ class PlayerManager(
         tickerJob?.cancel()
         tickerJob = null
         networkTracker = null
+        onRetryRequested = null
+        onPlaybackFailedCallback = null
+        lastWorkingTrackSelectionParams = null
+        hasUnsupportedTrackError = false
         exoPlayer?.let { player ->
             activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
-            player.stop()
-            player.release()
+            runCatching { player.stop() }
+            runCatching { player.release() }
         }
         exoPlayer = null
         activeSession = null
@@ -841,7 +790,14 @@ class PlayerManager(
         _isPlaying.value = false
         _isBuffering.value = false
         _isPlaybackEnded.value = false
+        _currentPosition.value = 0L
+        _duration.value = 0L
         _videoResolution.value = null
+        _activeAudioDecoder.value = null
+        _availableAudioTracks.value = emptyList()
+        _availableSubtitles.value = emptyList()
+        _availableQualities.value = emptyList()
+        _errorMessage.value = null
     }
 
     internal data class NetworkMetricsSnapshot(
@@ -1048,6 +1004,222 @@ class PlayerManager(
 
                 else -> null
             }
+        }
+
+        fun isFfmpegLibraryAvailable(): Boolean = runCatching {
+            FfmpegLibrary.isAvailable()
+        }.getOrDefault(false)
+
+        /**
+         * Identifies audio codecs that should be decoded via Media3 FFmpeg extension
+         * (EAC3, EAC3-JOC, AC3, DTS, DTS-HD, TrueHD, ALAC, WMA, MP2), while leaving
+         * AAC, MP3, Opus, FLAC, Vorbis, and PCM to Android's native MediaCodecAudioRenderer.
+         */
+        fun isFfmpegPreferredAudioMimeType(mimeType: String?): Boolean {
+            if (mimeType.isNullOrBlank()) return false
+            val norm = mimeType.trim().lowercase(java.util.Locale.ROOT)
+            return isEac3MimeType(norm) ||
+                norm == MimeTypes.AUDIO_AC3 ||
+                norm == MimeTypes.AUDIO_DTS ||
+                norm == MimeTypes.AUDIO_DTS_HD ||
+                norm == MimeTypes.AUDIO_DTS_X ||
+                norm == MimeTypes.AUDIO_TRUEHD ||
+                norm == MimeTypes.AUDIO_MLAW ||
+                norm == MimeTypes.AUDIO_ALAW ||
+                norm == MimeTypes.AUDIO_MPEG_L2 ||
+                norm == "audio/mp2" ||
+                norm == MimeTypes.AUDIO_ALAC ||
+                norm == "audio/ac3" ||
+                norm == "audio/vnd.dts" ||
+                norm == "audio/vnd.dts.hd" ||
+                norm == "audio/true-hd" ||
+                norm == "audio/x-ms-wma" ||
+                norm == "audio/alac"
+        }
+
+        internal fun createSelectiveMediaCodecSelector(
+            delegate: MediaCodecSelector = MediaCodecSelector.DEFAULT,
+            preferFfmpegForExtendedCodecs: Boolean = isFfmpegLibraryAvailable()
+        ): MediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+            if (preferFfmpegForExtendedCodecs && isFfmpegPreferredAudioMimeType(mimeType)) {
+                emptyList()
+            } else {
+                delegate.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+            }
+        }
+
+        internal data class ExtractedTracksResult(
+            val audioTracks: List<TrackOption>,
+            val subtitleTracks: List<TrackOption>,
+            val videoQualities: List<TrackOption>,
+            val selectedAudioDecoderLabel: String?,
+            val hasSupportedAudio: Boolean,
+            val hasUnsupportedAudioOnly: Boolean
+        )
+
+        internal fun extractTracksFromMedia3(
+            tracks: Tracks,
+            providerDiagnostic: String = "stream"
+        ): ExtractedTracksResult {
+            val audioList = mutableListOf<TrackOption>()
+            val subList = mutableListOf<TrackOption>()
+            val qualityList = mutableListOf<TrackOption>()
+
+            var anyAudioSelected = false
+            var anySubSelected = false
+            var anyVideoSelected = false
+            var selectedDecoderLabel: String? = null
+
+            for ((groupIndex, groupInfo) in tracks.groups.withIndex()) {
+                val trackGroup = groupInfo.mediaTrackGroup
+                val type = trackGroup.type
+
+                for (i in 0 until trackGroup.length) {
+                    val format = trackGroup.getFormat(i)
+                    val isSelected = groupInfo.isTrackSelected(i)
+                    val isSupported = groupInfo.isTrackSupported(i)
+                    if (type == C.TRACK_TYPE_AUDIO || type == C.TRACK_TYPE_VIDEO) {
+                        runCatching {
+                            Log.i(
+                                TAG,
+                                "media3_track provider=${providerDiagnostic} type=${if (type == C.TRACK_TYPE_VIDEO) "video" else "audio"} " +
+                                    "sample_mime=${format.sampleMimeType ?: "unknown"} codec=${format.codecs ?: "unknown"} supported=$isSupported"
+                            )
+                        }
+                    }
+
+                    when (type) {
+                        C.TRACK_TYPE_AUDIO -> {
+                            val lang = getDisplayLanguage(format.language, format.label)
+                            val mime = format.sampleMimeType ?: ""
+                            val isEac3 = isEac3MimeType(mime)
+                            val isFfmpegCodec = isFfmpegPreferredAudioMimeType(mime)
+                            val codec = codecDisplayName(mime)
+                            val channelsStr = if (format.channelCount > 0) " (${format.channelCount}ch)" else ""
+                            val decoderType = when {
+                                !isSupported -> "Unsupported"
+                                isFfmpegCodec -> "FFmpeg"
+                                else -> "MediaCodec"
+                            }
+                            val decoderBadge = when {
+                                !isSupported -> " [Unsupported]"
+                                decoderType == "FFmpeg" -> " [FFmpeg]"
+                                else -> ""
+                            }
+                            val label = (if (codec.isNotBlank()) "$lang ($codec$channelsStr)" else lang) + decoderBadge
+                            val uniqueId = "audio_${groupIndex}_${i}"
+                            if (isSelected && isSupported) {
+                                anyAudioSelected = true
+                                selectedDecoderLabel = if (decoderType == "FFmpeg") {
+                                    "FFmpeg Audio Renderer (Software)"
+                                } else {
+                                    "MediaCodec Hardware Audio Renderer"
+                                }
+                            }
+                            audioList.add(
+                                TrackOption(
+                                    id = uniqueId,
+                                    label = label,
+                                    isSelected = isSelected,
+                                    trackGroup = trackGroup,
+                                    trackIndex = i,
+                                    sampleMimeType = mime,
+                                    isEac3 = isEac3,
+                                    decoderType = decoderType,
+                                    isSupported = isSupported
+                                )
+                            )
+                        }
+                        C.TRACK_TYPE_TEXT -> {
+                            val lang = getDisplayLanguage(format.language, format.label)
+                            val uniqueId = "sub_${groupIndex}_${i}"
+                            if (isSelected) anySubSelected = true
+                            subList.add(TrackOption(uniqueId, lang, isSelected, trackGroup, i, isSupported = isSupported))
+                        }
+                        C.TRACK_TYPE_VIDEO -> {
+                            if (format.height > 0) {
+                                val label = "${format.height}p" + (if (format.frameRate > 0) " (${format.frameRate.toInt()}fps)" else "")
+                                val uniqueId = "video_${groupIndex}_${i}"
+                                if (isSelected) anyVideoSelected = true
+                                qualityList.add(TrackOption(uniqueId, label, isSelected, trackGroup, i, isSupported = isSupported))
+                            }
+                        }
+                    }
+                }
+            }
+
+            val hasSupportedAudio = audioList.any { it.isSupported }
+            val hasUnsupportedAudioOnly = audioList.isNotEmpty() && !hasSupportedAudio
+
+            audioList.add(0, TrackOption("auto_audio", "Default Audio", isSelected = !anyAudioSelected, isSupported = hasSupportedAudio))
+            subList.add(0, TrackOption("off_sub", "Subtitles Off", isSelected = !anySubSelected))
+            qualityList.add(0, TrackOption("auto_video", "Auto Quality", isSelected = !anyVideoSelected))
+
+            return ExtractedTracksResult(
+                audioTracks = audioList,
+                subtitleTracks = subList,
+                videoQualities = qualityList,
+                selectedAudioDecoderLabel = selectedDecoderLabel,
+                hasSupportedAudio = hasSupportedAudio,
+                hasUnsupportedAudioOnly = hasUnsupportedAudioOnly
+            )
+        }
+
+        internal fun codecDisplayName(mime: String): String {
+            val lower = mime.lowercase(java.util.Locale.ROOT)
+            return when {
+                isEac3MimeType(lower) -> "EAC3"
+                lower.contains("ac3") -> "AC3"
+                lower.contains("dts.hd") -> "DTS-HD"
+                lower.contains("dts") -> "DTS"
+                lower.contains("true-hd") || lower.contains("truehd") -> "TrueHD"
+                lower.contains("mp4a") || lower.contains("aac") -> "AAC"
+                lower.contains("opus") -> "OPUS"
+                lower.contains("flac") -> "FLAC"
+                lower.contains("vorbis") -> "VORBIS"
+                lower == MimeTypes.AUDIO_MPEG || lower == "audio/mp3" -> "MP3"
+                lower == MimeTypes.AUDIO_MPEG_L2 || lower == "audio/mp2" -> "MP2"
+                lower.contains("alac") -> "ALAC"
+                lower.contains("wma") -> "WMA"
+                lower.contains("raw") -> "PCM"
+                else -> lower.substringAfterLast('/').uppercase(java.util.Locale.ROOT)
+            }
+        }
+
+        fun getDisplayLanguage(langCode: String?, formatLabel: String? = null): String {
+            val raw = langCode?.trim()?.lowercase(java.util.Locale.ROOT)
+            if (!raw.isNullOrEmpty() && raw != "und" && raw != "unknown") {
+                val mapped = when (raw.substringBefore('-').substringBefore('_')) {
+                    "jpn", "ja", "japanese" -> "Japanese"
+                    "eng", "en", "english" -> "English"
+                    "hin", "hi", "hindi" -> "Hindi"
+                    "tam", "ta", "tamil" -> "Tamil"
+                    "tel", "te", "telugu" -> "Telugu"
+                    "spa", "es", "spanish" -> "Spanish"
+                    "fre", "fra", "fr", "french" -> "French"
+                    "ger", "deu", "de", "german" -> "German"
+                    "kor", "ko", "korean" -> "Korean"
+                    "chi", "zho", "zh", "chinese" -> "Chinese"
+                    "por", "pt", "portuguese" -> "Portuguese"
+                    "ita", "it", "italian" -> "Italian"
+                    "rus", "ru", "russian" -> "Russian"
+                    "ara", "ar", "arabic" -> "Arabic"
+                    "ind", "id", "indonesian" -> "Indonesian"
+                    "tha", "th", "thai" -> "Thai"
+                    "vie", "vi", "vietnamese" -> "Vietnamese"
+                    else -> null
+                }
+                if (mapped != null) return mapped
+                val localeName = runCatching {
+                    java.util.Locale.forLanguageTag(raw).getDisplayLanguage(java.util.Locale.ENGLISH)
+                        .takeIf { it.isNotBlank() && !it.equals(raw, ignoreCase = true) }
+                        ?.replaceFirstChar { c -> c.titlecase(java.util.Locale.ENGLISH) }
+                }.getOrNull()
+                if (!localeName.isNullOrBlank()) return localeName
+                return langCode.trim().uppercase(java.util.Locale.ROOT)
+            }
+            val cleanLabel = formatLabel?.trim()?.takeIf { it.isNotEmpty() }
+            return cleanLabel ?: "Audio"
         }
 
         /**

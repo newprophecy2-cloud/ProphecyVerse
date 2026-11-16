@@ -307,7 +307,7 @@ data class ResolvedStreamPlayback(
     val directData: DirectPlayData,
     val candidates: List<ProphecySourceDto>,
     val fromCache: Boolean,
-    val cacheTier: String, // "ROOM", "FIRESTORE", "BACKEND_RESOLVE"
+    val cacheTier: String, // "MEMORY", "D1", "BACKEND_RESOLVE"
     val resolveDurationMs: Long = 0L
 )
 
