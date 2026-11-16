@@ -5,9 +5,9 @@ import com.example.data.identity.EpisodeCanonicalizer
 
 /** Pure queue planning. Windows never cross an unrelated season boundary. */
 object PreResolvePlan {
-    const val UPCOMING_WINDOW_SIZE = 17
-    const val FAST_WINDOW_SIZE = 7
-    const val PREVIOUS_WINDOW_SIZE = 6
+    const val UPCOMING_WINDOW_SIZE = 10
+    const val FAST_WINDOW_SIZE = 4
+    const val PREVIOUS_WINDOW_SIZE = 0
 
     fun sameSeasonEpisodes(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> {
         if (current.animeId.isBlank() || current.id.isBlank() || current.seasonNumber <= 0 || current.id.startsWith("movie_")) {
@@ -31,11 +31,7 @@ object PreResolvePlan {
     fun fastUpcoming(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>) = upcoming(current, allEpisodes).take(FAST_WINDOW_SIZE)
     fun backgroundUpcoming(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>) = upcoming(current, allEpisodes).drop(FAST_WINDOW_SIZE)
 
-    fun previous(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> {
-        val ordered = sameSeasonEpisodes(current, allEpisodes)
-        val index = ordered.indexOfFirst { it.id == current.id && it.seasonNumber == current.seasonNumber && it.animeId == current.animeId }
-        return if (index < 0) emptyList() else ordered.subList(maxOf(0, index - PREVIOUS_WINDOW_SIZE), index)
-    }
+    fun previous(current: EpisodeEntry, allEpisodes: List<EpisodeEntry>): List<EpisodeEntry> = emptyList()
 
     /** Compatibility helper retained for callers/tests; batches are deliberately bounded. */
     fun <T> batches(items: List<T>): List<List<T>> = items.chunked(UPCOMING_WINDOW_SIZE)

@@ -633,37 +633,34 @@ class ArchitectureRemakeVerificationTest {
         )
         assertTrue(manager.queueStatus.value.isEmpty())
 
-        // Series Ep 1 -> queues 2..14 sequentially (13 available upcoming episodes; Ep 1 is already active)
+        // Series Ep 1 -> queues Next 10 episodes (Ep 2..11)
         manager.slideWindow("anilist_201", episodes.first(), episodes, isMovie = false)
         // Wait briefly for worker coroutine using IO dispatcher to settle
         val deadline = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline) {
             val statuses = manager.queueStatus.value
-            if (statuses.size == 13 && statuses.values.all { it == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
+            if (statuses.size == 10 && statuses.values.all { it == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
                 break
             }
             Thread.sleep(25L)
         }
         val afterEp1 = manager.queueStatus.value
-        assertEquals(13, afterEp1.size)
-        assertEquals(13, backend.resolveCalls.get())
+        assertEquals(10, afterEp1.size)
+        assertEquals(10, backend.resolveCalls.get())
 
-        // Sliding to Ep 2 reuses the overlapping next-17 window and resolves only uncached Ep 1 (previous)!
+        // Sliding to Ep 2 reuses overlapping Ep 3..11 and resolves only uncached Ep 12!
         manager.slideWindow("anilist_201", episodes[1], episodes, isMovie = false)
-        val ep13Key = PreResolveQueueManager.identity("anilist_201", episodes[12])
-        val ep1Key = PreResolveQueueManager.identity("anilist_201", episodes[0])
+        val ep12Key = PreResolveQueueManager.identity("anilist_201", episodes[11])
         val deadline2 = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline2) {
             val statuses = manager.queueStatus.value
-            if (statuses[ep13Key] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE &&
-                statuses[ep1Key] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE
-            ) {
+            if (statuses.size == 10 && statuses[ep12Key] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE) {
                 break
             }
             Thread.sleep(25L)
         }
-        // Ep 1 was active rather than pre-resolved, so the previous-6 window resolves it once.
-        assertEquals(14, backend.resolveCalls.get())
+        // Only Ep 12 was newly added at the tail of Next 10.
+        assertEquals(11, backend.resolveCalls.get())
         manager.clear()
     }
 

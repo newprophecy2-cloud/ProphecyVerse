@@ -336,7 +336,7 @@ class Fix1And2PrioritySchedulerTest {
     // -------------------------------------------------------------------------
 
     @Test
-    fun fix2_nextSevenStartsHighestPriority_thenFollowingTen_thenPreviousSix() = runBlocking {
+    fun fix2_nextFourStartsHighestPriority_thenFollowingSix_withNoPreviousOrCurrent() = runBlocking {
         val animeId = "anilist_7201"
         val eps = seedSeries(animeId, "be_7201", 30)
         val resolveStartOrder = Collections.synchronizedList(mutableListOf<Int>())
@@ -366,11 +366,11 @@ class Fix1And2PrioritySchedulerTest {
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val manager = PreResolveQueueManager(repo, managerScope)
 
-        // Current is Ep 7 -> Next 7 = 8..14, Following 10 = 15..24, Previous 6 = 1..6
+        // Current is Ep 7 -> Next 10 = 8..17 (Fast 4 = 8..11, Background 6 = 12..17)
         val current = eps[6]
         manager.slideWindow(animeId, current, eps, isMovie = false)
 
-        val expectedTotal = 7 + 10 + 6
+        val expectedTotal = 10
         val deadline = System.currentTimeMillis() + 8_000L
         while (System.currentTimeMillis() < deadline) {
             val statuses = manager.queueStatus.value
@@ -382,31 +382,25 @@ class Fix1And2PrioritySchedulerTest {
 
         assertEquals(expectedTotal, resolveStartOrder.size)
         val overlapMargin = PreResolveQueueManager.MAX_BACKGROUND_CONCURRENCY - 1
-        // With 2 concurrent workers, Next 7 must start within the first (7 + 1) slots,
-        // Following 10 must finish starting before Previous 6 except at most 1 boundary overlap,
-        // and Next 7 must strictly precede all of Previous 6.
         assertTrue(
-            "Next 7 (8..14) must start ahead of later tiers, got order=$resolveStartOrder",
-            resolveStartOrder.take(7 + overlapMargin).containsAll((8..14).toList())
+            "Fast 4 (8..11) must start ahead of background tier, got order=$resolveStartOrder",
+            resolveStartOrder.take(4 + overlapMargin).containsAll((8..11).toList())
         )
         assertTrue(
-            "Next 7 + Following 10 (8..24) must start ahead of Previous 6 (1..6), got order=$resolveStartOrder",
-            resolveStartOrder.take(17 + overlapMargin).containsAll((8..24).toList())
+            "Next 10 (8..17) must all be prepared, got order=$resolveStartOrder",
+            resolveStartOrder.containsAll((8..17).toList())
         )
         assertTrue(
-            "Previous 6 (1..6) must be scheduled in final tier, got order=$resolveStartOrder",
-            resolveStartOrder.drop(17 - overlapMargin).containsAll((1..6).toList())
+            "Current and previous episodes (1..7) must not be queued, got order=$resolveStartOrder",
+            (1..7).none { it in resolveStartOrder }
         )
-        val maxNext7Pos = (8..14).maxOf { resolveStartOrder.indexOf(it) }
-        val minPrev6Pos = (1..6).minOf { resolveStartOrder.indexOf(it) }
-        assertTrue("All Next 7 must start before any Previous 6 (maxNext7=$maxNext7Pos, minPrev6=$minPrev6Pos)", maxNext7Pos < minPrev6Pos)
 
         manager.clear()
         managerScope.cancel()
     }
 
     @Test
-    fun fix2_slowEpisodeInNextSevenDoesNotStallRemainingEpisodesOrTiers() = runBlocking {
+    fun fix2_slowEpisodeInNextFourDoesNotStallRemainingEpisodesOrTiers() = runBlocking {
         val animeId = "anilist_7202"
         val eps = seedSeries(animeId, "be_7202", 14)
         val slowEpGate = CompletableDeferred<Unit>()
@@ -439,16 +433,16 @@ class Fix1And2PrioritySchedulerTest {
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val manager = PreResolveQueueManager(repo, managerScope)
 
-        // Current Ep 1 -> Ep 2 is slow; Ep 3..8 (rest of Next 7) + Ep 9..14 (Following tier) MUST NOT wait for Ep 2!
+        // Current Ep 1 -> Next 10 window is 2..11. Ep 2 is slow; Ep 3..11 MUST NOT wait for Ep 2!
         manager.slideWindow(animeId, eps[0], eps, isMovie = false)
 
         val deadline = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline) {
-            if ((3..14).all { it in resolvedEps }) break
+            if ((3..11).all { it in resolvedEps }) break
             delay(25L)
         }
 
-        assertTrue("Ep 3..14 must all finish even while Ep 2 is still blocked: resolved=$resolvedEps", (3..14).all { it in resolvedEps })
+        assertTrue("Ep 3..11 must all finish even while Ep 2 is still blocked: resolved=$resolvedEps", (3..11).all { it in resolvedEps })
         assertFalse("Ep 2 gate is still blocked", 2 in resolvedEps)
 
         slowEpGate.complete(Unit)
@@ -566,26 +560,27 @@ class Fix1And2PrioritySchedulerTest {
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val manager = PreResolveQueueManager(repo, managerScope)
 
+        // Ep 1 playing -> Next 10 window is Ep 2..11
         manager.slideWindow(animeId, eps[0], eps, isMovie = false)
         val ep2Key = PreResolveQueueManager.identity(animeId, eps[1])
         val ep9Key = PreResolveQueueManager.identity(animeId, eps[8])
         val ep12Key = PreResolveQueueManager.identity(animeId, eps[11])
         val deadline1 = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline1) {
-            if ((2..12).all { n -> manager.queueStatus.value[PreResolveQueueManager.identity(animeId, eps[n - 1])] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
+            if ((2..11).all { n -> manager.queueStatus.value[PreResolveQueueManager.identity(animeId, eps[n - 1])] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE }) {
                 break
             }
             delay(25L)
         }
         assertEquals(1, resolveCounts[eps[2].id]?.get())
         assertEquals(1, resolveCounts[eps[8].id]?.get())
+        assertEquals(0, resolveCounts[eps[11].id]?.get() ?: 0)
 
-        // Slide from Ep 1 -> Ep 2: Ep 3..12 overlap and are cached; Ep 1 becomes newly previous
+        // Slide from Ep 1 -> Ep 2: Next 10 window is Ep 3..12; Ep 3..11 are reused and only Ep 12 resolves newly
         manager.slideWindow(animeId, eps[1], eps, isMovie = false)
-        val ep1Key = PreResolveQueueManager.identity(animeId, eps[0])
         val deadline2 = System.currentTimeMillis() + 5_000L
         while (System.currentTimeMillis() < deadline2) {
-            if (manager.queueStatus.value[ep1Key] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE) {
+            if (manager.queueStatus.value[ep12Key] == PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE) {
                 break
             }
             delay(25L)
@@ -597,7 +592,8 @@ class Fix1And2PrioritySchedulerTest {
         }
         assertEquals(PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE, manager.queueStatus.value[ep9Key])
         assertEquals(PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE, manager.queueStatus.value[ep12Key])
-        assertEquals(PreResolveQueueManager.ResolutionStatus.VERIFIED_PLAYABLE, manager.queueStatus.value[ep2Key])
+        assertNotNull("Ep 2 cached entry remains valid when accessed", manager.getPreparedSource(animeId, eps[1]))
+        assertEquals(null, manager.queueStatus.value[ep2Key])
 
         manager.clear()
         managerScope.cancel()

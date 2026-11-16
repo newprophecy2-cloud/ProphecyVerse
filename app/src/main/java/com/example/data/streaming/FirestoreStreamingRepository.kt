@@ -31,6 +31,46 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
+enum class DiscoveryStatus {
+    NOT_DISCOVERED,
+    IN_PROGRESS,
+    PARTIAL,
+    COMPLETED,
+    FAILED
+}
+
+enum class StreamRecordStatus {
+    AVAILABLE,
+    EXPIRED,
+    MISSING_URL,
+    FAILED,
+    REMOVED
+}
+
+enum class FirestoreWriteOperation {
+    ADD,
+    UPDATE,
+    REMOVE
+}
+
+data class FirestoreWriteAuditEntry(
+    val operation: FirestoreWriteOperation,
+    val contentType: String,
+    val canonicalTitle: String?,
+    val anilistId: String,
+    val backendId: String?,
+    val seasonId: String?,
+    val episodeId: String?,
+    val providerId: String?,
+    val sourceId: String?,
+    val targetPath: String,
+    val startedAtMs: Long,
+    val completedAtMs: Long,
+    val success: Boolean,
+    val failureReason: String? = null,
+    val firebaseErrorCode: String? = null
+)
+
 /**
  * Shared Firestore repository strictly responsible for streaming discovery,
  * cached playable Stream URLs, distributed resolution leases, and scoped real-time sync.
@@ -1462,7 +1502,7 @@ class FirestoreStreamingRepository(
     ): ResolveLease? {
         val now = System.currentTimeMillis()
         val expiresAt = now + ttlMs
-        val lockKey = ContentIdentityHelper.resolveLockKey(contentKey, isMovie, providerId, sourceId, seasonNumber, episodeNumber)
+        val lockKey = buildResolveLockKey(contentKey, isMovie, providerId, sourceId, seasonNumber, episodeNumber)
 
         val existingLocal = localLocks[lockKey]
         if (existingLocal != null && existingLocal.expiresAtMs > now && existingLocal.ownerId != ownerId) {
@@ -2208,6 +2248,18 @@ class FirestoreStreamingRepository(
 
     private fun Map<String, Any?>.stringValue(key: String): String? = this[key] as? String
     private fun Map<String, Any?>.longValue(key: String): Long? = (this[key] as? Number)?.toLong()
+
+    private fun buildResolveLockKey(
+        contentKey: String,
+        isMovie: Boolean,
+        providerId: String,
+        sourceId: String,
+        seasonNumber: Int,
+        episodeNumber: Int
+    ): String {
+        val scope = ContentIdentityHelper.scopeKey(contentKey, isMovie, seasonNumber, episodeNumber)
+        return ContentIdentityHelper.sanitizeDocId("${scope}_${providerId}_$sourceId")
+    }
 
     fun isDiscoveryFresh(updatedAt: Long, nowMs: Long = System.currentTimeMillis()): Boolean =
         updatedAt > 0L && (nowMs - updatedAt) < DISCOVERY_FRESHNESS_MS

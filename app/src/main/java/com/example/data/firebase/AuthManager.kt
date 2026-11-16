@@ -3,6 +3,7 @@ package com.example.data.firebase
 import android.content.Context
 import android.util.Log
 import com.example.BuildConfig
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
@@ -73,7 +74,15 @@ class AuthManager private constructor(private val context: Context) {
     private val _pendingDownload = MutableStateFlow<PendingDownload?>(null)
     val pendingDownload: StateFlow<PendingDownload?> = _pendingDownload.asStateFlow()
 
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
+    private val authLock = Any()
     private var userDocListener: ListenerRegistration? = null
+    private var activeListenedUid: String? = null
+    private var listenerAttached: Boolean = false
+    @Volatile
+    private var lastObservedUserDocExists: Boolean = false
+    private var lastSyncedUid: String? = null
+    private var lastProfileSyncAtMs: Long = 0L
 
     val currentUser: FirebaseUser?
         get() = auth.currentUser
@@ -92,20 +101,51 @@ class AuthManager private constructor(private val context: Context) {
         auth.addAuthStateListener { firebaseAuth -> updateAuthState(firebaseAuth.currentUser) }
     }
 
-    private fun updateAuthState(user: FirebaseUser?) {
+    private fun detachUserDocListenerLocked() {
         userDocListener?.remove()
         userDocListener = null
+        if (listenerAttached) {
+            listenerAttached = false
+            metricsTracker.recordFirestoreListenerDetached()
+        }
+        activeListenedUid = null
+        lastObservedUserDocExists = false
+    }
 
-        if (user == null || user.isAnonymous) {
-            _userProfile.value = UserProfile(
-                uid = user?.uid ?: currentUid,
-                isAnonymous = true,
-                status = "active"
-            )
-            _authState.value = AuthState.Guest(user?.uid ?: currentUid)
-        } else {
-            // Listen for profile changes (including suspension status) in real time
-            listenToUserProfile(user)
+    fun stopListening() {
+        synchronized(authLock) {
+            detachUserDocListenerLocked()
+        }
+    }
+
+    private fun updateAuthState(user: FirebaseUser?) {
+        synchronized(authLock) {
+            if (user == null || user.isAnonymous) {
+                detachUserDocListenerLocked()
+                lastSyncedUid = null
+                lastProfileSyncAtMs = 0L
+                val guestId = user?.uid ?: currentUid
+                val currentState = _authState.value
+                if (currentState is AuthState.Guest && currentState.guestId == guestId && _userProfile.value.uid == guestId) {
+                    return
+                }
+                _userProfile.value = UserProfile(
+                    uid = guestId,
+                    isAnonymous = true,
+                    status = "active"
+                )
+                _authState.value = AuthState.Guest(guestId)
+            } else {
+                if (activeListenedUid == user.uid && listenerAttached && userDocListener != null) {
+                    metricsTracker.recordFirestoreCacheHit()
+                    metricsTracker.recordDuplicateRequestPrevented()
+                    syncUserProfile(user)
+                    return
+                }
+                detachUserDocListenerLocked()
+                // Listen for profile changes (including suspension status) in real time
+                listenToUserProfile(user)
+            }
         }
     }
 
@@ -115,20 +155,26 @@ class AuthManager private constructor(private val context: Context) {
             _authState.value = AuthState.Error("Account profile verification is paused briefly after a Firestore quota limit. Retry after the cooldown.")
             return
         }
+        activeListenedUid = user.uid
         val docRef = firestore.collection("users").document(user.uid)
         userDocListener = docRef.addSnapshotListener { snapshot, error ->
             if (error != null) {
                 val category = FirestoreRequestGuard.recordListenerFailure(error)
                 Log.w(TAG, "User profile listener failed ($category): ${error.message}")
                 if (category == FirestoreFailureCategory.RESOURCE_EXHAUSTED || category == FirestoreFailureCategory.PERMISSION_DENIED) {
-                    userDocListener?.remove()
-                    userDocListener = null
+                    synchronized(authLock) {
+                        detachUserDocListenerLocked()
+                    }
                 }
                 if (_authState.value !is AuthState.Authenticated && _authState.value !is AuthState.Suspended) {
                     _authState.value = AuthState.Error("Unable to verify account profile ($category). Retry when the service is available.")
                 }
                 return@addSnapshotListener
             }
+
+            val docExists = snapshot?.exists() == true
+            lastObservedUserDocExists = docExists
+            metricsTracker.recordFirestoreListenerEvent(if (docExists) 1L else 0L)
 
             val status = snapshot?.getString("status") ?: "active"
             val reason = snapshot?.getString("suspension_reason") ?: "Account access restricted by administration."
@@ -155,6 +201,8 @@ class AuthManager private constructor(private val context: Context) {
                 _authState.value = AuthState.Authenticated(user, user.email ?: "", profile)
             }
         }
+        listenerAttached = true
+        metricsTracker.recordFirestoreListenerAttached()
 
         // Perform initial merge sync
         syncUserProfile(user)
@@ -238,8 +286,11 @@ class AuthManager private constructor(private val context: Context) {
     fun signOut() {
         scope.launch {
             try {
-                userDocListener?.remove()
-                userDocListener = null
+                synchronized(authLock) {
+                    detachUserDocListenerLocked()
+                    lastSyncedUid = null
+                    lastProfileSyncAtMs = 0L
+                }
                 auth.signOut()
                 val guest = try {
                     auth.signInAnonymously().await().user
@@ -258,6 +309,15 @@ class AuthManager private constructor(private val context: Context) {
 
     private fun syncUserProfile(user: FirebaseUser) {
         if (user.isAnonymous) return
+        val now = System.currentTimeMillis()
+        synchronized(authLock) {
+            if (lastSyncedUid == user.uid && (now - lastProfileSyncAtMs) < PROFILE_SYNC_COOLDOWN_MS) {
+                metricsTracker.recordFirestoreCacheHit()
+                return
+            }
+            lastSyncedUid = user.uid
+            lastProfileSyncAtMs = now
+        }
         scope.launch {
             try {
                 val instId = InstallationManager.getInstance(context).installationId
@@ -272,10 +332,20 @@ class AuthManager private constructor(private val context: Context) {
                 user.email?.let { data["email"] = it }
 
                 val userDocument = firestore.collection("users").document(user.uid)
-                val existingProfile = FirestoreRequestGuard.execute("read user profile before sync") {
-                    userDocument.get()
+                val profileExists = if (lastObservedUserDocExists) {
+                    metricsTracker.recordFirestoreCacheHit()
+                    true
+                } else {
+                    val existingProfile = FirestoreRequestGuard.execute("read user profile before sync") {
+                        userDocument.get()
+                    }
+                    val exists = existingProfile.exists()
+                    metricsTracker.recordFirestoreQuery(if (exists) 1L else 0L)
+                    metricsTracker.recordFirestoreRead(1L)
+                    lastObservedUserDocExists = exists
+                    exists
                 }
-                if (!existingProfile.exists()) {
+                if (!profileExists) {
                     // The deployed user rules require safe initial values on create. Do not include
                     // these fields for existing profiles, where owner updates cannot change them.
                     data["status"] = "active"
@@ -285,6 +355,12 @@ class AuthManager private constructor(private val context: Context) {
                     userDocument.set(data, SetOptions.merge())
                 }
             } catch (e: Exception) {
+                synchronized(authLock) {
+                    if (lastSyncedUid == user.uid) {
+                        lastSyncedUid = null
+                        lastProfileSyncAtMs = 0L
+                    }
+                }
                 Log.w(TAG, "Failed to sync user profile to Firestore: ${e.message}")
             }
         }
@@ -292,6 +368,7 @@ class AuthManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "AuthManager"
+        private const val PROFILE_SYNC_COOLDOWN_MS = 10 * 60 * 1000L
 
         @Volatile
         private var instance: AuthManager? = null

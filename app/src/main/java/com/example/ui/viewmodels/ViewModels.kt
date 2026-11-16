@@ -774,6 +774,8 @@ class PlayerViewModel(
     private var activeSourceId: String? = null
     private var playbackResolutionJob: Job? = null
     private var playbackGeneration: Long = 0L
+    @Volatile private var activeSwitchPrepStartedAtMs: Long = 0L
+    private val metricsTracker = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
     private val recoveryCoordinator = PlaybackRecoveryCoordinator(viewModelScope)
     private val sessionRecoveryMarkers = mutableSetOf<String>()
 
@@ -865,7 +867,13 @@ class PlayerViewModel(
                         val current = _currentEpisode.value
                         if (current != null && current.seasonNumber > 0) {
                             val currentSeasonEpisodes = epList.filter { it.seasonNumber == current.seasonNumber }
-                            preResolveManager.slideWindow(animeId, current, currentSeasonEpisodes, isMovie = false)
+                            preResolveManager.slideWindow(
+                                animeId = animeId,
+                                currentEpisode = current,
+                                allEpisodes = currentSeasonEpisodes,
+                                isMovie = false,
+                                preferredSourceId = activeSourceId
+                            )
                         }
                     }
                 }
@@ -950,15 +958,19 @@ class PlayerViewModel(
     ) {
         val normPreferredSource = com.example.data.repository.SourceIdentityValidator.normalizeId(preferredSourceId)
             .takeIf { it.isNotEmpty() }
-        if (_currentEpisode.value?.id == episode.id &&
+        val currentEp = _currentEpisode.value
+        val sameEpisodeAndSeason = currentEp?.id == episode.id && currentEp.seasonNumber == episode.seasonNumber
+        if (sameEpisodeAndSeason &&
             (normPreferredSource == null || com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(normPreferredSource, activeSourceId)) &&
             playbackResolutionJob?.isActive == true) return
-        if (_currentEpisode.value?.id == episode.id &&
+        if (sameEpisodeAndSeason &&
             (normPreferredSource == null || com.example.data.repository.SourceIdentityValidator.normalizedIdsEqual(normPreferredSource, activeSourceId)) &&
             !_isResolving.value &&
+            activeDirectData != null &&
             playerManager.errorMessage.value == null &&
             !playerManager.isPlaybackEnded.value &&
             playerManager.exoPlayerInstance.value != null) return
+        activeSwitchPrepStartedAtMs = com.example.data.streaming.MonotonicMetrics.nowMs()
         val requestGeneration = ++playbackGeneration
         sessionRecoveryMarkers.clear()
         recoveryCoordinator.beginGeneration(requestGeneration)
@@ -1030,11 +1042,16 @@ class PlayerViewModel(
                 val isMovieTarget = com.example.data.streaming.ContentIdentityHelper.isMovie(anime) ||
                     episode.seasonNumber == 0 || episode.id.startsWith("movie_")
 
-                // 3. Fast-Path: Check pre-resolve cache BEFORE sliding window so prepared or in-flight work is reused
-                if (normPreferredSource == null && !isMovieTarget) {
-                    val prepared = preResolveManager.getPreparedSource(animeId, episode)
+                // 3. Fast-Path: Check pre-resolve Ready Queue BEFORE sliding window so prepared work is reused instantaneously
+                if (!isMovieTarget) {
+                    val prepared = preResolveManager.getPreparedSource(
+                        backendAnimeId = animeId,
+                        episode = episode,
+                        preferredSourceId = normPreferredSource
+                    )
                     if (requestGeneration != playbackGeneration) return@launch
                     if (prepared != null) {
+                        metricsTracker.recordReadyQueueHit()
                         _resolutionStage.value = ResolutionStage.STARTING_PLAYBACK
                         val lastSavedPos = try {
                             startPositionOverrideMs ?: db.playbackHistoryDao().getHistoryForEpisode(animeId, episode.id)?.positionMs ?: 0L
@@ -1047,6 +1064,10 @@ class PlayerViewModel(
                         activeSourceId = prepared.source.id
                         _isResolving.value = false
                         _resolutionStage.value = ResolutionStage.IDLE
+                        if (activeSwitchPrepStartedAtMs > 0L) {
+                            val prepElapsed = (com.example.data.streaming.MonotonicMetrics.nowMs() - activeSwitchPrepStartedAtMs).coerceAtLeast(0L)
+                            metricsTracker.recordEpisodeSwitchPrep(prepElapsed)
+                        }
 
                         playerManager.initializePlayer(
                             directData = prepared.directData,
@@ -1074,8 +1095,16 @@ class PlayerViewModel(
                             resolveDurationMs = 0L,
                             cacheTier = "PRE_RESOLVED"
                         )
-                        preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
+                        preResolveManager.slideWindow(
+                            animeId = animeId,
+                            currentEpisode = episode,
+                            allEpisodes = allEpisodes.value,
+                            isMovie = false,
+                            preferredSourceId = prepared.source.id
+                        )
                         return@launch
+                    } else {
+                        metricsTracker.recordReadyQueueMiss()
                     }
                 }
 
@@ -1105,7 +1134,13 @@ class PlayerViewModel(
                         preResolved = sharedResolution
                     )
                     if (requestGeneration == playbackGeneration && !isMovieTarget) {
-                        preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
+                        preResolveManager.slideWindow(
+                            animeId = animeId,
+                            currentEpisode = episode,
+                            allEpisodes = allEpisodes.value,
+                            isMovie = false,
+                            preferredSourceId = activeSourceId
+                        )
                     }
                     return@launch
                 }
@@ -1155,7 +1190,13 @@ class PlayerViewModel(
                     requestGeneration = requestGeneration
                 )
                 if (requestGeneration == playbackGeneration && !isMovieTarget && _resolutionError.value == null) {
-                    preResolveManager.slideWindow(animeId, episode, allEpisodes.value, isMovie = false)
+                    preResolveManager.slideWindow(
+                        animeId = animeId,
+                        currentEpisode = episode,
+                        allEpisodes = allEpisodes.value,
+                        isMovie = false,
+                        preferredSourceId = activeSourceId
+                    )
                 }
             } finally {
                 com.example.data.repository.EpisodeResolutionCoordinator.endForegroundResolution()
@@ -1484,6 +1525,10 @@ class PlayerViewModel(
                 _resolutionStage.value = ResolutionStage.STARTING_PLAYBACK
                 _isResolving.value = false
                 _resolutionStage.value = ResolutionStage.IDLE
+                if (!isRecoveryAttempt && activeSwitchPrepStartedAtMs > 0L) {
+                    val prepElapsed = (com.example.data.streaming.MonotonicMetrics.nowMs() - activeSwitchPrepStartedAtMs).coerceAtLeast(0L)
+                    metricsTracker.recordEpisodeSwitchPrep(prepElapsed)
+                }
 
                 playerManager.initializePlayer(
                     directData = normalizedDirectData,

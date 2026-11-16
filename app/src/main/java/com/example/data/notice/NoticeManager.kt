@@ -6,6 +6,7 @@ import android.net.Uri
 import android.util.Log
 import com.example.BuildConfig
 import com.example.data.firebase.FirestoreRequestGuard
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import kotlinx.coroutines.CoroutineScope
@@ -77,17 +78,51 @@ class NoticeManager private constructor(private val context: Context) {
     private val _detectedCountry = MutableStateFlow<String?>(null)
     val detectedCountry: StateFlow<String?> = _detectedCountry.asStateFlow()
 
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
+    private val listenerLock = Any()
     private var listenerRegistration: ListenerRegistration? = null
+    private var listenerAttached = false
+    @Volatile
+    private var lastNoticeFetchAtMs = 0L
     private var sessionDismissed = false
 
     suspend fun checkAndPrepareNotice(forceShow: Boolean = false) = withContext(Dispatchers.IO) {
         _detectedCountry.value = resolveCountryCode()
-        startNoticeListener()
+        startNoticeListener(force = false)
         if (forceShow) _isNoticeVisible.value = true
     }
 
-    private fun startNoticeListener() {
-        if (listenerRegistration != null) return
+    private fun detachListenerLocked() {
+        listenerRegistration?.remove()
+        listenerRegistration = null
+        if (listenerAttached) {
+            listenerAttached = false
+            metricsTracker.recordFirestoreListenerDetached()
+        }
+    }
+
+    fun stopObservingNotices() {
+        synchronized(listenerLock) {
+            detachListenerLocked()
+        }
+    }
+
+    private fun startNoticeListener(force: Boolean = false) {
+        synchronized(listenerLock) {
+            if (listenerRegistration != null) {
+                metricsTracker.recordFirestoreCacheHit()
+                return
+            }
+            val now = System.currentTimeMillis()
+            if (!force &&
+                _noticeContent.value.hasLoaded &&
+                _noticeContent.value.errorMessage == null &&
+                (now - lastNoticeFetchAtMs) < NOTICE_CACHE_TTL_MS
+            ) {
+                metricsTracker.recordFirestoreCacheHit()
+                return
+            }
+        }
         val cooldownRemaining = FirestoreRequestGuard.cooldownRemainingMs()
         if (cooldownRemaining > 0L) {
             _noticeContent.value = _noticeContent.value.copy(
@@ -100,15 +135,16 @@ class NoticeManager private constructor(private val context: Context) {
         try {
             // Admin Firestore rules permit ordinary clients to read published notices.
             // Constrain this query to published=true so it remains valid under those rules.
-            listenerRegistration = FirebaseFirestore.getInstance()
+            val reg = FirebaseFirestore.getInstance()
                 .collection(NOTICES_COLLECTION)
                 .whereEqualTo("published", true)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
                         val category = FirestoreRequestGuard.recordListenerFailure(error)
                         Log.e(TAG, "Failed to listen for published notices ($category)", error)
-                        listenerRegistration?.remove()
-                        listenerRegistration = null
+                        synchronized(listenerLock) {
+                            detachListenerLocked()
+                        }
                         _noticeContent.value = _noticeContent.value.copy(
                             isLoading = false,
                             errorMessage = "Unable to load published notices ($category). Previously loaded notices are retained; retry when the service is available."
@@ -122,6 +158,9 @@ class NoticeManager private constructor(private val context: Context) {
                         )
                         return@addSnapshotListener
                     }
+
+                    lastNoticeFetchAtMs = System.currentTimeMillis()
+                    metricsTracker.recordFirestoreListenerEvent(snapshot.documents.size.toLong())
 
                     val notices = snapshot.documents.mapNotNull { document ->
                         runCatching { parsePublishedNotice(document.id, document.data.orEmpty()) }
@@ -140,6 +179,13 @@ class NoticeManager private constructor(private val context: Context) {
                         _isNoticeVisible.value = true
                     }
                 }
+            synchronized(listenerLock) {
+                listenerRegistration = reg
+                if (!listenerAttached) {
+                    listenerAttached = true
+                    metricsTracker.recordFirestoreListenerAttached()
+                }
+            }
         } catch (e: Exception) {
             val category = FirestoreRequestGuard.recordListenerFailure(e)
             Log.e(TAG, "Unable to attach notice listener", e)
@@ -151,16 +197,18 @@ class NoticeManager private constructor(private val context: Context) {
     }
 
     fun retryNotices() {
-        listenerRegistration?.remove()
-        listenerRegistration = null
+        synchronized(listenerLock) {
+            detachListenerLocked()
+            lastNoticeFetchAtMs = 0L
+        }
         _noticeContent.value = NoticeContent()
-        startNoticeListener()
+        startNoticeListener(force = true)
     }
 
     fun showNotice() {
         sessionDismissed = false
         _isNoticeVisible.value = true
-        startNoticeListener()
+        startNoticeListener(force = false)
     }
 
     fun dismissNotice() {
@@ -231,8 +279,10 @@ class NoticeManager private constructor(private val context: Context) {
     }
 
     fun clearCacheForTesting() {
-        listenerRegistration?.remove()
-        listenerRegistration = null
+        synchronized(listenerLock) {
+            detachListenerLocked()
+            lastNoticeFetchAtMs = 0L
+        }
         prefs.edit().clear().apply()
         sessionDismissed = false
         countryOverrideForTesting = null
@@ -247,6 +297,7 @@ class NoticeManager private constructor(private val context: Context) {
         private const val KEY_CACHED_COUNTRY = "cached_country_code"
         private const val KEY_CACHE_TIME = "cached_country_timestamp"
         private const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L
+        private const val NOTICE_CACHE_TTL_MS = 15 * 60 * 1000L
         private const val DEFAULT_COUNTRY = "US"
         private const val TAG = "NoticeManager"
         private const val NOTICES_COLLECTION = "notices"

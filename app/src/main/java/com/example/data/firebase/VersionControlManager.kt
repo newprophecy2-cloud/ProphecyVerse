@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.example.BuildConfig
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.google.firebase.FirebaseApp
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
@@ -167,6 +168,7 @@ sealed class ApkDownloadState {
 }
 
 class VersionControlManager private constructor(private val context: Context) {
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val scope = CoroutineScope(Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
@@ -177,9 +179,10 @@ class VersionControlManager private constructor(private val context: Context) {
     private val _versionState = MutableStateFlow<VersionCheckState>(VersionCheckState.Checking)
     val versionState: StateFlow<VersionCheckState> = _versionState.asStateFlow()
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private var networkCallbackRegistered = false
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            checkForUpdates()
+            checkForUpdates(force = false)
         }
     }
 
@@ -187,9 +190,21 @@ class VersionControlManager private constructor(private val context: Context) {
         readCachedVerification()?.let { _versionState.value = it }
         try {
             connectivityManager?.registerDefaultNetworkCallback(networkCallback)
+            networkCallbackRegistered = true
         } catch (e: Exception) {
             Log.w(TAG, "Could not register background version-refresh callback", e)
         }
+    }
+
+    fun stopMonitoring() {
+        if (networkCallbackRegistered) {
+            runCatching { connectivityManager?.unregisterNetworkCallback(networkCallback) }
+            networkCallbackRegistered = false
+        }
+        activeCheckJob?.cancel()
+        activeCheckJob = null
+        activeDownloadJob?.cancel()
+        activeDownloadJob = null
     }
 
     private val _apkDownloadState = MutableStateFlow<ApkDownloadState>(ApkDownloadState.Idle)
@@ -220,9 +235,21 @@ class VersionControlManager private constructor(private val context: Context) {
         )
     }
 
-
-    fun checkForUpdates() {
-        if (activeCheckJob?.isActive == true) return
+    fun checkForUpdates(force: Boolean = false) {
+        if (activeCheckJob?.isActive == true) {
+            metricsTracker.recordDuplicateRequestPrevented()
+            return
+        }
+        if (!force) {
+            val freshCached = readFreshCachedVerification()
+            if (freshCached != null) {
+                if (_versionState.value != freshCached) {
+                    _versionState.value = freshCached
+                }
+                metricsTracker.recordFirestoreCacheHit()
+                return
+            }
+        }
         activeCheckJob = scope.launch {
             val startedAt = SystemClock.elapsedRealtime()
             logVersionCheck("START", startedAt)
@@ -241,6 +268,8 @@ class VersionControlManager private constructor(private val context: Context) {
                     _versionState.value = verificationFailureFallback(readCachedVerification(), getDefaultConfig())
                     return@launch
                 }
+                metricsTracker.recordFirestoreQuery(if (snapshot.exists()) 1L else 0L)
+                metricsTracker.recordFirestoreRead(1L)
                 if (!snapshot.exists()) {
                     logVersionCheck("FAILED", startedAt, message = "DOCUMENT_NOT_FOUND")
                     _versionState.value = readCachedVerification()
@@ -556,6 +585,7 @@ class VersionControlManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "VersionControlManager"
+        private const val VERSION_CHECK_TTL_MS = 6 * 60 * 60 * 1000L
 
         @Volatile
         private var instance: VersionControlManager? = null
@@ -607,7 +637,19 @@ class VersionControlManager private constructor(private val context: Context) {
             .putString("downloads", downloads.toString()).putString("notesBn", config.releaseNotes.bn)
             .putString("notesEn", config.releaseNotes.en).putString("sha256", config.sha256)
             .putString("cert", config.signingCertificateSha256).putLong("updated", config.updatedAt)
-            .putString("updatedBy", config.updatedBy).apply()
+            .putString("updatedBy", config.updatedBy)
+            .putLong("checkedAt", System.currentTimeMillis())
+            .putInt("installedCode", currentVersionCode)
+            .apply()
+    }
+
+    private fun readFreshCachedVerification(now: Long = System.currentTimeMillis()): VersionCheckState? {
+        val prefs = context.getSharedPreferences("version_control_verification", Context.MODE_PRIVATE)
+        val checkedAt = prefs.getLong("checkedAt", 0L)
+        val installedCode = prefs.getInt("installedCode", -1)
+        if (checkedAt <= 0L || installedCode != currentVersionCode) return null
+        if (now - checkedAt >= VERSION_CHECK_TTL_MS) return null
+        return readCachedVerification()
     }
 
     private fun readCachedVerification(): VersionCheckState? = runCatching {

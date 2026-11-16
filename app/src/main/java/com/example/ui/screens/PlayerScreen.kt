@@ -152,7 +152,6 @@ fun PlayerScreen(
             anime?.format?.equals("MOVIE", ignoreCase = true) == true ||
             anime?.format?.equals("FILM", ignoreCase = true) == true
     val isResolving by viewModel.isResolving.collectAsStateWithLifecycle()
-    val resolutionStage by viewModel.resolutionStage.collectAsStateWithLifecycle()
     val resolutionError by viewModel.resolutionError.collectAsStateWithLifecycle()
 
     val isPlaying by viewModel.playerManager.isPlaying.collectAsStateWithLifecycle()
@@ -408,8 +407,7 @@ fun PlayerScreen(
             LoadingAndBufferingOverlay(
                 isResolving = isResolving,
                 isBuffering = isBuffering,
-                isInPipMode = isInPipMode,
-                resolvingMessage = resolutionStage.label
+                isInPipMode = isInPipMode
             )
 
             ErrorOverlay(
@@ -578,8 +576,7 @@ fun PlayerScreen(
                 LoadingAndBufferingOverlay(
                     isResolving = isResolving,
                     isBuffering = isBuffering,
-                    isInPipMode = isInPipMode,
-                    resolvingMessage = resolutionStage.label
+                    isInPipMode = isInPipMode
                 )
 
                 ErrorOverlay(
@@ -1200,31 +1197,32 @@ private fun VideoSurface(playerInstance: androidx.media3.exoplayer.ExoPlayer?) {
 }
 
 @Composable
-private fun LoadingAndBufferingOverlay(
+internal fun LoadingAndBufferingOverlay(
     isResolving: Boolean,
     isBuffering: Boolean,
-    isInPipMode: Boolean,
-    resolvingMessage: String = ""
+    isInPipMode: Boolean
 ) {
     if ((isResolving || isBuffering) && !isInPipMode) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = if (isResolving) 0.8f else 0.3f)),
+                .background(Color.Black.copy(alpha = if (isResolving) 0.78f else 0.35f))
+                .testTag("player_loading_overlay"),
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(color = AccentCyan, strokeWidth = 3.dp)
+                CircularProgressIndicator(
+                    color = AccentCyan,
+                    strokeWidth = 3.dp,
+                    modifier = Modifier.testTag("player_loading_spinner")
+                )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = if (isResolving) {
-                        resolvingMessage.ifBlank { "Resolving playback..." }
-                    } else {
-                        "Buffering..."
-                    },
+                    text = "Loading",
                     color = Color.White,
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.testTag("player_loading_text")
                 )
             }
         }
@@ -1232,7 +1230,7 @@ private fun LoadingAndBufferingOverlay(
 }
 
 @Composable
-private fun ErrorOverlay(
+internal fun ErrorOverlay(
     resolutionError: String?,
     playerError: String?,
     isResolving: Boolean,
@@ -1247,7 +1245,8 @@ private fun ErrorOverlay(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.85f)),
+                .background(Color.Black.copy(alpha = 0.85f))
+                .testTag("player_error_overlay"),
             contentAlignment = Alignment.Center
         ) {
             Column(
@@ -1647,11 +1646,10 @@ private fun PlayerControlsOverlay(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val timeText = when {
-                            dur > 0 -> "${formatMillis(pos)} / ${formatMillis(dur)}"
-                            isResolving || isBuffering -> "${formatMillis(pos)} / Loading..."
-                            isPlaying -> "${formatMillis(pos)} / Loading..."
-                            else -> "${formatMillis(pos)} / Loading..."
+                        val timeText = if (dur > 0) {
+                            "${formatMillis(pos)} / ${formatMillis(dur)}"
+                        } else {
+                            "${formatMillis(pos)} / --:--"
                         }
                         Text(
                             text = timeText,

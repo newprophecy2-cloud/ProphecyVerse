@@ -2,6 +2,7 @@ package com.example.player
 
 import android.util.Log
 import com.example.data.local.EpisodeEntry
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.repository.AnimeRepository
@@ -32,15 +33,20 @@ import kotlinx.coroutines.withTimeout
 import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentHashMap
 
-/** Serialized, bounded-concurrency priority pre-resolve worker. Signed URLs stay memory-only. */
+/** Serialized, bounded-concurrency Next-10 rolling pre-resolve worker. Signed URLs stay memory-only. */
 @OptIn(ExperimentalCoroutinesApi::class)
-class PreResolveQueueManager(private val repository: AnimeRepository, private val scope: CoroutineScope) {
+class PreResolveQueueManager(
+    private val repository: AnimeRepository,
+    private val scope: CoroutineScope,
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
+) {
     companion object {
         private const val TAG = "PreResolveQueueManager"
         const val CACHE_TTL_MS = 25 * 60 * 1000L
         const val MAX_ATTEMPTS = 2
         const val RETRY_DELAY_MS = 3_000L
         const val MAX_BACKGROUND_CONCURRENCY = 2
+        private const val MAX_PREPARED_CACHE_ENTRIES = 16
         fun identity(backendAnimeId: String, episode: EpisodeEntry): String =
             EpisodeSourceCacheIdentity.key(backendAnimeId, episode.seasonNumber, episode.id)
         fun completionStatus(verifiedPlayable: Boolean): ResolutionStatus =
@@ -71,7 +77,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         val directData: DirectPlayData,
         val resolvedAtMs: Long,
         val candidates: List<ProphecySourceDto> = listOf(source),
-        val providerId: String = ContentIdentityHelper.deterministicProviderId(source.label)
+        val providerId: String = ContentIdentityHelper.deterministicProviderId(source.label),
+        val episodeNumber: Int = 0
     ) {
         fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean =
             nowMs - resolvedAtMs > CACHE_TTL_MS || SourceExpiryTime.isExpired(directData.expiresAt, nowMs)
@@ -100,17 +107,51 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
     }
 
+    private fun isPreparedValidForSelection(
+        prepared: PreparedEpisode,
+        backendAnimeId: String,
+        seasonNumber: Int,
+        episodeId: String,
+        preferredSourceId: String? = null,
+        preferredProviderId: String? = null
+    ): Boolean {
+        if (prepared.isExpired()) return false
+        val expectedProviderId = ContentIdentityHelper.deterministicProviderId(prepared.source.label)
+        if (prepared.backendAnimeId != backendAnimeId ||
+            prepared.episodeId != episodeId ||
+            prepared.seasonNumber != seasonNumber ||
+            prepared.providerId != expectedProviderId
+        ) {
+            return false
+        }
+        val normPrefSource = SourceIdentityValidator.normalizeId(preferredSourceId)
+        if (normPrefSource.isNotEmpty() &&
+            !SourceIdentityValidator.normalizedIdsEqual(prepared.source.id, normPrefSource)
+        ) {
+            return false
+        }
+        val normPrefProvider = SourceIdentityValidator.normalizeId(preferredProviderId)
+        if (normPrefProvider.isNotEmpty() &&
+            !SourceIdentityValidator.normalizedIdsEqual(prepared.providerId, normPrefProvider)
+        ) {
+            return false
+        }
+        return SourceIdentityValidator.validateDirectPlayData(prepared.directData, prepared.source.id).isValid
+    }
+
     /**
-     * Queue the next 17 canonical episodes and previous 6 episodes in the same season.
-     * Priority: Next 7 (tier 0) -> Following 10 (tier 1) -> Previous 6 (tier 2).
-     * One slow or retrying item never stalls other ready slots in lower positions/tiers.
+     * Queue the next 10 canonical episodes in the same season relative to [currentEpisode].
+     * Priority: Next 4 (tier 0) -> Following 6 (tier 1).
+     * Never queues [currentEpisode] or crosses season boundaries.
      * Movies and invalid episode entries are excluded.
      */
     fun slideWindow(
         animeId: String,
         currentEpisode: EpisodeEntry,
         allEpisodes: List<EpisodeEntry>,
-        isMovie: Boolean = false
+        isMovie: Boolean = false,
+        preferredSourceId: String? = null,
+        preferredProviderId: String? = null
     ) {
         if (animeId.isBlank() || currentEpisode.id.isBlank() ||
             isMovie || currentEpisode.seasonNumber <= 0 || currentEpisode.id.startsWith("movie_")
@@ -118,69 +159,78 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
             clear()
             return
         }
+        val currentKey = identity(animeId, currentEpisode)
+        val normPrefSource = SourceIdentityValidator.normalizeId(preferredSourceId).takeIf { it.isNotEmpty() }
+        val normPrefProvider = SourceIdentityValidator.normalizeId(preferredProviderId).takeIf { it.isNotEmpty() }
+
         val upcoming = PreResolvePlan.upcoming(currentEpisode, allEpisodes)
-        val previous = PreResolvePlan.previous(currentEpisode, allEpisodes)
         val fastTier = upcoming.take(PreResolvePlan.FAST_WINDOW_SIZE)
         val backgroundTier = upcoming.drop(PreResolvePlan.FAST_WINDOW_SIZE)
 
         val scheduledList = buildList {
             val seen = HashSet<String>()
+            seen.add(currentKey)
             fastTier.forEachIndexed { idx, ep ->
                 val k = identity(animeId, ep)
-                if (ep.id.isNotBlank() && seen.add(k)) {
+                if (ep.id.isNotBlank() && ep.seasonNumber == currentEpisode.seasonNumber && seen.add(k)) {
                     add(ScheduledTask(key = k, episode = ep, tierRank = 0, sequenceOrder = idx))
                 }
             }
             backgroundTier.forEachIndexed { idx, ep ->
                 val k = identity(animeId, ep)
-                if (ep.id.isNotBlank() && seen.add(k)) {
+                if (ep.id.isNotBlank() && ep.seasonNumber == currentEpisode.seasonNumber && seen.add(k)) {
                     add(ScheduledTask(key = k, episode = ep, tierRank = 1, sequenceOrder = idx))
-                }
-            }
-            previous.forEachIndexed { idx, ep ->
-                val k = identity(animeId, ep)
-                if (ep.id.isNotBlank() && seen.add(k)) {
-                    add(ScheduledTask(key = k, episode = ep, tierRank = 2, sequenceOrder = idx))
                 }
             }
         }
 
         val signature = buildString {
-            append(animeId).append('|').append(identity(animeId, currentEpisode)).append('|')
-            append(upcoming.joinToString(",") { identity(animeId, it) }).append('|')
-            append(previous.joinToString(",") { identity(animeId, it) })
+            append(animeId).append('|').append(currentKey).append('|')
+            append(normPrefSource.orEmpty()).append('|').append(normPrefProvider.orEmpty()).append('|')
+            append(upcoming.joinToString(",") { identity(animeId, it) })
         }
         if (signature == lastWindowSignature && workerJob?.isActive == true) return
         lastWindowSignature = signature
         val generation = ++queueGeneration
+        workerJob?.cancel()
+
+        // Evict entries belonging to another anime or expired entries, keeping current window warm
+        val activeWindowKeys = scheduledList.mapTo(HashSet()) { it.key }
+        preparedCache.entries.removeIf { (key, entry) ->
+            entry.isExpired() ||
+                entry.backendAnimeId != animeId ||
+                entry.seasonNumber != currentEpisode.seasonNumber ||
+                (preparedCache.size > MAX_PREPARED_CACHE_ENTRIES && key !in activeWindowKeys && key != currentKey)
+        }
+
         if (scheduledList.isEmpty()) {
-            workerJob?.cancel()
             workerJob = null
-            updateStatuses { statuses ->
-                statuses.mapValues { (_, state) ->
-                    if (state == ResolutionStatus.RESOLVING || state == ResolutionStatus.QUEUED) ResolutionStatus.RETRY_PENDING else state
-                }
-            }
+            metricsTracker.recordPreloadCycle(0L)
+            _queueStatus.value = emptyMap()
             return
         }
-        workerJob?.cancel()
+
         val targetKeys = scheduledList.associateBy { it.key }
         val pendingTasks = ArrayList<ScheduledTask>(scheduledList.size)
         updateStatuses { prior ->
-            val next = prior.mapValues { (_, state) ->
-                if (state == ResolutionStatus.RESOLVING || state == ResolutionStatus.QUEUED) ResolutionStatus.RETRY_PENDING else state
-            }.toMutableMap()
+            val next = LinkedHashMap<String, ResolutionStatus>(targetKeys.size)
             targetKeys.forEach { (key, task) ->
                 val prepared = preparedCache[key]
-                val validPrepared = prepared != null &&
-                    !prepared.isExpired() &&
-                    SourceIdentityValidator.validateDirectPlayData(prepared.directData, prepared.source.id).isValid
+                val validPrepared = prepared != null && isPreparedValidForSelection(
+                    prepared = prepared,
+                    backendAnimeId = animeId,
+                    seasonNumber = task.episode.seasonNumber,
+                    episodeId = task.episode.id,
+                    preferredSourceId = normPrefSource,
+                    preferredProviderId = normPrefProvider
+                )
                 if (validPrepared) {
                     next[key] = ResolutionStatus.VERIFIED_PLAYABLE
                 } else {
                     if (prepared != null) preparedCache.remove(key)
                     next[key] = when {
-                        prepared != null || prior[key] == ResolutionStatus.VERIFIED_PLAYABLE -> ResolutionStatus.EXPIRED
+                        prepared != null && prepared.isExpired() -> ResolutionStatus.EXPIRED
+                        prior[key] == ResolutionStatus.VERIFIED_PLAYABLE && prepared == null -> ResolutionStatus.EXPIRED
                         else -> ResolutionStatus.QUEUED
                     }
                     pendingTasks += task
@@ -191,9 +241,11 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
 
         if (pendingTasks.isEmpty()) {
             workerJob = null
+            metricsTracker.recordPreloadCycle(0L)
             return
         }
 
+        val d1ReadsBeforeCycle = metricsTracker.snapshot().d1Reads
         workerJob = scope.launch(queueDispatcher) {
             val queueLock = Any()
             val readyQueue = PriorityQueue<ScheduledTask>().apply { addAll(pendingTasks) }
@@ -231,23 +283,45 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                                     waitUntilBackgroundAllowed()
                                     if (!isActive || generation != queueGeneration) break
                                     val cached = preparedCache[task.key]
-                                    if (cached != null && !cached.isExpired()) {
-                                        updateStatusFor(task.key, ResolutionStatus.VERIFIED_PLAYABLE)
+                                    if (cached != null && isPreparedValidForSelection(
+                                            prepared = cached,
+                                            backendAnimeId = animeId,
+                                            seasonNumber = task.episode.seasonNumber,
+                                            episodeId = task.episode.id,
+                                            preferredSourceId = normPrefSource,
+                                            preferredProviderId = normPrefProvider
+                                        )
+                                    ) {
+                                        if (generation == queueGeneration) {
+                                            updateStatusForGeneration(generation, task.key, ResolutionStatus.VERIFIED_PLAYABLE)
+                                        }
                                         continue
                                     }
                                     if (cached != null) {
-                                        preparedCache.remove(task.key)
-                                        updateStatusFor(task.key, ResolutionStatus.EXPIRED)
+                                        preparedCache.remove(task.key, cached)
+                                        if (generation == queueGeneration && cached.isExpired()) {
+                                            updateStatusForGeneration(generation, task.key, ResolutionStatus.EXPIRED)
+                                        }
                                     }
-                                    updateStatusFor(
-                                        task.key,
-                                        if (task.attempt == 1) ResolutionStatus.RESOLVING else ResolutionStatus.RETRY_PENDING
+                                    if (generation == queueGeneration) {
+                                        updateStatusForGeneration(
+                                            generation,
+                                            task.key,
+                                            if (task.attempt == 1) ResolutionStatus.RESOLVING else ResolutionStatus.RETRY_PENDING
+                                        )
+                                    }
+                                    val resolved = preResolveEpisode(
+                                        animeId = animeId,
+                                        episode = task.episode,
+                                        expectedGeneration = generation,
+                                        preferredSourceId = normPrefSource,
+                                        preferredProviderId = normPrefProvider
                                     )
-                                    val resolved = preResolveEpisode(animeId, task.episode)
+                                    if (generation != queueGeneration) break
                                     if (resolved) {
-                                        updateStatusFor(task.key, ResolutionStatus.VERIFIED_PLAYABLE)
+                                        updateStatusForGeneration(generation, task.key, ResolutionStatus.VERIFIED_PLAYABLE)
                                     } else if (task.attempt < MAX_ATTEMPTS && isActive && generation == queueGeneration) {
-                                        updateStatusFor(task.key, ResolutionStatus.RETRY_PENDING)
+                                        updateStatusForGeneration(generation, task.key, ResolutionStatus.RETRY_PENDING)
                                         synchronized(queueLock) {
                                             pendingRetryCount++
                                         }
@@ -272,8 +346,8 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                                                 throw cancelled
                                             }
                                         }
-                                    } else {
-                                        updateStatusFor(task.key, ResolutionStatus.FAILED)
+                                    } else if (generation == queueGeneration) {
+                                        updateStatusForGeneration(generation, task.key, ResolutionStatus.FAILED)
                                     }
                                 } finally {
                                     synchronized(queueLock) {
@@ -287,6 +361,10 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                         }
                     }
                     workers.joinAll()
+                }
+                if (generation == queueGeneration) {
+                    val d1Delta = (metricsTracker.snapshot().d1Reads - d1ReadsBeforeCycle).coerceAtLeast(0L)
+                    metricsTracker.recordPreloadCycle(d1Delta)
                 }
             } catch (cancelled: CancellationException) {
                 if (generation == queueGeneration) {
@@ -303,18 +381,29 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
     }
 
-    private suspend fun preResolveEpisode(animeId: String, episode: EpisodeEntry): Boolean {
+    private suspend fun preResolveEpisode(
+        animeId: String,
+        episode: EpisodeEntry,
+        expectedGeneration: Long,
+        preferredSourceId: String? = null,
+        preferredProviderId: String? = null
+    ): Boolean {
         val key = identity(animeId, episode)
         return try {
             waitUntilBackgroundAllowed()
+            if (expectedGeneration != queueGeneration) return false
             withTimeout(35_000L) {
-                // Delegates through cache-first Room -> Firestore -> Backend discovery/resolve with background priority
+                // DB-first (Memory -> D1 -> existing Backend resolver fallback) with background priority
                 val verified = repository.resolveVerifiedPlaybackForEpisode(
                     animeOrBackendId = animeId,
                     episode = episode,
+                    preferredSourceId = preferredSourceId,
+                    preferredProviderId = preferredProviderId,
                     isForeground = false
                 ).getOrNull() ?: return@withTimeout false
-                updateStatusFor(key, ResolutionStatus.RESOLVED)
+                if (expectedGeneration != queueGeneration) return@withTimeout false
+
+                updateStatusForGeneration(expectedGeneration, key, ResolutionStatus.RESOLVED)
                 val direct = verified.directData
                 val validation = SourceIdentityValidator.validateDirectPlayData(direct, verified.source.id)
                 if (!validation.isValid) {
@@ -327,11 +416,16 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                     )
                     return@withTimeout false
                 }
+                if (preferredSourceId != null &&
+                    !SourceIdentityValidator.normalizedIdsEqual(verified.source.id, preferredSourceId)
+                ) {
+                    return@withTimeout false
+                }
                 val normDirect = direct.copy(sourceId = SourceIdentityValidator.normalizeId(direct.sourceId))
                 val normSource = SourceIdentityValidator.normalizeDto(verified.source)
                 val allCandidates = verified.candidates.map { SourceIdentityValidator.normalizeDto(it) }
                     .ifEmpty { listOf(normSource) }
-                preparedCache[key] = PreparedEpisode(
+                val candidatePrepared = PreparedEpisode(
                     backendAnimeId = animeId,
                     episodeId = episode.id,
                     seasonNumber = episode.seasonNumber,
@@ -339,8 +433,13 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
                     directData = normDirect,
                     resolvedAtMs = System.currentTimeMillis(),
                     candidates = allCandidates,
-                    providerId = ContentIdentityHelper.deterministicProviderId(normSource.label)
+                    providerId = ContentIdentityHelper.deterministicProviderId(normSource.label),
+                    episodeNumber = episode.episodeNumber
                 )
+                if (expectedGeneration != queueGeneration || candidatePrepared.isExpired()) {
+                    return@withTimeout false
+                }
+                preparedCache[key] = candidatePrepared
                 Log.i(TAG, "Prepared (${verified.cacheTier}) S${episode.seasonNumber} E${episode.episodeNumber}")
                 true
             }
@@ -352,20 +451,33 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         }
     }
 
-    fun getPreparedSource(backendAnimeId: String, episode: EpisodeEntry): PreparedEpisode? {
+    fun getPreparedSource(
+        backendAnimeId: String,
+        episode: EpisodeEntry,
+        preferredSourceId: String? = null,
+        preferredProviderId: String? = null
+    ): PreparedEpisode? {
         val key = identity(backendAnimeId, episode)
         val entry = preparedCache[key] ?: return null
-        val expectedProviderId = ContentIdentityHelper.deterministicProviderId(entry.source.label)
-        val matchesIdentity = entry.backendAnimeId == backendAnimeId &&
-            entry.episodeId == episode.id &&
-            entry.seasonNumber == episode.seasonNumber &&
-            entry.providerId == expectedProviderId &&
-            SourceIdentityValidator.validateDirectPlayData(entry.directData, entry.source.id).isValid
-        return if (matchesIdentity && !entry.isExpired()) {
+        val matchesIdentity = isPreparedValidForSelection(
+            prepared = entry,
+            backendAnimeId = backendAnimeId,
+            seasonNumber = episode.seasonNumber,
+            episodeId = episode.id,
+            preferredSourceId = preferredSourceId,
+            preferredProviderId = preferredProviderId
+        )
+        return if (matchesIdentity) {
             entry
         } else {
-            preparedCache.remove(key)
-            updateStatusFor(key, if (!matchesIdentity) ResolutionStatus.FAILED else ResolutionStatus.EXPIRED)
+            val mismatchPref = preferredSourceId?.let {
+                SourceIdentityValidator.normalizeId(it).isNotEmpty() &&
+                    !SourceIdentityValidator.normalizedIdsEqual(entry.source.id, it)
+            } == true
+            if (!mismatchPref) {
+                preparedCache.remove(key, entry)
+                updateStatusFor(key, if (entry.isExpired()) ResolutionStatus.EXPIRED else ResolutionStatus.FAILED)
+            }
             null
         }
     }
@@ -374,6 +486,12 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         val key = identity(backendAnimeId, episode)
         preparedCache.remove(key)
         updateStatusFor(key, ResolutionStatus.RETRY_PENDING)
+    }
+
+    private fun updateStatusForGeneration(expectedGeneration: Long, key: String, status: ResolutionStatus) {
+        updateStatuses { prior ->
+            if (queueGeneration == expectedGeneration) prior + (key to status) else prior
+        }
     }
 
     private fun updateStatusFor(key: String, status: ResolutionStatus) {

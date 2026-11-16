@@ -34,7 +34,7 @@ class ProphecyMessagingService : FirebaseMessagingService() {
         val data = remoteMessage.data
         val eventType = data["event_type"] ?: data["type"] ?: "announcement"
         when (eventType) {
-            "apk_update", "mandatory_update", "new_apk_version" -> VersionControlManager.getInstance(applicationContext).checkForUpdates()
+            "apk_update", "mandatory_update", "new_apk_version" -> VersionControlManager.getInstance(applicationContext).checkForUpdates(force = true)
             "account_status" -> if (AuthManager.getInstance(applicationContext).currentUid.isNotBlank()) Log.i(TAG, "Received account status notification")
         }
         val title = remoteMessage.notification?.title ?: data["title"] ?: when (eventType) {

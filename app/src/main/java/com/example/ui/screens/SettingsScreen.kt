@@ -293,7 +293,7 @@ fun SettingsScreen(
                 title = "🚀 Check for Updates",
                 value = "v${com.example.BuildConfig.VERSION_NAME} (Build ${com.example.BuildConfig.VERSION_CODE})",
                 onClick = {
-                    com.example.data.firebase.VersionControlManager.getInstance(context).checkForUpdates()
+                    com.example.data.firebase.VersionControlManager.getInstance(context).checkForUpdates(force = true)
                     Toast.makeText(context, "Checking for latest Prophecy Verse updates...", Toast.LENGTH_SHORT).show()
                 }
             )

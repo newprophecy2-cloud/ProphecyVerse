@@ -12,8 +12,10 @@ import com.google.firebase.Timestamp
 import com.google.firebase.firestore.Source
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
+import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.repository.TitleMatcher
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -27,14 +29,18 @@ class SharedCatalogRepository(
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
     private val now: () -> Long = System::currentTimeMillis,
     private val random: (Long) -> Long = { bound -> Random.nextLong(bound) },
-    private val networkAvailable: () -> Boolean = { true }
+    private val networkAvailable: () -> Boolean = { true },
+    private val metricsTracker: DatabaseMetricsTracker = DatabaseMetricsTracker.getInstance()
 ) {
     companion object {
         private const val MAX_BATCH = 20
         private const val MAX_RETRIES = 6
         private const val MAX_QUEUE = 500
+        private const val MAX_SEARCH_CACHE_ENTRIES = 48
+        private const val MAX_SEARCH_TOKEN_QUERIES = 2
         private const val TAG = "SharedCatalogRepository"
         private const val CACHE_READ_TTL = 6L * 60 * 60 * 1000
+        private const val SEARCH_CACHE_TTL_MS = 5L * 60 * 1000
         private val allowedMetadataFields = setOf(
             "documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
             "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl", "mediaType", "releaseYear", "genres",
@@ -58,6 +64,8 @@ class SharedCatalogRepository(
     }
 
     private val locks = ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+    private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SharedCatalogCacheEntry>>>()
+    private val inFlightSearches = ConcurrentHashMap<String, CompletableDeferred<List<SharedCatalogCacheEntry>>>()
 
     suspend fun readAnime(documentId: String, forceServer: Boolean = false) = read("shared_catalog_anime", documentId, forceServer)
     suspend fun readMovie(documentId: String, forceServer: Boolean = false) = read("shared_catalog_movies", documentId, forceServer)
@@ -66,70 +74,145 @@ class SharedCatalogRepository(
     suspend fun readGenre(documentId: String, forceServer: Boolean = false) = read("shared_catalog_genres", documentId, forceServer)
     suspend fun readCategory(documentId: String, forceServer: Boolean = false) = read("shared_catalog_categories", documentId, forceServer)
 
-    /** Firestore-first bounded prefix search. Playback/source fields are never queried or returned. */
+    /** Firestore-first bounded prefix search with TTL cache, single-flight dedup, and conditional token queries. */
     suspend fun searchTitles(query: String, limit: Long = 50): List<SharedCatalogCacheEntry> {
         val normalized = SharedCatalogMetadata.normalizeTitle(query)
+        val boundedLimit = limit.toInt().coerceIn(1, 50)
         if (normalized.isBlank() || !networkAvailable() || auth.currentUser == null) return emptyList()
-        return try {
-            val end = normalized + "\uf8ff"
-            val tokens = normalized.split(" ").filter { it.length >= 2 }.take(3)
-            val candidates = linkedMapOf<String, Pair<String, com.google.firebase.firestore.DocumentSnapshot>>()
-            listOf("shared_catalog_anime", "shared_catalog_movies").forEach { collection ->
-                val queries = buildList {
-                    add(firestore.collection(collection).orderBy("normalizedTitle").startAt(normalized).endAt(end).limit(limit))
-                    tokens.forEach { token -> add(firestore.collection(collection).whereArrayContains("searchKeywords", token).limit(limit)) }
-                }
-                queries.forEach { queryRef ->
-                    queryRef.get().await().documents.forEach { document -> candidates.putIfAbsent("$collection/${document.id}", collection to document) }
+
+        val cacheKey = "$normalized|$boundedLimit"
+        val currentMs = now()
+        searchCache[cacheKey]?.let { (cachedAt, cachedEntries) ->
+            if (currentMs - cachedAt < SEARCH_CACHE_TTL_MS) {
+                metricsTracker.recordFirestoreCacheHit()
+                metricsTracker.recordMemoryHit()
+                return cachedEntries
+            }
+            searchCache.remove(cacheKey)
+        }
+
+        while (true) {
+            val existing = inFlightSearches[cacheKey]
+            if (existing != null) {
+                metricsTracker.recordDuplicateRequestPrevented()
+                return existing.await()
+            }
+            val created = CompletableDeferred<List<SharedCatalogCacheEntry>>()
+            if (inFlightSearches.putIfAbsent(cacheKey, created) == null) {
+                return try {
+                    val computed = executeSearchTitles(normalized, boundedLimit)
+                    if (searchCache.size >= MAX_SEARCH_CACHE_ENTRIES) {
+                        val expiredTime = now() - SEARCH_CACHE_TTL_MS
+                        searchCache.entries.removeIf { it.value.first <= expiredTime }
+                        if (searchCache.size >= MAX_SEARCH_CACHE_ENTRIES) {
+                            searchCache.keys.firstOrNull()?.let { searchCache.remove(it) }
+                        }
+                    }
+                    searchCache[cacheKey] = now() to computed
+                    created.complete(computed)
+                    computed
+                } catch (cancelled: CancellationException) {
+                    created.cancel(cancelled)
+                    throw cancelled
+                } catch (e: Exception) {
+                    created.complete(emptyList())
+                    emptyList()
+                } finally {
+                    inFlightSearches.remove(cacheKey, created)
                 }
             }
-            candidates.values.mapNotNull { (collection, document) ->
-                        val data = document.data ?: return@mapNotNull null
-                        val type = data["contentType"] as? String ?: return@mapNotNull null
-                        val id = data["documentId"] as? String ?: return@mapNotNull null
-                        val backendId = data["backendId"] as? String ?: return@mapNotNull null
-                        val hash = data["metadataHash"] as? String ?: return@mapNotNull null
-                        if (document.id != id || collectionFor(type) != collection || data["source"] != SharedCatalogMetadata.SOURCE ||
-                            (data["schemaVersion"] as? Number)?.toInt() != SharedCatalogMetadata.SCHEMA_VERSION ||
-                            !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
-                            data["normalizedTitle"] !is String ||
-                            data["createdAt"] !is Timestamp || data["updatedAt"] !is Timestamp ||
-                            data["lastSyncedAt"] !is Timestamp) return@mapNotNull null
-                        val safe = JSONObject()
-                        listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
-                            "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl",
-                            "mediaType", "releaseYear", "genres", "titleEnglish", "titleRomaji", "titleNative", "alternativeTitles",
-                            "status", "durationMinutes", "seasonCount", "episodeCount", "metadataComplete", "source").forEach { key ->
-                            data[key]?.let { safe.put(key, it) }
-                        }
-                        SharedCatalogCacheEntry(id, type, data["canonicalId"] as? String, backendId,
-                            SharedCatalogMetadata.SCHEMA_VERSION, hash, safe.toString(), now()).also { dao.putCache(it) }
-                    }.sortedWith(compareBy<SharedCatalogCacheEntry> {
-                        val json = runCatching { JSONObject(it.payloadJson) }.getOrNull()
-                        val aliases = buildList {
-                            json?.optString("title")?.takeIf { it.isNotBlank() }?.let(::add)
-                            json?.optString("titleEnglish")?.takeIf { it.isNotBlank() }?.let(::add)
-                            json?.optString("titleRomaji")?.takeIf { it.isNotBlank() }?.let(::add)
-                            json?.optString("titleNative")?.takeIf { it.isNotBlank() }?.let(::add)
-                            json?.optJSONArray("alternativeTitles")?.let { array -> (0 until array.length()).map { array.optString(it) }.forEach(::add) }
-                        }
-                        TitleMatcher.rank(normalized, aliases)
-                    }.thenBy { it.documentId }).take(limit.toInt().coerceIn(1, 50))
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            emptyList()
         }
+    }
+
+    private suspend fun executeSearchTitles(normalized: String, boundedLimit: Int): List<SharedCatalogCacheEntry> {
+        val end = normalized + "\uf8ff"
+        val tokens = normalized.split(" ")
+            .filter { it.length >= 2 && it != normalized }
+            .distinct()
+            .take(MAX_SEARCH_TOKEN_QUERIES)
+        val candidates = linkedMapOf<String, Pair<String, com.google.firebase.firestore.DocumentSnapshot>>()
+        listOf("shared_catalog_anime", "shared_catalog_movies").forEach { collection ->
+            val prefixSnap = firestore.collection(collection)
+                .orderBy("normalizedTitle")
+                .startAt(normalized)
+                .endAt(end)
+                .limit(boundedLimit.toLong())
+                .get()
+                .await()
+            metricsTracker.recordFirestoreQuery(prefixSnap.documents.size.toLong())
+            metricsTracker.recordFirestoreRead(prefixSnap.documents.size.coerceAtLeast(1).toLong())
+            var collectionMatches = 0
+            prefixSnap.documents.forEach { document ->
+                if (candidates.putIfAbsent("$collection/${document.id}", collection to document) == null) {
+                    collectionMatches++
+                }
+            }
+            if (collectionMatches < boundedLimit) {
+                for (token in tokens) {
+                    if (collectionMatches >= boundedLimit) break
+                    val tokenSnap = firestore.collection(collection)
+                        .whereArrayContains("searchKeywords", token)
+                        .limit(boundedLimit.toLong())
+                        .get()
+                        .await()
+                    metricsTracker.recordFirestoreQuery(tokenSnap.documents.size.toLong())
+                    metricsTracker.recordFirestoreRead(tokenSnap.documents.size.coerceAtLeast(1).toLong())
+                    tokenSnap.documents.forEach { document ->
+                        if (candidates.putIfAbsent("$collection/${document.id}", collection to document) == null) {
+                            collectionMatches++
+                        }
+                    }
+                }
+            }
+        }
+        return candidates.values.mapNotNull { (collection, document) ->
+            val data = document.data ?: return@mapNotNull null
+            val type = data["contentType"] as? String ?: return@mapNotNull null
+            val id = data["documentId"] as? String ?: return@mapNotNull null
+            val backendId = data["backendId"] as? String ?: return@mapNotNull null
+            val hash = data["metadataHash"] as? String ?: return@mapNotNull null
+            if (document.id != id || collectionFor(type) != collection || data["source"] != SharedCatalogMetadata.SOURCE ||
+                (data["schemaVersion"] as? Number)?.toInt() != SharedCatalogMetadata.SCHEMA_VERSION ||
+                !SharedCatalogMetadata.hasStableIdentity(type, backendId, id) ||
+                data["normalizedTitle"] !is String ||
+                data["createdAt"] !is Timestamp || data["updatedAt"] !is Timestamp ||
+                data["lastSyncedAt"] !is Timestamp) return@mapNotNull null
+            val safe = JSONObject()
+            listOf("documentId", "canonicalId", "backendId", "contentType", "schemaVersion", "metadataHash",
+                "title", "normalizedTitle", "searchKeywords", "description", "posterUrl", "bannerUrl",
+                "mediaType", "releaseYear", "genres", "titleEnglish", "titleRomaji", "titleNative", "alternativeTitles",
+                "status", "durationMinutes", "seasonCount", "episodeCount", "metadataComplete", "source").forEach { key ->
+                data[key]?.let { safe.put(key, it) }
+            }
+            SharedCatalogCacheEntry(id, type, data["canonicalId"] as? String, backendId,
+                SharedCatalogMetadata.SCHEMA_VERSION, hash, safe.toString(), now()).also { dao.putCache(it) }
+        }.sortedWith(compareBy<SharedCatalogCacheEntry> {
+            val json = runCatching { JSONObject(it.payloadJson) }.getOrNull()
+            val aliases = buildList {
+                json?.optString("title")?.takeIf { it.isNotBlank() }?.let(::add)
+                json?.optString("titleEnglish")?.takeIf { it.isNotBlank() }?.let(::add)
+                json?.optString("titleRomaji")?.takeIf { it.isNotBlank() }?.let(::add)
+                json?.optString("titleNative")?.takeIf { it.isNotBlank() }?.let(::add)
+                json?.optJSONArray("alternativeTitles")?.let { array -> (0 until array.length()).map { array.optString(it) }.forEach(::add) }
+            }
+            TitleMatcher.rank(normalized, aliases)
+        }.thenBy { it.documentId }).take(boundedLimit)
     }
 
     /** Cache-first read. It only returns validated schema v1 docs, and never writes them over backend state. */
     suspend fun read(collection: String, documentId: String, forceServer: Boolean = false): SharedCatalogCacheEntry? {
         if (collection !in allowedCollections || documentId.isBlank()) return null
         val cached = dao.getCache(documentId)
-        if (!forceServer && cached != null && now() - (cached.lastSyncedAt ?: 0L) < CACHE_READ_TTL) return cached
+        if (!forceServer && cached != null && now() - (cached.lastSyncedAt ?: 0L) < CACHE_READ_TTL) {
+            metricsTracker.recordFirestoreCacheHit()
+            metricsTracker.recordRoomHit()
+            return cached
+        }
         if (!networkAvailable()) return cached
         return try {
             val snapshot = firestore.collection(collection).document(documentId).get().await()
+            metricsTracker.recordFirestoreQuery(if (snapshot.exists()) 1L else 0L)
+            metricsTracker.recordFirestoreRead(1L)
             if (!snapshot.exists()) return if (forceServer) null else cached
             val data = snapshot.data ?: return cached
             if (!data.keys.all { it in allowedMetadataFields } ||

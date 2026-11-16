@@ -58,9 +58,14 @@ import java.util.concurrent.atomic.AtomicLong
 @OptIn(UnstableApi::class)
 class PlayerManager(
     private val context: Context,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val metricsTracker: com.example.data.metrics.DatabaseMetricsTracker =
+        com.example.data.metrics.DatabaseMetricsTracker.getInstance()
 ) {
     private var exoPlayer: ExoPlayer? = null
+    private var activePlayerListener: Player.Listener? = null
+    private var activeAnalyticsListener: AnalyticsListener? = null
+    private var activeRebufferStartedAtMs: Long = 0L
     private var tickerJob: Job? = null
     private var playbackGeneration: Long = 0L
     private var activeSession: PlaybackSessionIdentity? = null
@@ -192,11 +197,133 @@ class PlayerManager(
     )
 
     /**
-     * Stops any previously active episode playback immediately before resolving a new episode/source,
-     * preventing overlapping audio or wasted background CDN transfer during transitions.
+     * Stops any previously active episode playback immediately before resolving a new episode/source
+     * while keeping the underlying ExoPlayer instance warm for instant episode switching.
      */
     fun stopActivePlaybackForSwitch() {
-        release(resetRetryBudget = true)
+        resetPlaybackStateForSwitch(resetRetryBudget = true)
+    }
+
+    private fun resetPlaybackStateForSwitch(resetRetryBudget: Boolean) {
+        playbackGeneration++
+        tickerJob?.cancel()
+        tickerJob = null
+        if (activeRebufferStartedAtMs > 0L) {
+            val dur = (MonotonicMetrics.nowMs() - activeRebufferStartedAtMs).coerceAtLeast(0L)
+            metricsTracker.recordBufferingEvent(dur)
+            activeRebufferStartedAtMs = 0L
+        }
+        networkTracker = null
+        healthMonitor = null
+        onRetryRequested = null
+        onPlaybackFailedCallback = null
+        onFailureSignalCallback = null
+        lastWorkingTrackSelectionParams = null
+        hasUnsupportedTrackError = false
+        if (resetRetryBudget) {
+            activeLogicalSessionKey = null
+        }
+        exoPlayer?.let { player ->
+            activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
+            activePlayerListener?.let { runCatching { player.removeListener(it) }; activePlayerListener = null }
+            activeAnalyticsListener?.let { runCatching { player.removeAnalyticsListener(it) }; activeAnalyticsListener = null }
+            runCatching {
+                player.stop()
+                player.clearMediaItems()
+            }
+        }
+        activeSession = null
+        _isPlaying.value = false
+        _isBuffering.value = false
+        _isPlaybackEnded.value = false
+        _healthState.value = PlaybackHealthState.IDLE
+        _currentPosition.value = 0L
+        _duration.value = 0L
+        _videoResolution.value = null
+        _activeAudioDecoder.value = null
+        _availableAudioTracks.value = emptyList()
+        _availableSubtitles.value = emptyList()
+        _availableQualities.value = emptyList()
+        _errorMessage.value = null
+    }
+
+    private fun getOrCreateExoPlayer(): ExoPlayer {
+        exoPlayer?.let { return it }
+        val renderersFactory = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink {
+                return DefaultAudioSink.Builder(context)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .build()
+            }
+
+            override fun buildAudioRenderers(
+                context: Context,
+                extensionRendererMode: Int,
+                mediaCodecSelector: MediaCodecSelector,
+                enableDecoderFallback: Boolean,
+                audioSink: AudioSink,
+                eventHandler: Handler,
+                eventListener: AudioRendererEventListener,
+                out: ArrayList<Renderer>
+            ) {
+                val ffmpegAvailable = isFfmpegLibraryAvailable()
+                val selectiveSelector = createSelectiveMediaCodecSelector(
+                    delegate = mediaCodecSelector,
+                    preferFfmpegForExtendedCodecs = ffmpegAvailable
+                )
+
+                out.add(
+                    MediaCodecAudioRenderer(
+                        context,
+                        selectiveSelector,
+                        enableDecoderFallback,
+                        eventHandler,
+                        eventListener,
+                        audioSink
+                    )
+                )
+
+                if (ffmpegAvailable) {
+                    try {
+                        out.add(
+                            FfmpegAudioRenderer(
+                                eventHandler,
+                                eventListener,
+                                audioSink
+                            )
+                        )
+                        Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "FFmpeg audio decoder registration failed: ${t.message}")
+                    }
+                } else {
+                    Log.w(TAG, "FFmpeg native library unavailable; falling back to platform audio decoders.")
+                }
+            }
+        }.apply {
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+            setEnableDecoderFallback(true)
+        }
+
+        val loadControl = buildDefaultLoadControl()
+        val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        val created = ExoPlayer.Builder(context, renderersFactory)
+            .setLoadControl(loadControl)
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+        exoPlayer = created
+        _exoPlayerInstance.value = created
+        return created
     }
 
     fun initializePlayer(
@@ -212,7 +339,7 @@ class PlayerManager(
         onFailureSignal: ((PlaybackFailureReason) -> Unit)? = null,
         cacheTier: String? = null
     ): ExoPlayer {
-        release(resetRetryBudget = !isRecoveryAttempt)
+        resetPlaybackStateForSwitch(resetRetryBudget = !isRecoveryAttempt)
         val cleanPlaybackUrl = directData.playbackUrl.trim()
         val generation = playbackGeneration
         activeSession = sessionIdentity
@@ -291,84 +418,9 @@ class PlayerManager(
             setConstantBitrateSeekingEnabled(true)
         }
 
-        val renderersFactory = object : DefaultRenderersFactory(context) {
-            override fun buildAudioSink(
-                context: Context,
-                enableFloatOutput: Boolean,
-                enableAudioTrackPlaybackParams: Boolean
-            ): AudioSink {
-                return DefaultAudioSink.Builder(context)
-                    .setEnableFloatOutput(enableFloatOutput)
-                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .build()
-            }
-
-            override fun buildAudioRenderers(
-                context: Context,
-                extensionRendererMode: Int,
-                mediaCodecSelector: MediaCodecSelector,
-                enableDecoderFallback: Boolean,
-                audioSink: AudioSink,
-                eventHandler: Handler,
-                eventListener: AudioRendererEventListener,
-                out: ArrayList<Renderer>
-            ) {
-                val ffmpegAvailable = isFfmpegLibraryAvailable()
-                val selectiveSelector = createSelectiveMediaCodecSelector(
-                    delegate = mediaCodecSelector,
-                    preferFfmpegForExtendedCodecs = ffmpegAvailable
-                )
-
-                // 1. Native platform MediaCodecAudioRenderer preserved for AAC, HE-AAC, MP3, Opus,
-                // FLAC, Vorbis, PCM, etc., while yielding FFmpeg-handled codecs (EAC3, AC3, DTS,
-                // TrueHD, WMA, ALAC) when FFmpeg native library is loaded.
-                out.add(
-                    MediaCodecAudioRenderer(
-                        context,
-                        selectiveSelector,
-                        enableDecoderFallback,
-                        eventHandler,
-                        eventListener,
-                        audioSink
-                    )
-                )
-
-                // 2. FFmpeg Audio Decoder extension for EAC3/EAC3-JOC, AC3, DTS, TrueHD, etc.
-                if (ffmpegAvailable) {
-                    try {
-                        out.add(
-                            FfmpegAudioRenderer(
-                                eventHandler,
-                                eventListener,
-                                audioSink
-                            )
-                        )
-                        Log.i(TAG, "FFmpeg software audio decoder registered in renderers pipeline.")
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "FFmpeg audio decoder registration failed: ${t.message}")
-                    }
-                } else {
-                    Log.w(TAG, "FFmpeg native library unavailable; falling back to platform audio decoders.")
-                }
-            }
-        }.apply {
-            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
-            setEnableDecoderFallback(true)
-        }
-
-        val loadControl = buildDefaultLoadControl()
-
-        val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
-            .setUsage(C.USAGE_MEDIA)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-            .build()
-
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
 
-        // Resolve container MIME type:
-        // Cloudflare R2 / S3 URLs and CDN token URLs often end with a hash or query string
-        // without a clear file extension, or return application/octet-stream.
-        // We explicitly detect HLS, DASH, MKV, MP4 from url_type, content_type, and URL patterns.
+        // Resolve container MIME type and build a per-stream MediaSource so headers never bleed across switches.
         val normalizedDirectData = if (cleanPlaybackUrl == directData.playbackUrl) {
             directData
         } else {
@@ -385,31 +437,27 @@ class PlayerManager(
         }
 
         val mediaItem = mediaItemBuilder.build()
+        val mediaSource = mediaSourceFactory.createMediaSource(mediaItem)
 
-        val player = ExoPlayer.Builder(context, renderersFactory)
-            .setMediaSourceFactory(mediaSourceFactory)
-            .setLoadControl(loadControl)
-            .setAudioAttributes(audioAttributes, true)
-            .setHandleAudioBecomingNoisy(true)
-            .build()
+        val player = getOrCreateExoPlayer()
 
-        _exoPlayerInstance.value = player
-        exoPlayer = player
-
-        player.addAnalyticsListener(object : AnalyticsListener {
+        val analyticsListener = object : AnalyticsListener {
             override fun onAudioDecoderInitialized(
                 eventTime: AnalyticsListener.EventTime,
                 decoderName: String,
                 initializedTimestampMs: Long,
                 initializationDurationMs: Long
             ) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
                 Log.i(TAG, "Audio decoder initialized: $decoderName init_ms=${initializationDurationMs} provider=$providerDiagnostic")
                 _activeAudioDecoder.value = decoderName
                 _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderName)
             }
-        })
+        }
+        activeAnalyticsListener = analyticsListener
+        player.addAnalyticsListener(analyticsListener)
 
-        player.addListener(object : Player.Listener {
+        val playerListener = object : Player.Listener {
             override fun onEvents(player: Player, events: Player.Events) {
                 if (generation != playbackGeneration || player !== exoPlayer) return
                 val dur = player.duration
@@ -427,11 +475,15 @@ class PlayerManager(
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
                         _isBuffering.value = true
-                        healthMonitor?.onPlayerBufferingState()
-                        healthMonitor?.let { mon ->
+                        val mon = healthMonitor
+                        if (mon?.hasBecomeReady == true && activeRebufferStartedAtMs == 0L) {
+                            activeRebufferStartedAtMs = MonotonicMetrics.nowMs()
+                        }
+                        mon?.onPlayerBufferingState()
+                        mon?.let {
                             _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
-                                rebufferCount = mon.rebufferCount,
-                                totalRebufferMs = mon.currentTotalRebufferDurationMs()
+                                rebufferCount = it.rebufferCount,
+                                totalRebufferMs = it.currentTotalRebufferDurationMs()
                             )
                         }
                     }
@@ -439,6 +491,11 @@ class PlayerManager(
                         _isBuffering.value = false
                         val mon = healthMonitor
                         val firstReadyTransition = mon != null && !mon.hasBecomeReady
+                        if (activeRebufferStartedAtMs > 0L) {
+                            val rebufMs = (MonotonicMetrics.nowMs() - activeRebufferStartedAtMs).coerceAtLeast(0L)
+                            metricsTracker.recordBufferingEvent(rebufMs)
+                            activeRebufferStartedAtMs = 0L
+                        }
                         mon?.markReady()
                         _healthState.value = PlaybackHealthState.IDLE
                         sessionRetryTracker.onReadyStateReached()
@@ -453,6 +510,9 @@ class PlayerManager(
                             (MonotonicMetrics.nowMs() - prepareStartedAtMs).coerceAtLeast(0L)
                         } else {
                             _playbackDiagnostics.value.startupToReadyMs
+                        }
+                        if (firstReadyTransition && startupMs != null) {
+                            metricsTracker.recordPlaybackStartLatency(startupMs)
                         }
                         // Retry budget belongs to the logical playback session; NEVER reset on STATE_READY.
                         val currentDiag = _playbackDiagnostics.value.copy(
@@ -642,17 +702,23 @@ class PlayerManager(
                     }
                 }
             }
-        })
+        }
+        activePlayerListener = playerListener
+        player.addListener(playerListener)
 
-        // Configure playback parameters and media item after listeners are registered
+        // Configure playback parameters and media source after listeners are registered
         player.playWhenReady = true
         player.volume = 1.0f
         val preferredLangs = com.example.data.preferences.AudioPreferences.getInstance(context).getPreferredAudioLanguageCodes()
         player.trackSelectionParameters = player.trackSelectionParameters
             .buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
             .setPreferredAudioLanguages(*preferredLangs.toTypedArray())
             .build()
-        player.setMediaItem(mediaItem, startPositionMs)
+        player.setMediaSource(mediaSource, startPositionMs)
         player.prepare()
         player.play()
 
@@ -868,39 +934,12 @@ class PlayerManager(
     }
 
     fun release(resetRetryBudget: Boolean = true) {
-        playbackGeneration++
-        tickerJob?.cancel()
-        tickerJob = null
-        networkTracker = null
-        healthMonitor = null
-        onRetryRequested = null
-        onPlaybackFailedCallback = null
-        onFailureSignalCallback = null
-        lastWorkingTrackSelectionParams = null
-        hasUnsupportedTrackError = false
-        if (resetRetryBudget) {
-            activeLogicalSessionKey = null
-        }
+        resetPlaybackStateForSwitch(resetRetryBudget = resetRetryBudget)
         exoPlayer?.let { player ->
-            activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
-            runCatching { player.stop() }
             runCatching { player.release() }
         }
         exoPlayer = null
-        activeSession = null
         _exoPlayerInstance.value = null
-        _isPlaying.value = false
-        _isBuffering.value = false
-        _isPlaybackEnded.value = false
-        _healthState.value = PlaybackHealthState.IDLE
-        _currentPosition.value = 0L
-        _duration.value = 0L
-        _videoResolution.value = null
-        _activeAudioDecoder.value = null
-        _availableAudioTracks.value = emptyList()
-        _availableSubtitles.value = emptyList()
-        _availableQualities.value = emptyList()
-        _errorMessage.value = null
     }
 
     private fun buildLogicalSessionKey(session: PlaybackSessionIdentity?, sourceId: String): String {

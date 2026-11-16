@@ -28,7 +28,32 @@ class DatabaseMetricsTracker {
         val apiFailures: Long,
         val duplicateRequestsPrevented: Long,
         val roomWrites: Long = 0L,
-        val roomWriteSkipsUnchanged: Long = 0L
+        val roomWriteSkipsUnchanged: Long = 0L,
+        // Expanded D1 & Resolver telemetry
+        val d1CacheHits: Long = 0L,
+        val d1CacheMisses: Long = 0L,
+        val d1FallbackLookups: Long = 0L,
+        val d1PreloadCycles: Long = 0L,
+        val d1PreloadCycleReads: Long = 0L,
+        val resolverInvocations: Long = 0L,
+        val resolverLatencyTotalMs: Long = 0L,
+        // Expanded Firestore telemetry
+        val firestoreQueryCount: Long = 0L,
+        val firestoreDocumentsReturned: Long = 0L,
+        val firestoreListenerEvents: Long = 0L,
+        val firestoreActiveListeners: Long = 0L,
+        val firestoreFullSyncCount: Long = 0L,
+        val firestoreIncrementalSyncCount: Long = 0L,
+        val firestoreCacheHits: Long = 0L,
+        // Expanded Playback & Ready Queue telemetry
+        val readyQueueHits: Long = 0L,
+        val readyQueueMisses: Long = 0L,
+        val episodeSwitchPrepCount: Long = 0L,
+        val episodeSwitchPrepTotalMs: Long = 0L,
+        val playbackStartLatencyCount: Long = 0L,
+        val playbackStartLatencyTotalMs: Long = 0L,
+        val bufferingEvents: Long = 0L,
+        val bufferingDurationTotalMs: Long = 0L
     ) {
         val memoryHitRate: Double
             get() {
@@ -47,6 +72,24 @@ class DatabaseMetricsTracker {
                 val hits = memoryCacheHits + roomCacheHits
                 val total = hits + roomCacheMisses
                 return if (total == 0L) 0.0 else hits.toDouble() / total.toDouble()
+            }
+
+        val d1ReadsPerPreloadCycle: Double
+            get() = if (d1PreloadCycles <= 0L) 0.0 else d1PreloadCycleReads.toDouble() / d1PreloadCycles.toDouble()
+
+        val resolverAverageLatencyMs: Long
+            get() = if (resolverInvocations <= 0L) 0L else resolverLatencyTotalMs / resolverInvocations
+
+        val episodeSwitchPrepAverageMs: Long
+            get() = if (episodeSwitchPrepCount <= 0L) 0L else episodeSwitchPrepTotalMs / episodeSwitchPrepCount
+
+        val playbackStartLatencyAverageMs: Long
+            get() = if (playbackStartLatencyCount <= 0L) 0L else playbackStartLatencyTotalMs / playbackStartLatencyCount
+
+        val readyQueueHitRate: Double
+            get() {
+                val total = readyQueueHits + readyQueueMisses
+                return if (total == 0L) 0.0 else readyQueueHits.toDouble() / total.toDouble()
             }
     }
 
@@ -72,6 +115,31 @@ class DatabaseMetricsTracker {
     private val duplicateRequestsPrevented = AtomicLong(0L)
     private val roomWrites = AtomicLong(0L)
     private val roomWriteSkipsUnchanged = AtomicLong(0L)
+
+    private val d1CacheHits = AtomicLong(0L)
+    private val d1CacheMisses = AtomicLong(0L)
+    private val d1FallbackLookups = AtomicLong(0L)
+    private val d1PreloadCycles = AtomicLong(0L)
+    private val d1PreloadCycleReads = AtomicLong(0L)
+    private val resolverInvocations = AtomicLong(0L)
+    private val resolverLatencyTotalMs = AtomicLong(0L)
+
+    private val firestoreQueryCount = AtomicLong(0L)
+    private val firestoreDocumentsReturned = AtomicLong(0L)
+    private val firestoreListenerEvents = AtomicLong(0L)
+    private val firestoreActiveListeners = AtomicLong(0L)
+    private val firestoreFullSyncCount = AtomicLong(0L)
+    private val firestoreIncrementalSyncCount = AtomicLong(0L)
+    private val firestoreCacheHits = AtomicLong(0L)
+
+    private val readyQueueHits = AtomicLong(0L)
+    private val readyQueueMisses = AtomicLong(0L)
+    private val episodeSwitchPrepCount = AtomicLong(0L)
+    private val episodeSwitchPrepTotalMs = AtomicLong(0L)
+    private val playbackStartLatencyCount = AtomicLong(0L)
+    private val playbackStartLatencyTotalMs = AtomicLong(0L)
+    private val bufferingEvents = AtomicLong(0L)
+    private val bufferingDurationTotalMs = AtomicLong(0L)
 
     fun recordD1Read(rowsReturned: Int = 0, durationMs: Long = 0L) {
         d1Reads.incrementAndGet()
@@ -99,8 +167,77 @@ class DatabaseMetricsTracker {
         if (durationMs >= 0L) d1TotalLatencyMs.addAndGet(durationMs)
     }
 
+    fun recordD1CacheHit() {
+        d1CacheHits.incrementAndGet()
+    }
+
+    fun recordD1CacheMiss() {
+        d1CacheMisses.incrementAndGet()
+    }
+
+    fun recordD1FallbackLookup() {
+        d1FallbackLookups.incrementAndGet()
+    }
+
+    fun recordPreloadCycle(d1ReadsDelta: Long = 0L) {
+        d1PreloadCycles.incrementAndGet()
+        if (d1ReadsDelta > 0L) d1PreloadCycleReads.addAndGet(d1ReadsDelta)
+    }
+
+    fun recordResolverInvocation(durationMs: Long = 0L) {
+        resolverInvocations.incrementAndGet()
+        if (durationMs >= 0L) {
+            resolverLatencyTotalMs.addAndGet(durationMs)
+            MonotonicMetrics.recordValue("resolver_invocation_ms", durationMs)
+        }
+    }
+
     fun recordFirestoreRead(count: Long = 1L) {
         firestoreReads.addAndGet(count.coerceAtLeast(1L))
+    }
+
+    fun recordFirestoreQuery(documentsReturned: Long = 0L) {
+        firestoreQueryCount.incrementAndGet()
+        if (documentsReturned > 0L) {
+            firestoreDocumentsReturned.addAndGet(documentsReturned)
+        }
+    }
+
+    fun recordFirestoreDocumentsReturned(count: Long = 1L) {
+        if (count > 0L) firestoreDocumentsReturned.addAndGet(count)
+    }
+
+    fun recordFirestoreListenerAttached() {
+        firestoreActiveListeners.incrementAndGet()
+    }
+
+    fun recordFirestoreListenerDetached() {
+        firestoreActiveListeners.updateAndGet { (it - 1L).coerceAtLeast(0L) }
+    }
+
+    fun recordFirestoreListenerEvent(documentsReturned: Long = 0L) {
+        firestoreListenerEvents.incrementAndGet()
+        if (documentsReturned > 0L) {
+            firestoreDocumentsReturned.addAndGet(documentsReturned)
+        }
+    }
+
+    fun recordFirestoreFullSync(documentsReturned: Long = 0L) {
+        firestoreFullSyncCount.incrementAndGet()
+        if (documentsReturned > 0L) {
+            firestoreDocumentsReturned.addAndGet(documentsReturned)
+        }
+    }
+
+    fun recordFirestoreIncrementalSync(documentsReturned: Long = 0L) {
+        firestoreIncrementalSyncCount.incrementAndGet()
+        if (documentsReturned > 0L) {
+            firestoreDocumentsReturned.addAndGet(documentsReturned)
+        }
+    }
+
+    fun recordFirestoreCacheHit() {
+        firestoreCacheHits.incrementAndGet()
     }
 
     fun recordFirestoreWrite(count: Long = 1L) {
@@ -148,6 +285,37 @@ class DatabaseMetricsTracker {
         if (count > 0L) roomWriteSkipsUnchanged.addAndGet(count)
     }
 
+    fun recordReadyQueueHit() {
+        readyQueueHits.incrementAndGet()
+    }
+
+    fun recordReadyQueueMiss() {
+        readyQueueMisses.incrementAndGet()
+    }
+
+    fun recordEpisodeSwitchPrep(durationMs: Long) {
+        episodeSwitchPrepCount.incrementAndGet()
+        if (durationMs >= 0L) {
+            episodeSwitchPrepTotalMs.addAndGet(durationMs)
+            MonotonicMetrics.recordValue("episode_switch_prep_ms", durationMs)
+        }
+    }
+
+    fun recordPlaybackStartLatency(durationMs: Long) {
+        playbackStartLatencyCount.incrementAndGet()
+        if (durationMs >= 0L) {
+            playbackStartLatencyTotalMs.addAndGet(durationMs)
+            MonotonicMetrics.recordValue("playback_start_latency_ms", durationMs)
+        }
+    }
+
+    fun recordBufferingEvent(durationMs: Long = 0L) {
+        bufferingEvents.incrementAndGet()
+        if (durationMs > 0L) {
+            bufferingDurationTotalMs.addAndGet(durationMs)
+        }
+    }
+
     fun snapshot(): MetricsSnapshot {
         val totalD1Ops = d1Reads.get() + d1Writes.get() + d1Errors.get()
         val avgD1Ms = if (totalD1Ops > 0L) d1TotalLatencyMs.get() / totalD1Ops else 0L
@@ -170,7 +338,29 @@ class DatabaseMetricsTracker {
             apiFailures = apiFailures.get(),
             duplicateRequestsPrevented = duplicateRequestsPrevented.get(),
             roomWrites = roomWrites.get(),
-            roomWriteSkipsUnchanged = roomWriteSkipsUnchanged.get()
+            roomWriteSkipsUnchanged = roomWriteSkipsUnchanged.get(),
+            d1CacheHits = d1CacheHits.get(),
+            d1CacheMisses = d1CacheMisses.get(),
+            d1FallbackLookups = d1FallbackLookups.get(),
+            d1PreloadCycles = d1PreloadCycles.get(),
+            d1PreloadCycleReads = d1PreloadCycleReads.get(),
+            resolverInvocations = resolverInvocations.get(),
+            resolverLatencyTotalMs = resolverLatencyTotalMs.get(),
+            firestoreQueryCount = firestoreQueryCount.get(),
+            firestoreDocumentsReturned = firestoreDocumentsReturned.get(),
+            firestoreListenerEvents = firestoreListenerEvents.get(),
+            firestoreActiveListeners = firestoreActiveListeners.get(),
+            firestoreFullSyncCount = firestoreFullSyncCount.get(),
+            firestoreIncrementalSyncCount = firestoreIncrementalSyncCount.get(),
+            firestoreCacheHits = firestoreCacheHits.get(),
+            readyQueueHits = readyQueueHits.get(),
+            readyQueueMisses = readyQueueMisses.get(),
+            episodeSwitchPrepCount = episodeSwitchPrepCount.get(),
+            episodeSwitchPrepTotalMs = episodeSwitchPrepTotalMs.get(),
+            playbackStartLatencyCount = playbackStartLatencyCount.get(),
+            playbackStartLatencyTotalMs = playbackStartLatencyTotalMs.get(),
+            bufferingEvents = bufferingEvents.get(),
+            bufferingDurationTotalMs = bufferingDurationTotalMs.get()
         )
     }
 
@@ -179,12 +369,12 @@ class DatabaseMetricsTracker {
         runCatching {
             Log.i(
                 "ProphecyDbMetrics",
-                "$contextTag d1_r=${snap.d1Reads} d1_rows=${snap.d1RowsReturned} d1_w=${snap.d1Writes} " +
-                    "d1_skip=${snap.d1WriteSkipsUnchanged} fs_r=${snap.firestoreReads} fs_w=${snap.firestoreWrites} " +
-                    "room_w=${snap.roomWrites} room_skip=${snap.roomWriteSkipsUnchanged} " +
-                    "mem_hit=${snap.memoryCacheHits}/${snap.memoryCacheHits + snap.memoryCacheMisses} " +
-                    "room_hit=${snap.roomCacheHits}/${snap.roomCacheHits + snap.roomCacheMisses} " +
-                    "dedup=${snap.duplicateRequestsPrevented}"
+                "$contextTag d1_r=${snap.d1Reads} d1_hit=${snap.d1CacheHits} d1_miss=${snap.d1CacheMisses} " +
+                    "d1_fb=${snap.d1FallbackLookups} preload_cycles=${snap.d1PreloadCycles} " +
+                    "resolver=${snap.resolverInvocations} fs_r=${snap.firestoreReads} fs_q=${snap.firestoreQueryCount} " +
+                    "fs_docs=${snap.firestoreDocumentsReturned} fs_cache=${snap.firestoreCacheHits} " +
+                    "rq_hit=${snap.readyQueueHits}/${snap.readyQueueHits + snap.readyQueueMisses} " +
+                    "buf_events=${snap.bufferingEvents} dedup=${snap.duplicateRequestsPrevented}"
             )
         }
     }
@@ -209,6 +399,28 @@ class DatabaseMetricsTracker {
         duplicateRequestsPrevented.set(0L)
         roomWrites.set(0L)
         roomWriteSkipsUnchanged.set(0L)
+        d1CacheHits.set(0L)
+        d1CacheMisses.set(0L)
+        d1FallbackLookups.set(0L)
+        d1PreloadCycles.set(0L)
+        d1PreloadCycleReads.set(0L)
+        resolverInvocations.set(0L)
+        resolverLatencyTotalMs.set(0L)
+        firestoreQueryCount.set(0L)
+        firestoreDocumentsReturned.set(0L)
+        firestoreListenerEvents.set(0L)
+        firestoreActiveListeners.set(0L)
+        firestoreFullSyncCount.set(0L)
+        firestoreIncrementalSyncCount.set(0L)
+        firestoreCacheHits.set(0L)
+        readyQueueHits.set(0L)
+        readyQueueMisses.set(0L)
+        episodeSwitchPrepCount.set(0L)
+        episodeSwitchPrepTotalMs.set(0L)
+        playbackStartLatencyCount.set(0L)
+        playbackStartLatencyTotalMs.set(0L)
+        bufferingEvents.set(0L)
+        bufferingDurationTotalMs.set(0L)
     }
 
     companion object {

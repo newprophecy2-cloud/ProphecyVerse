@@ -102,7 +102,7 @@ fun ForceUpdateScreen(
             is VersionCheckState.VerificationFailed -> {
                 VerificationFailedCard(
                     errorMessage = versionState.message,
-                    onRetry = { versionManager.checkForUpdates() }
+                    onRetry = { versionManager.checkForUpdates(force = true) }
                 )
             }
             is VersionCheckState.ForceUpdate -> {

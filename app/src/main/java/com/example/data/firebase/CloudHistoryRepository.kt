@@ -224,19 +224,36 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 val currentUser = AuthManager.getInstance(context).currentUser ?: return@withLock false
                 val ownerKey = currentUser.uid
                 val prefKey = "last_successful_pull_$ownerKey"
+                val historyCursorPrefKey = "last_history_cursor_$ownerKey"
+                val watchlistCursorPrefKey = "last_watchlist_cursor_$ownerKey"
                 val now = System.currentTimeMillis()
                 if (!force && now - syncPreferences.getLong(prefKey, 0L) < MIN_PULL_INTERVAL_MS) {
+                    metricsTracker.recordFirestoreCacheHit()
                     return@withLock true
                 }
 
-                // 1. Pull cloud history
+                // 1. Pull cloud history (incremental cursor after initial sync, bounded full sync otherwise)
+                val historyCursor = if (force) 0L else syncPreferences.getLong(historyCursorPrefKey, 0L)
+                val historyRef = firestore.collection("watch_history")
+                    .document(ownerKey)
+                    .collection("episodes")
                 val historyDocs = FirestoreRequestGuard.execute("pull playback history") {
-                    firestore.collection("watch_history")
-                        .document(ownerKey)
-                        .collection("episodes")
-                        .get()
+                    if (historyCursor > 0L) {
+                        historyRef.whereGreaterThanOrEqualTo("last_played_at", historyCursor)
+                            .limit(INCREMENTAL_SYNC_LIMIT)
+                            .get()
+                    } else {
+                        historyRef.limit(FULL_SYNC_LIMIT).get()
+                    }
                 }
-                metricsTracker.recordFirestoreRead(historyDocs.size().coerceAtLeast(1).toLong())
+                val historyCount = historyDocs.size().toLong()
+                metricsTracker.recordFirestoreRead(historyCount.coerceAtLeast(1L))
+                metricsTracker.recordFirestoreQuery(historyCount)
+                if (historyCursor > 0L) {
+                    metricsTracker.recordFirestoreIncrementalSync(historyCount)
+                } else {
+                    metricsTracker.recordFirestoreFullSync(historyCount)
+                }
 
                 val cloudHistories = buildList {
                     for (doc in historyDocs.documents) {
@@ -274,12 +291,14 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                             val local = dao.getHistoryForEpisode(cloud.animeId, cloud.episodeId)
                             val anime = animeDao.getAnimeById(cloud.animeId)
                             val merged = mergePlaybackHistories(local, cloud, anime)
-                            if (local == null || cloud.lastPlayedAt >= local.lastPlayedAt) {
+                            if (local != null && merged == local) {
+                                metricsTracker.recordRoomWriteSkipped()
+                            } else if (local == null || cloud.lastPlayedAt >= local.lastPlayedAt || merged != local) {
                                 dao.upsertHistory(merged)
-                            } else if (merged != local) {
-                                // Backfill any missing metadata or completion flag onto newer local row
-                                dao.upsertHistory(merged)
+                                metricsTracker.recordRoomWrite()
                             }
+                            lastSyncedHistoryFingerprint[merged.id] =
+                                "$ownerKey|${merged.positionMs}|${merged.durationMs}|${merged.completed}|${merged.animeTitle.orEmpty()}|${merged.posterUrl.orEmpty()}|${merged.episodeTitle.orEmpty()}"
                         }
                     }
                 }
@@ -289,7 +308,15 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                     val canonicalId = animeRepository.resolveCanonicalRoute(local.animeId).animeId
                     val normalizedId = "history_${canonicalId}_${local.episodeId}"
                     val remote = cloudHistoryById[normalizedId]
-                    remote == null || local.lastPlayedAt > remote.lastPlayedAt || (local.completed && !remote.completed)
+                    val newerSinceCursor = if (historyCursor > 0L) {
+                        local.lastPlayedAt > historyCursor ||
+                            (remote != null && (local.lastPlayedAt > remote.lastPlayedAt || (local.completed && !remote.completed)))
+                    } else {
+                        remote == null || local.lastPlayedAt > remote.lastPlayedAt || (local.completed && !remote.completed)
+                    }
+                    if (!newerSinceCursor) return@filter false
+                    val fp = "$ownerKey|${local.positionMs}|${local.durationMs}|${local.completed}|${local.animeTitle.orEmpty()}|${local.posterUrl.orEmpty()}|${local.episodeTitle.orEmpty()}"
+                    lastSyncedHistoryFingerprint[normalizedId] != fp
                 }
                 for (local in historiesToPush) {
                     val canonicalId = animeRepository.resolveCanonicalRoute(local.animeId).animeId
@@ -309,17 +336,35 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                                 .document(normalized.id)
                                 .set(buildHistoryDocMap(normalized, ownerKey), SetOptions.merge())
                         }
+                    }.onSuccess {
+                        metricsTracker.recordFirestoreWrite()
+                        lastSyncedHistoryFingerprint[normalized.id] =
+                            "$ownerKey|${normalized.positionMs}|${normalized.durationMs}|${normalized.completed}|${normalized.animeTitle.orEmpty()}|${normalized.posterUrl.orEmpty()}|${normalized.episodeTitle.orEmpty()}"
                     }
                 }
 
-                // 2. Pull cloud watchlist
+                // 2. Pull cloud watchlist (incremental cursor after initial sync, bounded full sync otherwise)
+                val watchlistCursor = if (force) 0L else syncPreferences.getLong(watchlistCursorPrefKey, 0L)
+                val watchlistRef = firestore.collection("watchlist")
+                    .document(ownerKey)
+                    .collection("items")
                 val watchlistDocs = FirestoreRequestGuard.execute("pull watchlist") {
-                    firestore.collection("watchlist")
-                        .document(ownerKey)
-                        .collection("items")
-                        .get()
+                    if (watchlistCursor > 0L) {
+                        watchlistRef.whereGreaterThanOrEqualTo("updated_at", watchlistCursor)
+                            .limit(INCREMENTAL_SYNC_LIMIT)
+                            .get()
+                    } else {
+                        watchlistRef.limit(FULL_SYNC_LIMIT).get()
+                    }
                 }
-                metricsTracker.recordFirestoreRead(watchlistDocs.size().coerceAtLeast(1).toLong())
+                val watchlistCount = watchlistDocs.size().toLong()
+                metricsTracker.recordFirestoreRead(watchlistCount.coerceAtLeast(1L))
+                metricsTracker.recordFirestoreQuery(watchlistCount)
+                if (watchlistCursor > 0L) {
+                    metricsTracker.recordFirestoreIncrementalSync(watchlistCount)
+                } else {
+                    metricsTracker.recordFirestoreFullSync(watchlistCount)
+                }
 
                 val cloudWatchlist = buildList {
                     for (doc in watchlistDocs.documents) {
@@ -337,12 +382,33 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                 }.distinctBy { it.animeId }
 
                 val localWatchlistBefore = database.watchlistDao().getAllWatchlistOnce()
-                val mergePlan = computeWatchlistMergePlan(localWatchlistBefore, cloudWatchlist)
+                val mergePlan = computeWatchlistMergePlan(
+                    localEntries = localWatchlistBefore,
+                    cloudEntries = cloudWatchlist,
+                    incrementalCursor = watchlistCursor
+                )
 
-                if (mergePlan.toUpsertLocal.isNotEmpty()) {
-                    database.watchlistDao().upsertWatchlistEntries(mergePlan.toUpsertLocal)
+                val localWatchlistById = localWatchlistBefore.associateBy { it.animeId }
+                val actualLocalUpserts = mergePlan.toUpsertLocal.filter { candidate ->
+                    val existing = localWatchlistById[candidate.animeId]
+                    existing == null || existing.status != candidate.status || existing.isFavorite != candidate.isFavorite || existing.updatedAt != candidate.updatedAt
+                }
+                if (actualLocalUpserts.isNotEmpty()) {
+                    database.watchlistDao().upsertWatchlistEntries(actualLocalUpserts)
+                    metricsTracker.recordRoomWrite(actualLocalUpserts.size.toLong())
+                } else if (mergePlan.toUpsertLocal.isNotEmpty()) {
+                    metricsTracker.recordRoomWriteSkipped(mergePlan.toUpsertLocal.size.toLong())
+                }
+                cloudWatchlist.forEach { cloud ->
+                    lastSyncedWatchlistFingerprint["$ownerKey|${cloud.animeId}"] = "${cloud.status}|${cloud.isFavorite}"
                 }
                 for (local in mergePlan.toPushCloud) {
+                    val syncKey = "$ownerKey|${local.animeId}"
+                    val syncFp = "${local.status}|${local.isFavorite}"
+                    if (lastSyncedWatchlistFingerprint[syncKey] == syncFp) {
+                        metricsTracker.recordFirestoreWriteSkipped()
+                        continue
+                    }
                     runCatching {
                         FirestoreRequestGuard.execute("push local watchlist") {
                             firestore.collection("watchlist")
@@ -351,10 +417,32 @@ class CloudHistoryRepository private constructor(private val context: Context) {
                                 .document(local.animeId)
                                 .set(buildWatchlistDocMap(local, ownerKey), SetOptions.merge())
                         }
+                    }.onSuccess {
+                        metricsTracker.recordFirestoreWrite()
+                        lastSyncedWatchlistFingerprint[syncKey] = syncFp
                     }
                 }
 
-                syncPreferences.edit().putLong(prefKey, System.currentTimeMillis()).apply()
+                val maxHistoryTimestamp = maxOf(
+                    historyCursor,
+                    cloudHistories.maxOfOrNull { it.lastPlayedAt } ?: 0L,
+                    historiesToPush.maxOfOrNull { it.lastPlayedAt } ?: 0L
+                ).let { maxSeen ->
+                    if (maxSeen > 0L) (maxSeen - CURSOR_SKEW_MARGIN_MS).coerceAtLeast(1L) else (now - CURSOR_SKEW_MARGIN_MS).coerceAtLeast(1L)
+                }
+                val maxWatchlistTimestamp = maxOf(
+                    watchlistCursor,
+                    cloudWatchlist.maxOfOrNull { it.updatedAt } ?: 0L,
+                    mergePlan.toPushCloud.maxOfOrNull { it.updatedAt } ?: 0L
+                ).let { maxSeen ->
+                    if (maxSeen > 0L) (maxSeen - CURSOR_SKEW_MARGIN_MS).coerceAtLeast(1L) else (now - CURSOR_SKEW_MARGIN_MS).coerceAtLeast(1L)
+                }
+
+                syncPreferences.edit()
+                    .putLong(prefKey, System.currentTimeMillis())
+                    .putLong(historyCursorPrefKey, maxHistoryTimestamp)
+                    .putLong(watchlistCursorPrefKey, maxWatchlistTimestamp)
+                    .apply()
                 true
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -401,6 +489,9 @@ class CloudHistoryRepository private constructor(private val context: Context) {
 
     companion object {
         private const val MIN_PULL_INTERVAL_MS = 5 * 60 * 1000L
+        private const val FULL_SYNC_LIMIT = 250L
+        private const val INCREMENTAL_SYNC_LIMIT = 100L
+        private const val CURSOR_SKEW_MARGIN_MS = 60_000L
         @Volatile
         private var instance: CloudHistoryRepository? = null
 
@@ -444,7 +535,8 @@ class CloudHistoryRepository private constructor(private val context: Context) {
 
         internal fun computeWatchlistMergePlan(
             localEntries: List<WatchlistEntry>,
-            cloudEntries: List<WatchlistEntry>
+            cloudEntries: List<WatchlistEntry>,
+            incrementalCursor: Long = 0L
         ): WatchlistMergePlan {
             val localById = localEntries.associateBy { it.animeId }
             val cloudById = cloudEntries.associateBy { it.animeId }
@@ -455,7 +547,11 @@ class CloudHistoryRepository private constructor(private val context: Context) {
             }
             val toPushCloud = localEntries.filter { local ->
                 val cloud = cloudById[local.animeId]
-                cloud == null || local.updatedAt > cloud.updatedAt
+                if (incrementalCursor > 0L) {
+                    local.updatedAt > incrementalCursor || (cloud != null && local.updatedAt > cloud.updatedAt)
+                } else {
+                    cloud == null || local.updatedAt > cloud.updatedAt
+                }
             }
             return WatchlistMergePlan(
                 toUpsertLocal = toUpsertLocal,
