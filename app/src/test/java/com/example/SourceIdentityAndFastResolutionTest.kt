@@ -37,6 +37,7 @@ import com.example.data.repository.SourceIdentityValidator
 import com.example.data.repository.SourceResolutionDiagnosticException
 import com.example.data.repository.SourceValidationResult
 import com.example.data.repository.resolveVerifiedPlaybackForEpisode
+import com.example.data.streaming.ContentIdentityHelper
 import com.example.data.streaming.MonotonicMetrics
 import com.example.player.PreResolveQueueManager
 import com.example.ui.viewmodels.PlayerViewModel
@@ -803,14 +804,26 @@ class SourceIdentityAndFastResolutionTest {
 
         // 2nd direct playback resolves strictly from Memory LRU
         val hitsBefore = metricsTracker.snapshot().memoryCacheHits
-        val memHit = repo.resolveDirectPlayback("src_800_1", scopeKey = "anime:800:s1:e1").getOrThrow()
+        val providerId = ContentIdentityHelper.deterministicProviderId("VidStream")
+        val memHit = repo.resolveDirectPlayback(
+            sourceId = "src_800_1",
+            scopeKey = "anime:800:s1:e1",
+            providerId = providerId,
+            animeId = "be_800",
+            episodeId = "be_800_1"
+        ).getOrThrow()
         println("SCENARIO8 checkpoint=memory url=${memHit.playbackUrl} directCalls=${directCalls.get()} memoryHitsBefore=$hitsBefore memoryHitsAfter=${metricsTracker.snapshot().memoryCacheHits}")
         assertEquals("https://cdn.example/cache_800.mp4", memHit.playbackUrl)
         assertTrue(metricsTracker.snapshot().memoryCacheHits > hitsBefore)
         assertEquals(1, directCalls.get())
 
         // Invalidate Memory -> 3rd resolvePlayableStream hits D1 stream_urls cleanly with ZERO Backend calls!
-        memoryCache.invalidatePlayback("src_800_1", "anime:800:s1:e1")
+        memoryCache.invalidatePlayback(
+            sourceId = "src_800_1",
+            scopeKey = "anime:800:s1:e1",
+            providerId = providerId,
+            backendEpisodeId = "be_800_1"
+        )
         val d1Hit = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
         println("SCENARIO8 checkpoint=d1 tier=${d1Hit.cacheTier} url=${d1Hit.directData.playbackUrl} directCalls=${directCalls.get()}")
         assertEquals("D1", d1Hit.cacheTier)
