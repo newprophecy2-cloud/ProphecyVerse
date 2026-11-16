@@ -7,8 +7,6 @@ import com.example.data.cache.MemoryCacheManager
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.EpisodeEntry
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.AniListData
 import com.example.data.remote.AniListGraphQLRequest
@@ -17,23 +15,25 @@ import com.example.data.remote.AniListGraphQLService
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.DirectPlayRequest
 import com.example.data.remote.DirectPlayResponse
+import com.example.data.remote.NetworkModule
 import com.example.data.remote.ProphecyAnimeDetailsResponse
 import com.example.data.remote.ProphecyEpisodeDto
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySearchResponse
+import com.example.data.remote.ProphecySearchResultItem
 import com.example.data.remote.ProphecySourceDto
 import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.SourceDiagnosticCode
 import com.example.data.repository.SourceIdentityValidator
 import com.example.data.repository.SourceValidationResult
+import com.example.data.repository.TitleMatcher
 import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.FirestoreStreamingRepository
-import com.example.data.streaming.StreamRecordStatus
 import com.google.firebase.FirebaseApp
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -78,22 +78,16 @@ class Fix3IdentityValidationTest {
             Response.success(AniListGraphQLResponse(AniListData(null)))
     }
 
-    private fun createRepo(api: ProphecyVerseApiService): AnimeRepository {
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false },
-            cloudStoreProvider = null,
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
+    private fun createRepo(
+        api: ProphecyVerseApiService,
+        d1DataSource: com.example.data.d1.CloudflareD1DataSource = createTestD1DataSource(metricsTracker)
+    ): AnimeRepository {
         return AnimeRepository(
             database = db,
             prophecyApi = api,
             aniListApi = noOpAniList(),
             applicationContext = context,
-            streamingRepository = streamingRepo,
-            d1DataSource = null,
+            d1DataSource = d1DataSource,
             memoryCache = memoryCache,
             metricsTracker = metricsTracker
         )
@@ -125,34 +119,16 @@ class Fix3IdentityValidationTest {
             AnimeEntry(id = animeId, aniListId = 3001, backendAnimeId = "be_3001", preferredTitle = "Collision Show", format = "TV", isPlayable = true)
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_3001_1", animeId, 1, 1, "Ep 1", sourceEpisodeIds = "[\"be_ep_1\"]")))
-
-        val entityA = StreamSourceEntity(
-            sourceDocKey = "$scope|p|$provA|s|$sharedSourceId",
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
             scopeKey = scope,
-            providerId = provA,
-            sourceId = sharedSourceId,
-            sourceName = "Pahe",
-            backendEpisodeId = "be_ep_1",
-            status = StreamRecordStatus.MISSING_URL.name,
-            expiresAt = "2099-01-01T00:00:00Z"
-        )
-        val entityB = StreamSourceEntity(
-            sourceDocKey = "$scope|p|$provB|s|$sharedSourceId",
-            scopeKey = scope,
-            providerId = provB,
-            sourceId = sharedSourceId,
-            sourceName = "MegaCloud",
-            backendEpisodeId = "be_ep_1",
-            status = StreamRecordStatus.MISSING_URL.name,
-            expiresAt = "2099-01-01T00:00:00Z"
-        )
-        db.streamCacheDao().upsertProviders(
-            listOf(
-                StreamProviderEntity("$scope|p|$provA", scope, provA, "Pahe", sourceCount = 1),
-                StreamProviderEntity("$scope|p|$provB", scope, provB, "MegaCloud", sourceCount = 1)
+            seasonNumber = 1,
+            episodeNumber = 1,
+            sources = listOf(
+                ProphecySourceDto(id = sharedSourceId, label = "Pahe", quality = "1080p", expiresAt = "2099-01-01T00:00:00Z"),
+                ProphecySourceDto(id = sharedSourceId, label = "MegaCloud", quality = "1080p", expiresAt = "2099-01-01T00:00:00Z")
             )
         )
-        db.streamCacheDao().upsertSources(listOf(entityA, entityB))
 
         // Memory cache keeps both isolated by providerId and rejects ambiguous lookup without providerId
         memoryCache.putResolvedPlayback(
@@ -182,37 +158,7 @@ class Fix3IdentityValidationTest {
     }
 
     @Test
-    fun fix3_cachedUrlFromWrongEpisodeSeasonOrProvider_isRejected() {
-        val scopeTarget = "anime:3002:s1:e2"
-        val provPahe = ContentIdentityHelper.deterministicProviderId("Pahe")
-        val provMega = ContentIdentityHelper.deterministicProviderId("MegaCloud")
-
-        val base = StreamSourceEntity(
-            sourceDocKey = "$scopeTarget|p|$provPahe|s|src_1",
-            scopeKey = scopeTarget,
-            providerId = provPahe,
-            sourceId = "src_1",
-            sourceName = "Pahe",
-            backendEpisodeId = "be_s1_e2",
-            status = StreamRecordStatus.AVAILABLE.name,
-            expiresAt = "2099-01-01T00:00:00Z"
-        )
-
-        val wrongEp = base.copy(scopeKey = "anime:3002:s1:e1", sourceDocKey = "anime:3002:s1:e1|p|$provPahe|s|src_1")
-        val wrongEpResult = SourceIdentityValidator.validateCachedSourceEntity(wrongEp, scopeTarget, "src_1")
-        assertTrue(wrongEpResult is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (wrongEpResult as SourceValidationResult.Invalid).code)
-
-        val wrongSeason = base.copy(scopeKey = "anime:3002:s2:e2", sourceDocKey = "anime:3002:s2:e2|p|$provPahe|s|src_1")
-        val wrongSeasonResult = SourceIdentityValidator.validateCachedSourceEntity(wrongSeason, scopeTarget, "src_1")
-        assertTrue(wrongSeasonResult is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.SEASON_MISMATCH, (wrongSeasonResult as SourceValidationResult.Invalid).code)
-
-        val wrongProviderResult = SourceIdentityValidator.validateCachedSourceEntity(base, scopeTarget, "src_1", expectedProviderId = provMega)
-        assertTrue(wrongProviderResult is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (wrongProviderResult as SourceValidationResult.Invalid).code)
-
-        // Validate D1 stream_urls identity checks (anime_id, episode_id, source_id, URL, expiry)
+    fun fix3_cachedUrlFromWrongAnimeEpisodeSourceOrExpired_isRejected() {
         val validD1 = com.example.data.d1.D1StreamUrlRecordDto(
             id = "r1",
             animeId = "be_3002",
@@ -222,69 +168,53 @@ class Fix3IdentityValidationTest {
             expiresAt = "2099-01-01T00:00:00Z"
         )
         assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_1").isValid)
-        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_9999", "be_s1_e2", "src_1") is SourceValidationResult.Invalid)
-        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e1", "src_1") is SourceValidationResult.Invalid)
-        assertTrue(SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_other") is SourceValidationResult.Invalid)
+
+        val wrongAnime = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_9999", "be_s1_e2", "src_1")
+        assertTrue(wrongAnime is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (wrongAnime as SourceValidationResult.Invalid).code)
+
+        val wrongEp = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e1", "src_1")
+        assertTrue(wrongEp is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (wrongEp as SourceValidationResult.Invalid).code)
+
+        val wrongSource = SourceIdentityValidator.validateD1StreamUrlRecord(validD1, "be_3002", "be_s1_e2", "src_other")
+        assertTrue(wrongSource is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (wrongSource as SourceValidationResult.Invalid).code)
+
+        val expired = SourceIdentityValidator.validateD1StreamUrlRecord(validD1.copy(expiresAt = "2020-01-01T00:00:00Z"), "be_3002", "be_s1_e2", "src_1")
+        assertTrue(expired is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.SOURCE_EXPIRED, (expired as SourceValidationResult.Invalid).code)
+
+        val badScheme = SourceIdentityValidator.validateD1StreamUrlRecord(validD1.copy(streamUrl = "ftp://bad.example/file"), "be_3002", "be_s1_e2", "src_1")
+        assertTrue(badScheme is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.SOURCE_NOT_PLAYABLE, (badScheme as SourceValidationResult.Invalid).code)
     }
 
     @Test
-    fun fix3_missingOrMismatchedProviderIdSourceDocKeyOrBackendEpisodeId_rejectsCachedItem() {
-        val scope = "anime:3003:s1:e1"
-        val prov = "pahe"
-        val valid = StreamSourceEntity(
-            sourceDocKey = "$scope|p|$prov|s|src_3",
-            scopeKey = scope,
-            providerId = prov,
-            sourceId = "src_3",
-            sourceName = "Pahe",
-            backendEpisodeId = "be_ep_3",
-            status = StreamRecordStatus.MISSING_URL.name,
-            expiresAt = "2099-01-01T00:00:00Z"
+    fun fix3_episodeFullAndDirectPlayValidationRejectsCrossBoundaryPayloads() {
+        val resp = ProphecyEpisodeFullResponse(
+            anime = ProphecyAnimeDetailsResponse(id = "other_anime", title = "Wrong Anime"),
+            sources = listOf(ProphecySourceDto(id = "s1", label = "Pahe"))
         )
-        assertTrue(
-            SourceIdentityValidator.validateCachedSourceEntity(
-                entity = valid,
-                expectedScopeKey = scope,
-                expectedSourceId = "src_3",
-                expectedProviderId = prov,
-                expectedBackendEpisodeId = "be_ep_3"
-            ).isValid
+        val resAnime = SourceIdentityValidator.validateEpisodeFullResponse(
+            body = resp,
+            animeEntry = AnimeEntry(id = "anilist_3003", aniListId = 3003, backendAnimeId = "be_3003", preferredTitle = "Correct Show"),
+            requestedBackendId = "be_3003",
+            requestedBackendEpisodeId = "be_ep_3",
+            isMovie = false,
+            requestedSeason = 1,
+            effectiveBackendSeason = 1,
+            allowedEpisodeNumbers = setOf(1)
         )
+        assertTrue(resAnime is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (resAnime as SourceValidationResult.Invalid).code)
 
-        val blankProvider = valid.copy(providerId = "")
-        val resBlankProv = SourceIdentityValidator.validateCachedSourceEntity(blankProvider, scope, "src_3")
-        assertTrue(resBlankProv is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (resBlankProv as SourceValidationResult.Invalid).code)
-
-        val badDocKey = valid.copy(sourceDocKey = "$scope|p|other_provider|s|src_3")
-        val resBadDocKey = SourceIdentityValidator.validateCachedSourceEntity(badDocKey, scope, "src_3")
-        assertTrue(resBadDocKey is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (resBadDocKey as SourceValidationResult.Invalid).code)
-
-        val blankDocKey = valid.copy(sourceDocKey = "")
-        assertTrue(SourceIdentityValidator.validateCachedSourceEntity(blankDocKey, scope, "src_3") is SourceValidationResult.Invalid)
-
-        val missingBackendEp = valid.copy(backendEpisodeId = null)
-        val resMissingBackendEp = SourceIdentityValidator.validateCachedSourceEntity(
-            entity = missingBackendEp,
-            expectedScopeKey = scope,
-            expectedSourceId = "src_3",
-            expectedProviderId = prov,
-            expectedBackendEpisodeId = "be_ep_3"
+        val directWrong = SourceIdentityValidator.validateDirectPlayData(
+            DirectPlayData(sourceId = "wrong_src", playbackUrl = "https://cdn.example/video.mp4"),
+            expectedSourceId = "src_3"
         )
-        assertTrue(resMissingBackendEp is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (resMissingBackendEp as SourceValidationResult.Invalid).code)
-
-        val mismatchedBackendEp = valid.copy(backendEpisodeId = "be_ep_999")
-        val resMismatchBackendEp = SourceIdentityValidator.validateCachedSourceEntity(
-            entity = mismatchedBackendEp,
-            expectedScopeKey = scope,
-            expectedSourceId = "src_3",
-            expectedProviderId = prov,
-            expectedBackendEpisodeId = "be_ep_3"
-        )
-        assertTrue(resMismatchBackendEp is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (resMismatchBackendEp as SourceValidationResult.Invalid).code)
+        assertTrue(directWrong is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (directWrong as SourceValidationResult.Invalid).code)
     }
 
     @Test
@@ -299,21 +229,12 @@ class Fix3IdentityValidationTest {
             AnimeEntry(id = animeId, aniListId = 3004, backendAnimeId = "be_3004", preferredTitle = "No Cross-Merge", format = "TV", isPlayable = true)
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_3004_1", animeId, 1, 1, "Ep 1")))
-        // Seed OldProvider with shared sourceId in Room + Memory
-        db.streamCacheDao().upsertProviders(listOf(StreamProviderEntity("$scope|p|$oldProv", scope, oldProv, "OldProvider", sourceCount = 1)))
-        db.streamCacheDao().upsertSources(
-            listOf(
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$oldProv|s|$sharedSourceId",
-                    scopeKey = scope,
-                    providerId = oldProv,
-                    sourceId = sharedSourceId,
-                    sourceName = "OldProvider",
-                    backendEpisodeId = "old_be_ep",
-                    status = StreamRecordStatus.MISSING_URL.name,
-                    expiresAt = "2099-01-01T00:00:00Z"
-                )
-            )
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
+            scopeKey = scope,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            sources = listOf(ProphecySourceDto(id = sharedSourceId, label = "OldProvider", expiresAt = "2099-01-01T00:00:00Z"))
         )
         memoryCache.putResolvedPlayback(sharedSourceId, DirectPlayData(sourceId = sharedSourceId, playbackUrl = "https://old-provider.example/old.mp4"), scope, oldProv)
 
@@ -343,12 +264,8 @@ class Fix3IdentityValidationTest {
         }
 
         val repo = createRepo(api)
-        repo.discoverStreamsForScope(animeId, 1, 1, "ep_3004_1", forceRefresh = true).getOrThrow()
-
-        val newEntity = db.streamCacheDao().getLatestActiveSourceForProviderInScope(scope, newProv, sharedSourceId)
-        assertNotNull(newEntity)
-        assertEquals("NewProvider", newEntity!!.sourceName)
-        assertEquals(StreamRecordStatus.MISSING_URL.name, newEntity.status)
+        val snap = repo.discoverStreamsForScope(animeId, 1, 1, "ep_3004_1", forceRefresh = true).getOrThrow()
+        assertEquals("NewProvider", snap.sources.single().label)
 
         // Playing via NewProvider must resolve fresh URL, never OldProvider's cached URL
         val resolved = repo.resolvePlayableStream(animeId, 1, 1, "ep_3004_1", preferredSourceId = sharedSourceId, preferredProviderId = newProv).getOrThrow()
@@ -367,29 +284,15 @@ class Fix3IdentityValidationTest {
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 3005, backendAnimeId = "be_3005", preferredTitle = "Scoped Invalidate", format = "TV", isPlayable = true)
         )
-        db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_3005_1", animeId, 1, 1)))
-        db.streamCacheDao().upsertSources(
-            listOf(
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$provA|s|$sharedSourceId",
-                    scopeKey = scope,
-                    providerId = provA,
-                    sourceId = sharedSourceId,
-                    sourceName = "ProviderA",
-                    backendEpisodeId = "be_ep_3005",
-                    status = StreamRecordStatus.MISSING_URL.name,
-                    expiresAt = "2099-01-01T00:00:00Z"
-                ),
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$provB|s|$sharedSourceId",
-                    scopeKey = scope,
-                    providerId = provB,
-                    sourceId = sharedSourceId,
-                    sourceName = "ProviderB",
-                    backendEpisodeId = "be_ep_3005",
-                    status = StreamRecordStatus.MISSING_URL.name,
-                    expiresAt = "2099-01-01T00:00:00Z"
-                )
+        db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_3005_1", animeId, 1, 1, sourceEpisodeIds = "[\"be_ep_3005\"]")))
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
+            scopeKey = scope,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            sources = listOf(
+                ProphecySourceDto(id = sharedSourceId, label = "ProviderA"),
+                ProphecySourceDto(id = sharedSourceId, label = "ProviderB")
             )
         )
         memoryCache.putResolvedPlayback(sharedSourceId, DirectPlayData(sourceId = sharedSourceId, playbackUrl = "https://provA.example/video.mp4"), scope, provA)
@@ -401,5 +304,97 @@ class Fix3IdentityValidationTest {
         // ProviderA invalidated in Memory without disturbing ProviderB in Memory!
         assertNull(memoryCache.getResolvedPlayback(sharedSourceId, scope, provA))
         assertEquals("https://provB.example/video.mp4", memoryCache.getResolvedPlayback(sharedSourceId, scope, provB)?.playbackUrl)
+    }
+
+    @Test
+    fun fix3_directPlayRequest_wireJsonContainsOnlySourceId() {
+        val adapter = NetworkModule.moshi.adapter(DirectPlayRequest::class.java)
+        val json = adapter.toJson(
+            DirectPlayRequest(
+                animeId = "be_1",
+                episodeId = "ep_1",
+                sourceId = "  src_1  "
+            )
+        )
+        assertEquals("{\"source_id\":\"src_1\"}", json)
+        assertFalse(json.contains("anime_id"))
+        assertFalse(json.contains("episode_id"))
+    }
+
+    @Test
+    fun fix3_validateDirectPlayData_acceptsSameEpisodeFallbackTokenAndRejectsMismatches() {
+        fun encodeToken(json: String): String =
+            java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(json.toByteArray(Charsets.UTF_8))
+
+        val requestedSrc = encodeToken("""{"p":"dramachi","v":"123","s":1,"e":1}""")
+        val fallbackSameEpSrc = encodeToken("""{"p":"fourkhdhub","v":"/show/","s":1,"e":1}""")
+        val fallbackDifferentEpSrc = encodeToken("""{"p":"fourkhdhub","v":"/show/","s":1,"e":2}""")
+
+        val acceptedFallback = SourceIdentityValidator.validateDirectPlayData(
+            data = DirectPlayData(
+                sourceId = fallbackSameEpSrc,
+                playbackUrl = "https://cdn.example/video.mkv",
+                message = "Fallback provider playback URL resolved."
+            ),
+            expectedSourceId = requestedSrc
+        )
+        assertTrue("Expected same-episode fallback token to validate", acceptedFallback.isValid)
+
+        val rejectedCrossEpisode = SourceIdentityValidator.validateDirectPlayData(
+            data = DirectPlayData(
+                sourceId = fallbackDifferentEpSrc,
+                playbackUrl = "https://cdn.example/video.mkv",
+                message = "Fallback provider playback URL resolved."
+            ),
+            expectedSourceId = requestedSrc
+        )
+        assertTrue(rejectedCrossEpisode is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (rejectedCrossEpisode as SourceValidationResult.Invalid).code)
+
+        val rejectedUnrelatedWithoutFallbackMsg = SourceIdentityValidator.validateDirectPlayData(
+            data = DirectPlayData(
+                sourceId = fallbackSameEpSrc,
+                playbackUrl = "https://cdn.example/video.mkv",
+                message = "Playback URL resolved."
+            ),
+            expectedSourceId = requestedSrc
+        )
+        assertTrue(rejectedUnrelatedWithoutFallbackMsg is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (rejectedUnrelatedWithoutFallbackMsg as SourceValidationResult.Invalid).code)
+
+        val rejectedPlainString = SourceIdentityValidator.validateDirectPlayData(
+            data = DirectPlayData(
+                sourceId = "wrong_src",
+                playbackUrl = "https://cdn.example/video.mkv",
+                message = "Fallback provider playback URL resolved."
+            ),
+            expectedSourceId = "src_plain_1"
+        )
+        assertTrue(rejectedPlainString is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.PROVIDER_ID_MISMATCH, (rejectedPlainString as SourceValidationResult.Invalid).code)
+    }
+
+    @Test
+    fun fix3_titleMatcher_stripsTrailingReleaseYearForSearchAndEntryConfidence() {
+        val variants = TitleMatcher.buildSearchQueryVariants(listOf("Hunter x Hunter (2011)"))
+        assertTrue("Expected query variants to include 'Hunter x Hunter'", variants.contains("Hunter x Hunter"))
+
+        val entry = AnimeEntry(
+            id = "anilist_11061",
+            aniListId = 11061,
+            preferredTitle = "Hunter x Hunter (2011)",
+            titleEnglish = "Hunter x Hunter (2011)",
+            titleRomaji = "HUNTER×HUNTER (2011)",
+            year = "2011",
+            format = "TV"
+        )
+        val backendCandidate = ProphecySearchResultItem(
+            id = "be_hxh_2011",
+            title = "Hunter x Hunter",
+            mediaType = "tv",
+            year = "2011"
+        )
+        val confidence = TitleMatcher.computeMatchConfidenceForEntry(entry, backendCandidate)
+        assertTrue("Expected high match confidence for 'Hunter x Hunter (2011)' vs 'Hunter x Hunter', got $confidence", confidence >= 0.90f)
     }
 }

@@ -58,7 +58,10 @@ class PlayerManager(
     private var tickerJob: Job? = null
     private var playbackGeneration: Long = 0L
     private var activeSession: PlaybackSessionIdentity? = null
+    private var activeLogicalSessionKey: String? = null
     private var networkTracker: PlaybackNetworkTracker? = null
+    private var healthMonitor: PlaybackHealthMonitor? = null
+    private val sessionRetryTracker = LogicalPlaybackSessionRetryTracker()
 
     private val _exoPlayerInstance = MutableStateFlow<ExoPlayer?>(null)
     val exoPlayerInstance: StateFlow<ExoPlayer?> = _exoPlayerInstance.asStateFlow()
@@ -120,12 +123,18 @@ class PlayerManager(
     private val _isPlaybackEnded = MutableStateFlow(false)
     val isPlaybackEnded: StateFlow<Boolean> = _isPlaybackEnded.asStateFlow()
 
-    private var retryCount = 0
     private var hasUnsupportedTrackError = false
     private var onRetryRequested: (() -> Unit)? = null
     private var onPlaybackFailedCallback: (() -> Unit)? = null
+    private var onFailureSignalCallback: ((PlaybackFailureReason) -> Unit)? = null
     private var lastWorkingTrackSelectionParams: androidx.media3.common.TrackSelectionParameters? = null
     var onPlaybackEndedCallback: (() -> Unit)? = null
+
+    private val _healthState = MutableStateFlow(PlaybackHealthState.IDLE)
+    val healthState: StateFlow<PlaybackHealthState> = _healthState.asStateFlow()
+
+    internal fun retryTracker(): LogicalPlaybackSessionRetryTracker = sessionRetryTracker
+
     data class PlaybackSessionIdentity(
         val animeId: String,
         val seasonNumber: Int,
@@ -166,7 +175,8 @@ class PlayerManager(
         val throughputKbps: Long? = null,
         val lastHttpStatusCode: Int? = null,
         val supportsByteRanges: Boolean? = null,
-        val retryCount: Int = 0
+        val retryCount: Int = 0,
+        val healthState: PlaybackHealthState = PlaybackHealthState.IDLE
     )
 
     fun initializePlayer(
@@ -177,29 +187,48 @@ class PlayerManager(
         providerName: String? = null,
         sessionIdentity: PlaybackSessionIdentity? = null,
         sourceQuality: String? = null,
-        resolveDurationMs: Long = 0L
+        resolveDurationMs: Long = 0L,
+        isRecoveryAttempt: Boolean = false,
+        onFailureSignal: ((PlaybackFailureReason) -> Unit)? = null
     ): ExoPlayer {
-        release()
+        release(resetRetryBudget = !isRecoveryAttempt)
         val cleanPlaybackUrl = directData.playbackUrl.trim()
         val generation = playbackGeneration
-        activeSession = sessionIdentity?.copy(generation = generation)
+        activeSession = sessionIdentity
+        val logicalKey = buildLogicalSessionKey(sessionIdentity, directData.sourceId)
+        val currentRetryCount = if (!isRecoveryAttempt || activeLogicalSessionKey != logicalKey) {
+            activeLogicalSessionKey = logicalKey
+            sessionRetryTracker.beginNewSession(logicalKey)
+        } else {
+            sessionRetryTracker.currentRetryCount(logicalKey)
+        }
         onRetryRequested = onRetryNeeded
         onPlaybackFailedCallback = onPlaybackFailed
-        retryCount = 0
+        onFailureSignalCallback = onFailureSignal
         hasUnsupportedTrackError = false
         _errorMessage.value = null
         _activeAudioDecoder.value = null
         _isPlaybackEnded.value = false
         _isBuffering.value = true
+        _healthState.value = PlaybackHealthState.INITIAL_BUFFERING
         _duration.value = 0L
         _currentPosition.value = startPositionMs
         val providerDiagnostic = providerName?.replace(Regex("[\\r\\n\\t]"), " ")?.take(64) ?: "unknown"
+        val scopeLabel = sessionIdentity?.let { "${it.animeId}:s${it.seasonNumber}:e${it.episodeId}" } ?: "player"
+        healthMonitor = PlaybackHealthMonitor(
+            scopeKey = scopeLabel,
+            sourceId = directData.sourceId,
+            noProgressStallThresholdSec = STALL_NO_DATA_SECONDS,
+            recentTransferWindowMs = RECENT_TRANSFER_WINDOW_MS
+        )
         _playbackDiagnostics.value = PlaybackDiagnostics(
             providerName = providerDiagnostic,
             sourceQuality = sourceQuality,
             urlType = directData.urlType,
             contentType = directData.contentType,
-            resolveDurationMs = resolveDurationMs.coerceAtLeast(0L)
+            resolveDurationMs = resolveDurationMs.coerceAtLeast(0L),
+            retryCount = currentRetryCount,
+            healthState = PlaybackHealthState.INITIAL_BUFFERING
         )
         val tracker = PlaybackNetworkTracker { snap ->
             if (generation == playbackGeneration) {
@@ -213,7 +242,7 @@ class PlayerManager(
             }
         }
         networkTracker = tracker
-        Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
+        Log.i(TAG, "playback_start provider=$providerDiagnostic backend_content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType} session_retry=$currentRetryCount")
 
         // Build safe HTTP DataSource with response-authorized headers and bounded timeouts
         val rawHttpFactory = DefaultHttpDataSource.Factory()
@@ -417,6 +446,9 @@ class PlayerManager(
                     }
                     Player.STATE_READY -> {
                         _isBuffering.value = false
+                        healthMonitor?.markReady()
+                        _healthState.value = PlaybackHealthState.IDLE
+                        sessionRetryTracker.onReadyStateReached()
                         if (!hasUnsupportedTrackError) {
                             _errorMessage.value = null
                         }
@@ -424,8 +456,11 @@ class PlayerManager(
                         if (dur > 0 && dur != C.TIME_UNSET) {
                             _duration.value = dur
                         }
-                        retryCount = 0
-                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = 0)
+                        // Retry budget belongs to the logical playback session; NEVER reset on STATE_READY.
+                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                            healthState = PlaybackHealthState.IDLE,
+                            retryCount = sessionRetryTracker.currentRetryCount(activeLogicalSessionKey)
+                        )
                         if (!player.isPlaying && player.playWhenReady) {
                             player.play()
                         }
@@ -434,6 +469,7 @@ class PlayerManager(
                         _isBuffering.value = false
                         _isPlaying.value = false
                         _isPlaybackEnded.value = true
+                        _healthState.value = PlaybackHealthState.IDLE
                         onPlaybackEndedCallback?.invoke()
                     }
                     Player.STATE_IDLE -> {
@@ -488,11 +524,25 @@ class PlayerManager(
                 val requestId = httpFailure?.headerFields?.entries
                     ?.firstOrNull { it.key.equals("X-Request-ID", true) || it.key.equals("X-Correlation-ID", true) }
                     ?.value?.firstOrNull()
+                val monitor = healthMonitor ?: PlaybackHealthMonitor()
+                val (classifiedHealth, failureReason) = monitor.classifyError(
+                    failureCategory = failureCategory,
+                    httpStatusCode = httpFailure?.responseCode
+                )
+                _healthState.value = classifiedHealth
                 _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
                     failureCategory = failureCategory,
-                    lastErrorMessage = error.localizedMessage ?: error.errorCodeName
+                    lastErrorMessage = error.localizedMessage ?: error.errorCodeName,
+                    lastHttpStatusCode = httpFailure?.responseCode ?: _playbackDiagnostics.value.lastHttpStatusCode,
+                    healthState = classifiedHealth
                 )
-                Log.e(TAG, "ExoPlayer failure category=$failureCategory code=${error.errorCode} http_status=${httpFailure?.responseCode ?: "none"} request_id=${requestId ?: "none"} provider=$providerDiagnostic content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}")
+                Log.e(
+                    TAG,
+                    "ExoPlayer failure category=$failureCategory health=$classifiedHealth reason=$failureReason " +
+                        "code=${error.errorCode} http_status=${httpFailure?.responseCode ?: "none"} " +
+                        "request_id=${requestId ?: "none"} provider=$providerDiagnostic " +
+                        "content_type=${directData.contentType ?: "unknown"} url_type=${directData.urlType}"
+                )
 
                 // If track switching failed due to unsupported decoder on selected track, recover smoothly
                 if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
@@ -516,11 +566,6 @@ class PlayerManager(
                     }
                 }
 
-                val isResolvableHttp = error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
-                        error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
-                        error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
-                        error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
-
                 val formatOrCodecMsg = when (failureCategory) {
                     PlaybackFailureCategory.CONTENT_TYPE -> "Unsupported stream content type."
                     PlaybackFailureCategory.CONTAINER -> "Media container format is not supported on this device."
@@ -529,29 +574,61 @@ class PlayerManager(
                     else -> null
                 }
 
-                if (isResolvableHttp && retryCount < 1) {
-                    retryCount++
-                    _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = retryCount)
-                    _errorMessage.value = "Playback link expired or connection dropped. Refreshing..."
-                    onRetryRequested?.invoke()
-                } else if (onPlaybackFailedCallback != null) {
-                    if (formatOrCodecMsg != null) {
+                val isRecoverableLinkFailure = failureReason == PlaybackFailureReason.HTTP_EXPIRED_OR_UNAUTHORIZED ||
+                    failureReason == PlaybackFailureReason.TRANSIENT_NETWORK_ERROR
+
+                if (onFailureSignalCallback != null) {
+                    val nextAttempt = if (isRecoverableLinkFailure) {
+                        sessionRetryTracker.consumeRetry(activeLogicalSessionKey)
+                    } else {
+                        null
+                    }
+                    if (nextAttempt != null) {
+                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = nextAttempt)
+                        _errorMessage.value = "Playback link expired or connection dropped. Refreshing..."
+                    } else if (formatOrCodecMsg != null) {
                         hasUnsupportedTrackError = true
                         _errorMessage.value = formatOrCodecMsg
                     } else {
                         _errorMessage.value = "Source failed to play. Trying alternative source..."
                     }
-                    onPlaybackFailedCallback?.invoke()
+                    onFailureSignalCallback?.invoke(failureReason)
                 } else {
-                    val msg = formatOrCodecMsg ?: when (failureCategory) {
-                        PlaybackFailureCategory.HTTP -> "The stream request was rejected by the server (HTTP error)."
-                        PlaybackFailureCategory.NETWORK_TIMEOUT -> "The stream request timed out. Check the connection and retry."
-                        PlaybackFailureCategory.NETWORK -> "The stream could not be reached. Check the connection and retry."
-                        PlaybackFailureCategory.MANIFEST -> "The HLS/DASH manifest could not be parsed."
-                        PlaybackFailureCategory.OTHER -> "Playback failed. Please select another source."
-                        else -> "Playback failed. Please select another source."
+                    val nextRetry = if (isRecoverableLinkFailure) {
+                        sessionRetryTracker.consumeRetry(activeLogicalSessionKey)
+                    } else {
+                        null
                     }
-                    _errorMessage.value = msg
+                    if (nextRetry != null) {
+                        _playbackDiagnostics.value = _playbackDiagnostics.value.copy(retryCount = nextRetry)
+                        _errorMessage.value = "Playback link expired or connection dropped. Refreshing..."
+                        onRetryRequested?.invoke()
+                    } else if (onPlaybackFailedCallback != null) {
+                        if (formatOrCodecMsg != null) {
+                            hasUnsupportedTrackError = true
+                            _errorMessage.value = formatOrCodecMsg
+                        } else {
+                            _errorMessage.value = "Source failed to play. Trying alternative source..."
+                        }
+                        onPlaybackFailedCallback?.invoke()
+                    } else {
+                        val msg = formatOrCodecMsg ?: when (failureCategory) {
+                            PlaybackFailureCategory.HTTP -> "The stream request was rejected by the server (HTTP error)."
+                            PlaybackFailureCategory.NETWORK_TIMEOUT -> "The stream request timed out. Check the connection and retry."
+                            PlaybackFailureCategory.NETWORK -> "The stream could not be reached. Check the connection and retry."
+                            PlaybackFailureCategory.MANIFEST -> "The HLS/DASH manifest could not be parsed."
+                            PlaybackFailureCategory.OTHER -> "Playback failed. Please select another source."
+                            else -> "Playback failed. Please select another source."
+                        }
+                        com.example.data.metrics.PlaybackDiagnosticsLogger.log(
+                            event = com.example.data.metrics.PlaybackDiagnosticEvent.PLAYBACK_SESSION_FAILED,
+                            animeId = activeSession?.animeId,
+                            episodeId = activeSession?.episodeId,
+                            reason = failureReason.name,
+                            detail = msg
+                        )
+                        _errorMessage.value = msg
+                    }
                 }
             }
         })
@@ -711,8 +788,6 @@ class PlayerManager(
     private fun startPositionTicker() {
         tickerJob?.cancel()
         tickerJob = scope.launch(Dispatchers.Main) {
-            var bufferingSeconds = 0
-            var stallFallbackTriggered = false
             while (isActive) {
                 exoPlayer?.let { player ->
                     val dur = player.duration
@@ -724,37 +799,40 @@ class PlayerManager(
                         _currentPosition.value = pos
                     }
 
-                    if (player.isPlaying) {
-                        bufferingSeconds = 0
-                        stallFallbackTriggered = false
-                        activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
-                    } else if (player.playbackState == Player.STATE_BUFFERING) {
-                        bufferingSeconds++
-                        val lastTransferAtMs = networkTracker?.lastTransferAtMs() ?: 0L
-                        val hasRecentTransfer = lastTransferAtMs > 0L &&
-                            (System.currentTimeMillis() - lastTransferAtMs) < RECENT_TRANSFER_WINDOW_MS
-                        if (!stallFallbackTriggered &&
-                            shouldTriggerBufferingStallFallback(
-                                bufferingSeconds = bufferingSeconds,
-                                hasRecentTransfer = hasRecentTransfer
-                            )
-                        ) {
-                            stallFallbackTriggered = true
-                            bufferingSeconds = 0
+                    val monitor = healthMonitor
+                    if (monitor != null) {
+                        val eval = monitor.evaluateTick(
+                            isPlaying = player.isPlaying,
+                            isBuffering = player.playbackState == Player.STATE_BUFFERING,
+                            bytesTransferred = networkTracker?.totalBytesTransferred() ?: 0L,
+                            bufferedPositionMs = player.bufferedPosition,
+                            lastTransferAtMs = networkTracker?.lastTransferAtMs() ?: 0L
+                        )
+                        if (_healthState.value != eval.state) {
+                            _healthState.value = eval.state
+                            _playbackDiagnostics.value = _playbackDiagnostics.value.copy(healthState = eval.state)
+                        }
+                        if (player.isPlaying) {
+                            activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
+                        } else if (eval.shouldTriggerStallRecovery) {
                             Log.w(
                                 TAG,
-                                "Playback stalled in buffering state (recentTransfer=$hasRecentTransfer, " +
-                                    "bytes=${networkTracker?.totalBytesTransferred() ?: 0L}). Triggering fallback."
+                                "Playback stalled with zero byte/buffer progress for ${eval.noProgressSeconds}s. " +
+                                    "Triggering bounded recovery."
                             )
-                            if (onPlaybackFailedCallback != null) {
-                                _errorMessage.value = "Playback link stalled. Trying alternative source..."
+                            val failureSignal = onFailureSignalCallback
+                            if (failureSignal != null) {
+                                _errorMessage.value = "Playback stalled without network progress. Recovering..."
+                                failureSignal.invoke(PlaybackFailureReason.STALL_NO_PROGRESS)
+                            } else if (onPlaybackFailedCallback != null) {
+                                _errorMessage.value = "Playback stalled without network progress. Recovering..."
                                 onPlaybackFailedCallback?.invoke()
                             } else {
                                 _errorMessage.value = "Stream buffering stalled. Please try another source."
                             }
                         }
-                    } else {
-                        bufferingSeconds = 0
+                    } else if (player.isPlaying) {
+                        activeSession?.let { onPositionUpdate?.invoke(it, pos, _duration.value) }
                     }
                 }
                 delay(1000)
@@ -770,15 +848,20 @@ class PlayerManager(
         exoPlayer?.pause()
     }
 
-    fun release() {
+    fun release(resetRetryBudget: Boolean = true) {
         playbackGeneration++
         tickerJob?.cancel()
         tickerJob = null
         networkTracker = null
+        healthMonitor = null
         onRetryRequested = null
         onPlaybackFailedCallback = null
+        onFailureSignalCallback = null
         lastWorkingTrackSelectionParams = null
         hasUnsupportedTrackError = false
+        if (resetRetryBudget) {
+            activeLogicalSessionKey = null
+        }
         exoPlayer?.let { player ->
             activeSession?.let { onPositionUpdate?.invoke(it, player.currentPosition, player.duration) }
             runCatching { player.stop() }
@@ -790,6 +873,7 @@ class PlayerManager(
         _isPlaying.value = false
         _isBuffering.value = false
         _isPlaybackEnded.value = false
+        _healthState.value = PlaybackHealthState.IDLE
         _currentPosition.value = 0L
         _duration.value = 0L
         _videoResolution.value = null
@@ -798,6 +882,15 @@ class PlayerManager(
         _availableSubtitles.value = emptyList()
         _availableQualities.value = emptyList()
         _errorMessage.value = null
+    }
+
+    private fun buildLogicalSessionKey(session: PlaybackSessionIdentity?, sourceId: String): String {
+        val normSrc = sourceId.trim()
+        return if (session != null) {
+            "${session.animeId}|${session.seasonNumber}|${session.episodeId}|${session.generation}|$normSrc"
+        } else {
+            "direct|$normSrc"
+        }
     }
 
     internal data class NetworkMetricsSnapshot(
@@ -922,18 +1015,17 @@ class PlayerManager(
         const val TAG = "PlayerManager"
         const val HTTP_CONNECT_TIMEOUT_MS = 12_000
         const val HTTP_READ_TIMEOUT_MS = 20_000
-        const val STALL_NO_DATA_SECONDS = 12
-        const val MAX_SLOW_BUFFER_SECONDS = 30
-        const val RECENT_TRANSFER_WINDOW_MS = 5_000L
+        const val STALL_NO_DATA_SECONDS = PlaybackHealthMonitor.DEFAULT_STALL_NO_PROGRESS_SECONDS
+        const val RECENT_TRANSFER_WINDOW_MS = PlaybackHealthMonitor.DEFAULT_RECENT_TRANSFER_WINDOW_MS
 
+        /**
+         * Slow-but-progressing downloads NEVER trigger stall fallback or source rediscovery.
+         * Only sustained zero-progress buffering reaches stall recovery.
+         */
         internal fun shouldTriggerBufferingStallFallback(
             bufferingSeconds: Int,
             hasRecentTransfer: Boolean
-        ): Boolean = if (hasRecentTransfer) {
-            bufferingSeconds >= MAX_SLOW_BUFFER_SECONDS
-        } else {
-            bufferingSeconds >= STALL_NO_DATA_SECONDS
-        }
+        ): Boolean = !hasRecentTransfer && bufferingSeconds >= STALL_NO_DATA_SECONDS
 
         /** Custom credential headers are not forwarded through uncontrolled CDN redirects. */
         fun isRedirectSensitiveHeader(headerName: String): Boolean {

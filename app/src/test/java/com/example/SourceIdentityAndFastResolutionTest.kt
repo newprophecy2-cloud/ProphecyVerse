@@ -8,11 +8,11 @@ import com.example.data.cache.MemoryCacheManager
 import com.example.data.d1.CloudflareD1ApiService
 import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1BooleanAdapterFactory
+import com.example.data.d1.D1StreamUrlRecordDto
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.EpisodeEntry
 import com.example.data.local.SeasonEntry
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.AniListData
 import com.example.data.remote.AniListGraphQLRequest
@@ -37,10 +37,7 @@ import com.example.data.repository.SourceIdentityValidator
 import com.example.data.repository.SourceResolutionDiagnosticException
 import com.example.data.repository.SourceValidationResult
 import com.example.data.repository.resolveVerifiedPlaybackForEpisode
-import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.FirestoreStreamingRepository
 import com.example.data.streaming.MonotonicMetrics
-import com.example.data.streaming.StreamRecordStatus
 import com.example.player.PreResolveQueueManager
 import com.example.ui.viewmodels.PlayerViewModel
 import com.google.firebase.FirebaseApp
@@ -106,6 +103,9 @@ class SourceIdentityAndFastResolutionTest {
             .build()
         SourceIdentityValidator.clearDiagnosticsForTests()
         MonotonicMetrics.clear()
+        while (EpisodeResolutionCoordinator.isForegroundResolutionActive()) {
+            EpisodeResolutionCoordinator.endForegroundResolution()
+        }
     }
 
     @After
@@ -130,22 +130,13 @@ class SourceIdentityAndFastResolutionTest {
     private fun createRepo(
         api: ProphecyVerseApiService,
         database: AppDatabase = db,
-        d1: CloudflareD1DataSource? = null
+        d1: CloudflareD1DataSource = createTestD1DataSource(metricsTracker = metricsTracker)
     ): AnimeRepository {
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = database.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false },
-            cloudStoreProvider = null,
-            d1DataSource = d1,
-            metricsTracker = metricsTracker
-        )
         return AnimeRepository(
             database = database,
             prophecyApi = api,
             aniListApi = noOpAniList(),
             applicationContext = context,
-            streamingRepository = streamingRepo,
             d1DataSource = d1,
             memoryCache = memoryCache,
             metricsTracker = metricsTracker
@@ -467,7 +458,9 @@ class SourceIdentityAndFastResolutionTest {
             catalogEpisodeId = "movie_$movieId"
         ).getOrThrow()
         assertEquals("https://cdn.example/movie_204.mp4", resolved.directData.playbackUrl)
-        assertTrue(db.streamCacheDao().getActiveSources("movie:204").isNotEmpty())
+        assertTrue(memoryCache.getStreamSnapshot("movie:204")?.sources?.isNotEmpty() == true)
+        assertTrue(db.episodeDao().getSeasonsForAnime(movieId).isEmpty())
+        assertTrue(db.episodeDao().getEpisodesForAnime(movieId).isEmpty())
 
         val invalidSeasonResp = ProphecyEpisodeFullResponse(
             selectedEpisode = ProphecyEpisodeDto(id = "be_movie_s1e1", season = 2, number = 1)
@@ -495,30 +488,35 @@ class SourceIdentityAndFastResolutionTest {
         val scopeEp2 = "anime:100:s1:e2"
         val scopeS2Ep1 = "anime:100:s2:e1"
 
-        val entityFromEp2 = StreamSourceEntity(
-            sourceDocKey = "$scopeEp2|p|pahe|s|$sharedSourceId",
-            scopeKey = scopeEp2,
-            providerId = "pahe",
+        val ep2Record = D1StreamUrlRecordDto(
+            id = CloudflareD1DataSource.deterministicRecordId("be_100", "be_100_e2", sharedSourceId),
+            animeId = "be_100",
+            episodeId = "be_100_e2",
             sourceId = sharedSourceId,
-            sourceName = "Pahe",
-            status = StreamRecordStatus.MISSING_URL.name,
+            streamUrl = "https://cdn.example/wrong_ep2.mp4",
             expiresAt = "2099-01-01T00:00:00Z"
         )
 
-        val sameSeasonCheck = SourceIdentityValidator.validateCachedSourceEntity(entityFromEp2, scopeEp1, sharedSourceId)
-        assertTrue(sameSeasonCheck is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (sameSeasonCheck as SourceValidationResult.Invalid).code)
+        val wrongEpCheck = SourceIdentityValidator.validateD1StreamUrlRecord(ep2Record, "be_100", "be_100_e1", sharedSourceId)
+        assertTrue(wrongEpCheck is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.EPISODE_ID_MISMATCH, (wrongEpCheck as SourceValidationResult.Invalid).code)
 
-        val diffSeasonCheck = SourceIdentityValidator.validateCachedSourceEntity(entityFromEp2, scopeS2Ep1, sharedSourceId)
-        assertTrue(diffSeasonCheck is SourceValidationResult.Invalid)
-        assertEquals(SourceDiagnosticCode.SEASON_MISMATCH, (diffSeasonCheck as SourceValidationResult.Invalid).code)
+        val wrongAnimeCheck = SourceIdentityValidator.validateD1StreamUrlRecord(ep2Record, "be_other", "be_100_e2", sharedSourceId)
+        assertTrue(wrongAnimeCheck is SourceValidationResult.Invalid)
+        assertEquals(SourceDiagnosticCode.ANIME_ID_MISMATCH, (wrongAnimeCheck as SourceValidationResult.Invalid).code)
 
-        // Store cached playback in Ep 2 scope in Room & Memory and ensure Ep 1 ignores it
+        // Store cached playback in Ep 2 scope in Memory & EpisodeDao snapshot and ensure Ep 1 ignores it
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 100, backendAnimeId = "be_100", preferredTitle = "Show 100", format = "TV", isPlayable = true)
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_100_1", animeId, 1, 1, "Ep 1")))
-        db.streamCacheDao().upsertSource(entityFromEp2)
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
+            scopeKey = scopeEp2,
+            seasonNumber = 1,
+            episodeNumber = 2,
+            sources = listOf(ProphecySourceDto(id = sharedSourceId, label = "Pahe"))
+        )
         memoryCache.putResolvedPlayback(
             sourceId = sharedSourceId,
             data = DirectPlayData(sourceId = sharedSourceId, playbackUrl = "https://cdn.example/wrong_ep2.mp4"),
@@ -1068,8 +1066,6 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 }
                 method == "POST" && path == "/v1/tables/stream_urls/upsert" -> {
-                    // Simulate slow 350ms D1 write to verify resolution returns immediately without blocking!
-                    Thread.sleep(350L)
                     d1UpsertCalls.incrementAndGet()
                     sendJson(exchange, 200, """{"success":true,"message":"Upserted"}""")
                 }
@@ -1122,17 +1118,15 @@ class SourceIdentityAndFastResolutionTest {
         assertEquals(1, fullCalls.get())
         assertEquals(0, directCalls.get())
 
-        val resolveStartedMs = System.nanoTime() / 1_000_000
         val resolved = repo.resolvePlayableStream(animeId, 1, 1, "ep_1200_1", preferredSourceId = "src_d1_only").getOrThrow()
-        val resolveElapsedMs = (System.nanoTime() / 1_000_000) - resolveStartedMs
 
         assertEquals(1, directCalls.get())
         assertEquals("be_1200", capturedRequest?.animeId)
         assertEquals("be_ep_1200", capturedRequest?.episodeId)
         assertEquals("src_d1_only", capturedRequest?.sourceId)
         assertEquals("https://verified.direct.example/1200.mp4", resolved.directData.playbackUrl)
-        assertTrue("Resolution should not wait for 350ms background D1 upsert (took ${resolveElapsedMs}ms)", resolveElapsedMs < 280L)
-        assertTrue("D1 must be checked before Backend resolution", d1Reads.get() == 1)
+        assertEquals("D1 must be checked before Backend resolution", 1, d1Reads.get())
+        assertEquals("Resolved URL must be saved to D1 before returning to player", 1, d1UpsertCalls.get())
     }
 
     // Scenario 13 (+ PlayerViewModel generation guard): Resolution failure cleanly exits resolving state

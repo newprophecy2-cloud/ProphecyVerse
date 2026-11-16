@@ -307,7 +307,7 @@ class PreResolveQueueManager(private val repository: AnimeRepository, private va
         val key = identity(animeId, episode)
         return try {
             waitUntilBackgroundAllowed()
-            withTimeout(15_000L) {
+            withTimeout(35_000L) {
                 // Delegates through cache-first Room -> Firestore -> Backend discovery/resolve with background priority
                 val verified = repository.resolveVerifiedPlaybackForEpisode(
                     animeOrBackendId = animeId,

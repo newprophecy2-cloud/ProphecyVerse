@@ -31,7 +31,6 @@ import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeCatalogState
 import com.example.data.repository.EpisodeSourceResponseState
-import com.example.data.streaming.FirestoreStreamingRepository
 import com.example.ui.viewmodels.DetailViewModel
 import com.example.ui.viewmodels.PlayerViewModel
 import com.example.ui.viewmodels.SearchViewModel
@@ -350,17 +349,12 @@ class Phase2ApiAndEpisodeSourcesTest {
         aniList: RecordingAniListApi = RecordingAniListApi(),
         database: AppDatabase = db
     ): Triple<AnimeRepository, RecordingBackendApi, RecordingAniListApi> {
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = database.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { true }
-        )
         val repo = AnimeRepository(
             database = database,
             prophecyApi = backend,
             aniListApi = aniList,
             applicationContext = context,
-            streamingRepository = streamingRepo
+            d1DataSource = createTestD1DataSource()
         )
         return Triple(repo, backend, aniList)
     }
@@ -577,7 +571,12 @@ class Phase2ApiAndEpisodeSourcesTest {
         val playDeadline = System.currentTimeMillis() + 4_000L
         while (System.currentTimeMillis() < playDeadline) {
             shadowOf(android.os.Looper.getMainLooper()).idle()
-            if (backend.directPlayRequests.isNotEmpty()) break
+            if (backend.directPlayRequests.isNotEmpty() &&
+                !playerVm.isResolving.value &&
+                !com.example.data.repository.EpisodeResolutionCoordinator.isForegroundResolutionActive()
+            ) {
+                break
+            }
             Thread.sleep(25L)
         }
         assertEquals("be_ep_201", playerVm.currentEpisode.value?.id)

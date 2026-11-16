@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "Prophecy Verse"
+rootProject.name = "My Application"
 
 include(":app")

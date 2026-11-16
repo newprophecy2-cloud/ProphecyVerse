@@ -25,7 +25,6 @@ import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeResolutionCoordinator
 import com.example.data.repository.SourceIdentityValidator
 import com.example.data.repository.resolveVerifiedPlaybackForEpisode
-import com.example.data.streaming.FirestoreStreamingRepository
 import com.example.data.streaming.MonotonicMetrics
 import com.example.player.PreResolvePlan
 import com.example.player.PreResolveQueueManager
@@ -97,21 +96,12 @@ class Fix1And2PrioritySchedulerTest {
     }
 
     private fun createRepo(api: ProphecyVerseApiService): AnimeRepository {
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false },
-            cloudStoreProvider = null,
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
         return AnimeRepository(
             database = db,
             prophecyApi = api,
             aniListApi = noOpAniList(),
             applicationContext = context,
-            streamingRepository = streamingRepo,
-            d1DataSource = null,
+            d1DataSource = createTestD1DataSource(metricsTracker),
             memoryCache = memoryCache,
             metricsTracker = metricsTracker
         )

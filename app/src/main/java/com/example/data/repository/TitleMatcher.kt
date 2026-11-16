@@ -180,17 +180,21 @@ object TitleMatcher {
             out += cleanCanonical
         }
         all.take(4).forEach { out += it }
-        if (!isMovie) {
-            for (t in all.take(4)) {
-                val stripped = t
+        for (t in all.take(4)) {
+            val withoutYear = t.replace(Regex("""\s*\((?:19|20)\d{2}\)\s*$"""), "").trim()
+            if (withoutYear.length >= 3 && withoutYear.lowercase(Locale.ROOT) != t.lowercase(Locale.ROOT)) {
+                out += withoutYear
+            }
+            if (!isMovie) {
+                val stripped = withoutYear
                     .replace(Regex("""\s*-\s*[^-]+-\s*$"""), "")
                     .replace(TRAILING_MARKER_REGEX, "")
                     .trim()
-                if (stripped.length >= 3 && stripped.lowercase(Locale.ROOT) != t.lowercase(Locale.ROOT)) {
+                if (stripped.length >= 3 && stripped.lowercase(Locale.ROOT) != withoutYear.lowercase(Locale.ROOT)) {
                     out += stripped
                 }
-                if (t.contains(':')) {
-                    val prefix = t.substringBefore(':').trim()
+                if (withoutYear.contains(':')) {
+                    val prefix = withoutYear.substringBefore(':').trim()
                     if (prefix.length >= 4 && prefix.split(" ").size >= 2) {
                         out += prefix
                     }
@@ -278,7 +282,10 @@ object TitleMatcher {
             aliases.forEach { add(it) }
         }.filter { it.isNotBlank() }.distinct()
 
-        val candidateTitles = rawEntryTitles.map(::normalize).filter { it.isNotBlank() }.distinct()
+        val yearSuffixNormalized = rawEntryTitles
+            .map { it.replace(Regex("""\s*\((?:19|20)\d{2}\)\s*$"""), "").trim() }
+            .filter { it.isNotBlank() }
+        val candidateTitles = (rawEntryTitles + yearSuffixNormalized).map(::normalize).filter { it.isNotBlank() }.distinct()
         val entryYear = entry.year?.toIntOrNull()
         val prophecyYear = prophecyItem.year?.toIntOrNull()
         val hasCanonicalSequel = !entryIsMovie &&

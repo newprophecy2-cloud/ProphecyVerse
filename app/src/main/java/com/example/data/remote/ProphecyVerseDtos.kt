@@ -89,7 +89,8 @@ data class ProphecyEpisodeFullResponse(
     @Json(name = "sources") val sources: List<ProphecySourceDto>? = null,
     @Json(name = "sources_status") val sourcesStatus: String? = null,
     @Json(name = "sources_partial") val sourcesPartial: Boolean? = null,
-    @Json(name = "source_error") val sourceError: String? = null
+    @Json(name = "source_error") val sourceError: String? = null,
+    @Json(name = "provider_status") val providerStatus: Map<String, String>? = null
 )
 
 @JsonClass(generateAdapter = true)

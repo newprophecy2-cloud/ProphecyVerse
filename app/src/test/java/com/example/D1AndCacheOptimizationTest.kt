@@ -31,7 +31,6 @@ import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeCatalogState
 import com.example.data.repository.SourceIdentityValidator
 import com.example.data.repository.SourceValidationResult
-import com.example.data.streaming.FirestoreStreamingRepository
 import com.google.firebase.FirebaseApp
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -360,6 +359,7 @@ class D1AndCacheOptimizationTest {
                     ProphecyAnimeDetailsResponse(
                         id = "be-500",
                         title = "Frieren",
+                        partial = false,
                         seasons = listOf(
                             ProphecySeasonDto(
                                 number = 1,
@@ -407,27 +407,16 @@ class D1AndCacheOptimizationTest {
 
         val d1 = CloudflareD1DataSource(d1Api, metricsTracker)
         val memCache = MemoryCacheManager(metricsTracker = metricsTracker)
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false },
-            cloudStoreProvider = null,
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
-        assertFalse("FirestoreStreamingRepository must NOT use D1 as metadata primary", streamingRepo.usesD1Primary)
 
         val repo = AnimeRepository(
             database = db,
             prophecyApi = prophecyApi,
             aniListApi = aniList,
             applicationContext = context,
-            streamingRepository = streamingRepo,
             d1DataSource = d1,
             memoryCache = memCache,
             metricsTracker = metricsTracker
         )
-        assertFalse(repo.usesFirestoreStreamingRealtime)
 
         db.animeDao().upsertAnime(
             AnimeEntry(id = "anilist_500", aniListId = 500, backendAnimeId = "be-500", preferredTitle = "Frieren", format = "TV", isPlayable = true)

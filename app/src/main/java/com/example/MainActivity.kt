@@ -101,19 +101,6 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             NoticeManager.getInstance(applicationContext).checkAndPrepareNotice(forceShow = false)
             com.example.data.firebase.AuthManager.getInstance(applicationContext).ensureGuestSignIn()
-            if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
-                launch(kotlinx.coroutines.Dispatchers.IO) {
-                    runCatching {
-                        val repo = com.example.data.repository.AnimeRepository.getInstance(applicationContext)
-                        if (repo.streamingRepository.pendingOutboxCount() > 0) {
-                            repo.streamingRepository.flushPendingOutbox()
-                        }
-                        if (repo.usesFirestoreStreamingRealtime) {
-                            repo.processPendingSharedCatalogQueue()
-                        }
-                    }
-                }
-            }
             com.example.data.firebase.AppAnalytics.getInstance(applicationContext).logEvent("app_open")
             com.example.data.firebase.CloudHistoryRepository.getInstance(applicationContext).pullCloudHistoryAndWatchlist()
         }
@@ -157,19 +144,6 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         com.example.data.firebase.InstallationManager.getInstance(applicationContext).recordHeartbeat()
         com.example.data.firebase.VersionControlManager.getInstance(applicationContext).checkForUpdates()
-        if (com.google.firebase.auth.FirebaseAuth.getInstance().currentUser != null) {
-            lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                runCatching {
-                    val repo = com.example.data.repository.AnimeRepository.getInstance(applicationContext)
-                    if (repo.streamingRepository.pendingOutboxCount() > 0) {
-                        repo.streamingRepository.flushPendingOutbox()
-                    }
-                    if (repo.usesFirestoreStreamingRealtime) {
-                        repo.processPendingSharedCatalogQueue()
-                    }
-                }
-            }
-        }
     }
 
     override fun onPictureInPictureModeChanged(

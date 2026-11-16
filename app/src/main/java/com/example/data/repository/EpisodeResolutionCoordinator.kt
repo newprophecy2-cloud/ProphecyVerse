@@ -220,7 +220,7 @@ suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
         EpisodeResolutionCoordinator.resolve("verified:$key", priority = priority) {
             val startedAt = MonotonicMetrics.nowMs()
             try {
-                withTimeout(22_000L) {
+                withTimeout(45_000L) {
                     val resolved = resolvePlayableStream(
                         animeId = targetAnimeId,
                         seasonNumber = episode.seasonNumber,
@@ -228,7 +228,8 @@ suspend fun AnimeRepository.resolveVerifiedPlaybackForEpisode(
                         catalogEpisodeId = episode.id,
                         preferredSourceId = normPreferred.takeIf { it.isNotEmpty() },
                         forceResolveFresh = forceResolveFresh,
-                        preferredProviderId = normProvider.takeIf { it.isNotEmpty() }
+                        preferredProviderId = normProvider.takeIf { it.isNotEmpty() },
+                        allowBypassBackoff = isForeground
                     ).getOrElse { return@withTimeout Result.failure(it) }
 
                     MonotonicMetrics.recordDuration(

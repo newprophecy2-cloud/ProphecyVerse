@@ -2,6 +2,8 @@ package com.example.data.d1
 
 import android.util.Log
 import com.example.data.metrics.DatabaseMetricsTracker
+import com.example.data.metrics.PlaybackDiagnosticEvent
+import com.example.data.metrics.PlaybackDiagnosticsLogger
 import com.example.data.repository.ExpiryState
 import com.example.data.repository.SourceExpiryTime
 import com.example.data.streaming.MonotonicMetrics
@@ -118,16 +120,24 @@ class CloudflareD1DataSource(
     }
 
     private fun readDigest(key: String): String? =
-        writtenDigests[key] ?: digestStore.get(key)?.also { writtenDigests[key] = it }
+        writtenDigests[key] ?: digestStore.get(key)
 
-    private fun saveDigest(key: String, digest: String) {
+    private fun isPersistedDigestStale(key: String, nowMs: Long): Boolean {
+        if (writtenDigests.containsKey(key)) return false
+        val savedAt = digestStore.getLong("ts:$key") ?: return true
+        return (nowMs - savedAt).coerceAtLeast(0L) >= PERSISTED_DIGEST_MAX_AGE_MS
+    }
+
+    private fun saveDigest(key: String, digest: String, nowMs: Long = System.currentTimeMillis()) {
         writtenDigests[key] = digest
         digestStore.put(key, digest)
+        digestStore.putLong("ts:$key", nowMs)
     }
 
     private fun removeDigest(key: String) {
         writtenDigests.remove(key)
         digestStore.remove(key)
+        digestStore.remove("ts:$key")
     }
 
     private suspend fun <T> withWriteLock(key: String, block: suspend () -> T): T {
@@ -228,7 +238,13 @@ class CloudflareD1DataSource(
 
     suspend fun verifyHealth(): Boolean {
         val resp = executeWithRetry("verifyHealth") { api.listTables() } ?: return false
-        return resp.isSuccessful && resp.body()?.success == true
+        val body = resp.body() ?: return false
+        if (!resp.isSuccessful || !body.success) return false
+        val hasStreamUrlsTable = body.tables.any { it.equals("stream_urls", ignoreCase = true) }
+        if (!hasStreamUrlsTable) {
+            Log.w(TAG, "D1 health check schema mismatch: 'stream_urls' table missing; available=${body.tables}")
+        }
+        return hasStreamUrlsTable
     }
 
     /**
@@ -253,15 +269,47 @@ class CloudflareD1DataSource(
             val resp = executeWithRetry("getStreamUrl") {
                 api.getStreamUrl(recordId)
             }
-            if (resp == null || !resp.isSuccessful) {
+            if (resp == null) {
+                return@coalesceRead null
+            }
+            if (resp.code() == 404 || resp.code() == 410) {
+                removeDigest(lockKey)
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource,
+                    reason = "http_${resp.code()}"
+                )
+                return@coalesceRead null
+            }
+            if (!resp.isSuccessful) {
                 return@coalesceRead null
             }
             val body = resp.body()
             if (body == null || !body.success) {
+                removeDigest(lockKey)
                 Log.w(TAG, "D1 getStreamUrl unsuccessful response: ${body?.error ?: "empty body"}")
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource,
+                    reason = "unsuccessful_body"
+                )
                 return@coalesceRead null
             }
-            val record = body.data ?: return@coalesceRead null
+            val record = body.data ?: run {
+                removeDigest(lockKey)
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource,
+                    reason = "empty_data"
+                )
+                return@coalesceRead null
+            }
 
             if (record.animeId.trim() != normAnime ||
                 record.episodeId.trim() != normEpisode ||
@@ -279,10 +327,23 @@ class CloudflareD1DataSource(
             when (SourceExpiryTime.evaluateExpiry(rawExpiry, nowMs)) {
                 ExpiryState.EXPIRED, ExpiryState.INVALID -> {
                     removeDigest(lockKey)
+                    PlaybackDiagnosticsLogger.log(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_MISS,
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource,
+                        reason = "expired_or_invalid"
+                    )
                     null
                 }
                 ExpiryState.MISSING -> {
-                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n"))
+                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n"), nowMs)
+                    PlaybackDiagnosticsLogger.log(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_HIT,
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource
+                    )
                     CachedStreamUrl(
                         animeId = normAnime,
                         episodeId = normEpisode,
@@ -292,7 +353,13 @@ class CloudflareD1DataSource(
                     )
                 }
                 ExpiryState.VALID -> {
-                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n${rawExpiry.orEmpty()}"))
+                    saveDigest(lockKey, sha256Hex("$normAnime\n$normEpisode\n$normSource\n$candidateUrl\n${rawExpiry.orEmpty()}"), nowMs)
+                    PlaybackDiagnosticsLogger.log(
+                        event = PlaybackDiagnosticEvent.D1_CACHE_HIT,
+                        animeId = normAnime,
+                        episodeId = normEpisode,
+                        sourceId = normSource
+                    )
                     CachedStreamUrl(
                         animeId = normAnime,
                         episodeId = normEpisode,
@@ -315,7 +382,8 @@ class CloudflareD1DataSource(
         sourceId: String,
         streamUrl: String,
         expiresAt: String? = null,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        forceWrite: Boolean = false
     ): Boolean {
         val normAnime = animeId.trim()
         val normEpisode = episodeId.trim()
@@ -335,7 +403,8 @@ class CloudflareD1DataSource(
         val lockKey = digestKey(normAnime, normEpisode, normSource)
         return withWriteLock(lockKey) {
             val digest = sha256Hex("$normAnime\n$normEpisode\n$normSource\n$normUrl\n${normalizedExpiry.orEmpty()}")
-            if (readDigest(lockKey) == digest) {
+            if (!forceWrite && readDigest(lockKey) == digest && !isPersistedDigestStale(lockKey, nowMs)) {
+                writtenDigests[lockKey] = digest
                 metricsTracker.recordD1WriteSkipped()
                 return@withWriteLock true
             }
@@ -353,7 +422,13 @@ class CloudflareD1DataSource(
             }
             val succeeded = resp != null && resp.isSuccessful && (resp.body()?.success != false)
             if (succeeded) {
-                saveDigest(lockKey, digest)
+                saveDigest(lockKey, digest, nowMs)
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_WRITE,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource
+                )
             } else {
                 Log.w(TAG, "D1 saveStreamUrl failed: ${resp?.body()?.error ?: "http=${resp?.code()}"}")
             }
@@ -381,7 +456,16 @@ class CloudflareD1DataSource(
             val resp = executeWithRetry("deleteStreamUrl", isWrite = true) {
                 api.deleteStreamUrl(id)
             }
-            resp != null && (resp.isSuccessful || resp.code() == 404)
+            val ok = resp != null && (resp.isSuccessful || resp.code() == 404)
+            if (ok) {
+                PlaybackDiagnosticsLogger.log(
+                    event = PlaybackDiagnosticEvent.D1_CACHE_INVALIDATED,
+                    animeId = normAnime,
+                    episodeId = normEpisode,
+                    sourceId = normSource
+                )
+            }
+            ok
         }
     }
 
@@ -397,6 +481,7 @@ class CloudflareD1DataSource(
         private const val TAG = "CloudflareD1"
         private const val MAX_RETRIES = 2
         private const val BASE_RETRY_DELAY_MS = 180L
+        private const val PERSISTED_DIGEST_MAX_AGE_MS = 10 * 60 * 1000L
 
         fun deterministicRecordId(animeId: String, episodeId: String, sourceId: String): String {
             val raw = "${animeId.trim()}\n${episodeId.trim()}\n${sourceId.trim()}"

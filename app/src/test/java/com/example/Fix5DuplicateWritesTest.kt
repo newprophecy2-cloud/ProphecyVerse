@@ -7,23 +7,8 @@ import com.example.data.d1.CloudflareD1ApiService
 import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1BooleanAdapterFactory
 import com.example.data.d1.SharedPreferencesD1DigestStore
-import com.example.data.local.AnimeAlias
-import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
-import com.example.data.local.CatalogMapping
-import com.example.data.local.EpisodeEntry
-import com.example.data.local.SeasonEntry
-import com.example.data.local.StreamContainerEntity
-import com.example.data.local.StreamEpisodeEntity
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSeasonEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
-import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.DiscoveryStatus
-import com.example.data.streaming.FirestoreStreamingRepository
-import com.example.data.streaming.StreamRecordStatus
-import com.example.data.streaming.StreamingCloudStore
 import com.google.firebase.FirebaseApp
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -113,51 +98,6 @@ class Fix5DuplicateWritesTest {
         exchange.responseHeaders.add("Content-Type", "application/json")
         exchange.sendResponseHeaders(status, bytes.size.toLong())
         exchange.responseBody.use { it.write(bytes) }
-    }
-
-    private class CountingCloudStore : StreamingCloudStore {
-        val docs = ConcurrentHashMap<String, Map<String, Any?>>()
-        val batchCommits = AtomicInteger(0)
-        val mergeCalls = AtomicInteger(0)
-        val txCalls = AtomicInteger(0)
-
-        override suspend fun getDoc(operation: String, path: String, preferCache: Boolean): StreamingCloudStore.RemoteSnapshot? {
-            val data = docs[path] ?: return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, false, emptyMap())
-            return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, true, data)
-        }
-
-        override suspend fun listCollection(operation: String, collectionPath: String, preferCache: Boolean): List<StreamingCloudStore.RemoteSnapshot> {
-            val prefix = "$collectionPath/"
-            return docs.entries
-                .filter { it.key.startsWith(prefix) && !it.key.removePrefix(prefix).contains('/') }
-                .map { StreamingCloudStore.RemoteSnapshot(it.key.removePrefix(prefix), it.key, true, it.value) }
-        }
-
-        override suspend fun commitBatch(operation: String, writes: List<StreamingCloudStore.DocWrite>) {
-            batchCommits.incrementAndGet()
-            Thread.sleep(10)
-            writes.forEach { docs[it.path] = it.data }
-        }
-
-        override suspend fun mergeDoc(operation: String, path: String, data: Map<String, Any?>) {
-            mergeCalls.incrementAndGet()
-            Thread.sleep(10)
-            val existing = docs[path].orEmpty().toMutableMap()
-            existing.putAll(data)
-            docs[path] = existing
-        }
-
-        override suspend fun <T> runTx(operation: String, readPath: String, block: (StreamingCloudStore.RemoteSnapshot?) -> Pair<T, List<StreamingCloudStore.DocWrite>>): T {
-            txCalls.incrementAndGet()
-            Thread.sleep(10)
-            val snap = docs[readPath]?.let { StreamingCloudStore.RemoteSnapshot(readPath.substringAfterLast('/'), readPath, true, it) }
-            val (result, writes) = block(snap)
-            writes.forEach { docs[it.path] = it.data }
-            return result
-        }
-
-        override fun observeDoc(path: String, onUpdate: (StreamingCloudStore.RemoteSnapshot?) -> Unit, onError: (Throwable) -> Unit): () -> Unit = {}
-        override fun observeCollection(collectionPath: String, onUpdate: (List<StreamingCloudStore.RemoteSnapshot>) -> Unit, onError: (Throwable) -> Unit): () -> Unit = {}
     }
 
     @Test
@@ -278,127 +218,5 @@ class Fix5DuplicateWritesTest {
         }.awaitAll()
         assertTrue(writeResults.all { it })
         assertEquals("Concurrent identical D1 stream_url writes must coalesce to 1 POST", 1, streamUrlWrites.get())
-    }
-
-    @Test
-    fun fix5_concurrentAndRepeatedRoomFirestoreWrites_coalesceAndSkipDuplicates() = runBlocking {
-        val cloudStore = CountingCloudStore()
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { true },
-            cloudStoreProvider = { cloudStore },
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
-        val contentKey = "503"
-        val scopeKey = "anime:503:s1:e1"
-        val providerId = ContentIdentityHelper.deterministicProviderId("AnimePahe")
-        val providers = listOf(
-            StreamProviderEntity("$scopeKey|p|$providerId", scopeKey, providerId, "AnimePahe", sourceCount = 1, updatedAt = 1000L)
-        )
-        val sources = listOf(
-            StreamSourceEntity("$scopeKey|p|$providerId|s|src503", scopeKey, providerId, "src503", "AnimePahe 1080p", updatedAt = 1000L)
-        )
-
-        // 5 parallel identical discovery publishes -> only 1 Firestore batch commit, subsequent skipped via Room diff
-        val discoveryResults = (1..5).map {
-            async {
-                streamingRepo.publishDiscoveryAndSyncRoom(
-                    contentKey = contentKey,
-                    anilistId = 503,
-                    isMovie = false,
-                    backendId = "b_503",
-                    seasonNumber = 1,
-                    episodeNumber = 1,
-                    providers = providers,
-                    sources = sources,
-                    discoveryStatus = DiscoveryStatus.COMPLETED,
-                    canonicalTitle = "Dedupe Anime"
-                )
-            }
-        }.awaitAll()
-        assertTrue(discoveryResults.all { it })
-        assertEquals("Concurrent identical discovery calls must coalesce to 1 Firestore batch", 1, cloudStore.batchCommits.get())
-
-        // Repeat discovery publish sequentially -> skipped cleanly with zero additional batch commits
-        assertTrue(
-            streamingRepo.publishDiscoveryAndSyncRoom(
-                contentKey = contentKey,
-                anilistId = 503,
-                isMovie = false,
-                backendId = "b_503",
-                seasonNumber = 1,
-                episodeNumber = 1,
-                providers = providers,
-                sources = sources,
-                discoveryStatus = DiscoveryStatus.COMPLETED,
-                canonicalTitle = "Dedupe Anime"
-            )
-        )
-        assertEquals(1, cloudStore.batchCommits.get())
-        assertTrue(metricsTracker.snapshot().firestoreWriteSkipsUnchanged >= 1)
-
-        // 4 parallel identical resolved URL writes -> only 1 Firestore transaction
-        val resolvedSource = sources.first()
-        val resolveResults = (1..4).map {
-            async {
-                streamingRepo.publishResolvedStreamUrl(
-                    sourceEntity = resolvedSource,
-                    contentKey = contentKey,
-                    isMovie = false,
-                    seasonNumber = 1,
-                    episodeNumber = 1,
-                    streamUrl = "https://cdn.example.com/503/master.m3u8",
-                    urlType = "hls",
-                    contentType = "application/x-mpegURL",
-                    safeHeaders = listOf(listOf("Referer", "https://kwik.si/")),
-                    expiresAt = "2099-01-01T00:00:00Z",
-                    verifiedAt = 5000L,
-                    canonicalTitle = "Dedupe Anime",
-                    backendId = "b_503"
-                )
-            }
-        }.awaitAll()
-        assertTrue(resolveResults.all { it })
-        assertEquals("Concurrent identical resolved URL publishes must coalesce to 1 Firestore tx", 1, cloudStore.txCalls.get())
-
-        // Repeat identical resolved URL publish -> skipped cleanly
-        assertTrue(
-            streamingRepo.publishResolvedStreamUrl(
-                sourceEntity = resolvedSource,
-                contentKey = contentKey,
-                isMovie = false,
-                seasonNumber = 1,
-                episodeNumber = 1,
-                streamUrl = "https://cdn.example.com/503/master.m3u8",
-                urlType = "hls",
-                contentType = "application/x-mpegURL",
-                safeHeaders = listOf(listOf("Referer", "https://kwik.si/")),
-                expiresAt = "2099-01-01T00:00:00Z",
-                verifiedAt = 6000L,
-                canonicalTitle = "Dedupe Anime",
-                backendId = "b_503"
-            )
-        )
-        assertEquals(1, cloudStore.txCalls.get())
-
-        // Concurrent playback success writes -> cooldown re-checked inside per-source lock, only 1 mergeDoc
-        val latestEntity = db.streamCacheDao().getLatestActiveSourceForProviderInScope(scopeKey, providerId, "src503")!!
-        val playbackResults = (1..4).map {
-            async {
-                streamingRepo.recordPlaybackSuccess(
-                    sourceEntity = latestEntity,
-                    contentKey = contentKey,
-                    isMovie = false,
-                    seasonNumber = 1,
-                    episodeNumber = 1,
-                    canonicalTitle = "Dedupe Anime",
-                    backendId = "b_503"
-                )
-            }
-        }.awaitAll()
-        assertTrue(playbackResults.all { it })
-        assertEquals("Concurrent playback success writes within cooldown should execute at most 1 Room update + skip duplicates", 1, cloudStore.mergeCalls.get())
     }
 }

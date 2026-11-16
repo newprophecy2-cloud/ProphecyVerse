@@ -19,6 +19,9 @@ import com.example.data.repository.EpisodeCatalogRefreshStatus
 import com.example.data.repository.EpisodeCatalogState
 import com.example.data.repository.EpisodeRecordPagination
 import com.example.data.repository.EpisodeSourceResponseState
+import com.example.player.PlaybackFailureReason
+import com.example.player.PlaybackRecoveryCoordinator
+import com.example.player.PlaybackRecoveryKey
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
 import com.example.player.PreResolvePlan
@@ -87,15 +90,6 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             viewModelScope.launch {
-                // When internet connectivity returns, flush queued writes if any and refresh feeds
-                launch(kotlinx.coroutines.Dispatchers.IO) {
-                    if (repository.streamingRepository.pendingOutboxCount() > 0) {
-                        runCatching { repository.streamingRepository.flushPendingOutbox() }
-                    }
-                    if (repository.usesFirestoreStreamingRealtime) {
-                        runCatching { repository.processPendingSharedCatalogQueue() }
-                    }
-                }
                 repository.refreshHomeDiscovery(force = false)
             }
         }
@@ -320,8 +314,6 @@ class DetailViewModel(
     val syncError: StateFlow<String?> = _syncError.asStateFlow()
     private var refreshJob: Job? = null
     private var sourceDiscoveryJob: Job? = null
-    private var scopedListenerJob: Job? = null
-    private var activeScopedListenerKey: String? = null
     private var sourceRequestGeneration: Long = 0L
 
     // In-memory episode or movie source selection
@@ -393,9 +385,6 @@ class DetailViewModel(
                     )
                 }
                 .collect { (anime, window, history) ->
-                    if (anime != null && com.example.data.streaming.ContentIdentityHelper.isMovie(anime)) {
-                        attachScopedListener(anime, isMovie = true, seasonNumber = 0, episodeNumber = 1, catalogEpisodeId = null)
-                    }
                     checkCachedSourceStatesForWindow(window, anime, history)
                 }
         }
@@ -568,9 +557,6 @@ class DetailViewModel(
         val entry = animeEntry.value
         val isMovie = com.example.data.streaming.ContentIdentityHelper.isMovie(entry) ||
             episode.seasonNumber == 0 || episode.id.startsWith("movie_")
-        if (entry != null) {
-            attachScopedListener(entry, isMovie, episode.seasonNumber, episode.episodeNumber, episode.id)
-        }
 
         sourceDiscoveryJob = viewModelScope.launch {
             _isLoadingSources.value = true
@@ -635,53 +621,6 @@ class DetailViewModel(
         }
     }
 
-    private fun attachScopedListener(
-        entry: AnimeEntry,
-        isMovie: Boolean,
-        seasonNumber: Int,
-        episodeNumber: Int,
-        catalogEpisodeId: String?
-    ) {
-        if (!repository.usesFirestoreStreamingRealtime) return
-        val contentKey = com.example.data.streaming.ContentIdentityHelper.canonicalContentKey(animeId, entry)
-        val effectiveSeason = if (isMovie) 0 else com.example.data.streaming.ContentIdentityHelper.effectiveSeasonNumber(entry, seasonNumber, isMovie = false)
-        val targetEpisodeId = catalogEpisodeId ?: "movie_${entry.id}"
-        val listenerKey = "$contentKey|$isMovie|$effectiveSeason|$episodeNumber|$targetEpisodeId"
-        if (activeScopedListenerKey == listenerKey && scopedListenerJob?.isActive == true) return
-        activeScopedListenerKey = listenerKey
-        scopedListenerJob?.cancel()
-        scopedListenerJob = viewModelScope.launch {
-            repository.streamingRepository.observeScopedStreamingUpdates(
-                contentKey = contentKey,
-                isMovie = isMovie,
-                seasonNumber = effectiveSeason,
-                episodeNumber = if (isMovie) 1 else episodeNumber,
-                catalogEpisodeId = targetEpisodeId
-            ).collect { scoped ->
-                val activeEp = _selectedEpisodeForSources.value
-                if (scoped.sources.isNotEmpty() && (isMovie || activeEp?.id == targetEpisodeId)) {
-                    val dtos = scoped.sources.filter { it.status != "REMOVED" && it.deletedAt == null }
-                        .map {
-                            ProphecySourceDto(
-                                id = it.sourceId,
-                                label = it.sourceName,
-                                quality = it.quality,
-                                codec = it.codec,
-                                language = it.audioLanguage,
-                                sizeBytes = it.sizeBytes,
-                                downloadable = it.downloadable,
-                                expiresAt = it.expiresAt
-                            )
-                        }
-                    if (dtos.isNotEmpty()) {
-                        _episodeSources.value = dtos
-                        _episodeSourceStates.value = _episodeSourceStates.value + (targetEpisodeId to EpisodeSourceState.AVAILABLE)
-                    }
-                }
-            }
-        }
-    }
-
     private fun mapResponseState(state: EpisodeSourceResponseState): EpisodeSourceState = when (state) {
         EpisodeSourceResponseState.AVAILABLE -> EpisodeSourceState.AVAILABLE
         EpisodeSourceResponseState.EMPTY -> EpisodeSourceState.EMPTY
@@ -696,12 +635,6 @@ class DetailViewModel(
         sourceRequestGeneration += 1L
         sourceDiscoveryJob?.cancel()
         sourceDiscoveryJob = null
-        val anime = animeEntry.value
-        if (anime == null || !com.example.data.streaming.ContentIdentityHelper.isMovie(anime)) {
-            scopedListenerJob?.cancel()
-            scopedListenerJob = null
-            activeScopedListenerKey = null
-        }
         _isLoadingSources.value = false
         _selectedEpisodeForSources.value = null
         _episodeSources.value = emptyList()
@@ -710,7 +643,6 @@ class DetailViewModel(
 
     override fun onCleared() {
         super.onCleared()
-        scopedListenerJob?.cancel()
         sourceDiscoveryJob?.cancel()
         refreshJob?.cancel()
         automaticSourceJobs.values.forEach { it.cancel() }
@@ -841,11 +773,9 @@ class PlayerViewModel(
     private var activeDirectData: DirectPlayData? = null
     private var activeSourceId: String? = null
     private var playbackResolutionJob: Job? = null
-    private var scopedListenerJob: Job? = null
     private var playbackGeneration: Long = 0L
-    private var retriedSourceGeneration: Long = -1L
-    private val retriedSourceIds = mutableSetOf<String>()
-    private val reportedSuccessKeys = mutableSetOf<String>()
+    private val recoveryCoordinator = PlaybackRecoveryCoordinator(viewModelScope)
+    private val sessionRecoveryMarkers = mutableSetOf<String>()
 
     val unifiedAudioTracks: StateFlow<List<PlayerManager.TrackOption>> = combine(
         _availableSources,
@@ -892,23 +822,6 @@ class PlayerViewModel(
                 buffering && player != null && err == null
             }.distinctUntilChanged().collect { shouldThrottle ->
                 preResolveManager.setPlaybackBuffering(shouldThrottle)
-            }
-        }
-
-        // Report actual playback success to Firestore/Room when ExoPlayer begins playing a source
-        viewModelScope.launch {
-            playerManager.isPlaying.collect { playing ->
-                val ep = _currentEpisode.value
-                val srcId = activeSourceId
-                val provId = _activeSource.value?.label?.let {
-                    com.example.data.streaming.ContentIdentityHelper.deterministicProviderId(it)
-                }
-                if (playing && ep != null && !srcId.isNullOrBlank()) {
-                    val key = "${ep.id}|$srcId|${provId.orEmpty()}"
-                    if (reportedSuccessKeys.add(key)) {
-                        repository.reportPlaybackSuccess(animeId, srcId, ep.seasonNumber, ep.episodeNumber, provId)
-                    }
-                }
             }
         }
 
@@ -1047,8 +960,8 @@ class PlayerViewModel(
             !playerManager.isPlaybackEnded.value &&
             playerManager.exoPlayerInstance.value != null) return
         val requestGeneration = ++playbackGeneration
-        retriedSourceGeneration = requestGeneration
-        retriedSourceIds.clear()
+        sessionRecoveryMarkers.clear()
+        recoveryCoordinator.beginGeneration(requestGeneration)
         playbackResolutionJob?.cancel()
         _currentEpisode.value = episode
         _selectedSeason.value = episode.seasonNumber
@@ -1103,52 +1016,17 @@ class PlayerViewModel(
                             onPlaybackFailed = null,
                             onRetryNeeded = {},
                             providerName = "Offline",
-                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L)
+                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, requestGeneration)
                         )
                         return@launch
                     }
                 }
 
-                // 2. Online cache-first playback flow (Memory -> Room -> D1/Firestore -> Lazy Backend Discovery + Direct Resolve)
+                // 2. Online cache-first playback flow (Memory -> Room metadata -> Cloudflare D1 -> Backend Discovery & Direct Resolve)
                 val anime = db.animeDao().getAnimeById(animeId) ?: animeEntry.value
                 if (requestGeneration != playbackGeneration) return@launch
                 val isMovieTarget = com.example.data.streaming.ContentIdentityHelper.isMovie(anime) ||
                     episode.seasonNumber == 0 || episode.id.startsWith("movie_")
-                val contentKey = com.example.data.streaming.ContentIdentityHelper.canonicalContentKey(animeId, anime)
-                val effectiveSeason = if (isMovieTarget) 0 else com.example.data.streaming.ContentIdentityHelper.effectiveSeasonNumber(anime, episode.seasonNumber, isMovie = false)
-
-                // Attach scoped Firestore snapshot listener strictly when realtime Firestore streaming is active
-                scopedListenerJob?.cancel()
-                if (repository.usesFirestoreStreamingRealtime) {
-                    scopedListenerJob = viewModelScope.launch {
-                        repository.streamingRepository.observeScopedStreamingUpdates(
-                            contentKey = contentKey,
-                            isMovie = isMovieTarget,
-                            seasonNumber = effectiveSeason,
-                            episodeNumber = if (isMovieTarget) 1 else episode.episodeNumber,
-                            catalogEpisodeId = episode.id
-                        ).collect { scoped ->
-                            if (requestGeneration == playbackGeneration && scoped.sources.isNotEmpty()) {
-                                val dtos = scoped.sources.filter { it.status != "REMOVED" && it.deletedAt == null }
-                                    .map {
-                                        ProphecySourceDto(
-                                            id = com.example.data.repository.SourceIdentityValidator.normalizeId(it.sourceId),
-                                            label = it.sourceName,
-                                            quality = it.quality,
-                                            codec = it.codec,
-                                            language = it.audioLanguage,
-                                            sizeBytes = it.sizeBytes,
-                                            downloadable = it.downloadable,
-                                            expiresAt = it.expiresAt
-                                        )
-                                    }
-                                if (dtos.isNotEmpty() && _availableSources.value.isEmpty()) {
-                                    _availableSources.value = dtos
-                                }
-                            }
-                        }
-                    }
-                }
 
                 // 3. Fast-Path: Check pre-resolve cache BEFORE sliding window so prepared or in-flight work is reused
                 if (normPreferredSource == null && !isMovieTarget) {
@@ -1171,54 +1049,25 @@ class PlayerViewModel(
                         playerManager.initializePlayer(
                             directData = prepared.directData,
                             startPositionMs = lastSavedPos,
-                            onPlaybackFailed = {
-                                if (requestGeneration == playbackGeneration) {
-                                    preResolveManager.discardPreparedSource(animeId, episode)
-                                    playbackResolutionJob = viewModelScope.launch {
-                                        _isResolving.value = true
-                                        _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
-                                        repository.invalidateFailedCachedPlayback(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id, prepared.providerId
-                                        )
-                                        val freshSources = repository.discoverStreamsForScope(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
-                                        ).getOrNull()?.sources ?: emptyList()
-                                        if (requestGeneration == playbackGeneration) {
-                                            resolveWithFallback(
-                                                animeId, episode, freshSources, 0,
-                                                startPositionOverrideMs = lastSavedPos,
-                                                requestGeneration = requestGeneration,
-                                                forceFresh = true
-                                            )
-                                        }
-                                    }
-                                }
-                            },
-                            onRetryNeeded = {
-                                if (requestGeneration == playbackGeneration) {
-                                    preResolveManager.discardPreparedSource(animeId, episode)
-                                    playbackResolutionJob = viewModelScope.launch {
-                                        _isResolving.value = true
-                                        _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
-                                        repository.invalidateFailedCachedPlayback(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, prepared.source.id, prepared.providerId
-                                        )
-                                        val refreshedSources = repository.discoverStreamsForScope(
-                                            animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
-                                        ).getOrNull()?.sources ?: emptyList()
-                                        if (requestGeneration == playbackGeneration) {
-                                            resolveWithFallback(
-                                                animeId, episode, refreshedSources, 0,
-                                                startPositionOverrideMs = lastSavedPos,
-                                                requestGeneration = requestGeneration,
-                                                forceFresh = true
-                                            )
-                                        }
-                                    }
-                                }
+                            onPlaybackFailed = null,
+                            onRetryNeeded = {},
+                            onFailureSignal = { reason ->
+                                handlePlaybackFailureSignal(
+                                    targetAnimeId = animeId,
+                                    episode = episode,
+                                    source = prepared.source,
+                                    candidates = preparedCandidates,
+                                    candidateIndex = 0,
+                                    currentDirectData = prepared.directData,
+                                    resolvedFromCache = true,
+                                    lastSavedPos = lastSavedPos,
+                                    requestGeneration = requestGeneration,
+                                    reason = reason,
+                                    discardPrepared = true
+                                )
                             },
                             providerName = prepared.source.displayProviderName,
-                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, 0L),
+                            sessionIdentity = PlayerManager.PlaybackSessionIdentity(animeId, episode.seasonNumber, episode.id, requestGeneration),
                             sourceQuality = prepared.source.quality,
                             resolveDurationMs = 0L
                         )
@@ -1260,7 +1109,7 @@ class PlayerViewModel(
 
                 _resolutionStage.value = ResolutionStage.FINDING_SOURCES
                 val discoveryRes = repository.discoverStreamsForScope(
-                    animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
+                    animeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true, allowBypassBackoff = true
                 )
                 if (requestGeneration != playbackGeneration) return@launch
                 val sources = discoveryRes.getOrNull()?.sources.orEmpty()
@@ -1343,6 +1192,184 @@ class PlayerViewModel(
                 cause.message.orEmpty().contains("retry is backed off", ignoreCase = true)
         }
 
+    private fun handlePlaybackFailureSignal(
+        targetAnimeId: String,
+        episode: EpisodeEntry,
+        source: ProphecySourceDto,
+        candidates: List<ProphecySourceDto>,
+        candidateIndex: Int,
+        currentDirectData: DirectPlayData,
+        resolvedFromCache: Boolean,
+        lastSavedPos: Long,
+        requestGeneration: Long,
+        reason: PlaybackFailureReason,
+        discardPrepared: Boolean
+    ) {
+        if (requestGeneration != playbackGeneration) return
+        val providerId = com.example.data.streaming.ContentIdentityHelper.deterministicProviderId(source.label)
+        val recoveryKey = PlaybackRecoveryKey(
+            animeId = targetAnimeId,
+            episodeId = episode.id,
+            sourceId = source.id,
+            playbackGeneration = requestGeneration
+        )
+        val sameSourceRetryPendingEscalation =
+            (sessionRecoveryMarkers.contains("stall:${providerId}:${source.id}") ||
+                sessionRecoveryMarkers.contains("cache_refresh:${providerId}:${source.id}")) &&
+                !sessionRecoveryMarkers.contains("switched:${providerId}:${source.id}")
+        recoveryCoordinator.triggerRecovery(
+            key = recoveryKey,
+            reason = reason,
+            allowRepeatForSameSource = sameSourceRetryPendingEscalation,
+            onBudgetExhausted = {
+                if (requestGeneration == playbackGeneration) {
+                    _resolutionError.value =
+                        "All available sources failed after bounded recovery attempts. Select Retry or another source."
+                    _isResolving.value = false
+                    _resolutionStage.value = ResolutionStage.IDLE
+                    playerManager.clearErrorState()
+                }
+            }
+        ) {
+            if (requestGeneration != playbackGeneration) return@triggerRecovery
+            if (discardPrepared) {
+                preResolveManager.discardPreparedSource(targetAnimeId, episode)
+            }
+
+            // Never invalidate D1 URLs or force source rediscovery for decoder/codec errors.
+            if (reason == PlaybackFailureReason.DECODER_OR_UNSUPPORTED) {
+                if (candidateIndex + 1 < candidates.size) {
+                    _isResolving.value = true
+                    _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
+                    resolveWithFallback(
+                        targetAnimeId = targetAnimeId,
+                        episode = episode,
+                        candidates = candidates,
+                        startIndex = candidateIndex + 1,
+                        startPositionOverrideMs = lastSavedPos,
+                        requestGeneration = requestGeneration,
+                        isRecoveryAttempt = true
+                    )
+                } else {
+                    val existingErr = playerManager.errorMessage.value
+                    _resolutionError.value = existingErr ?: "The media format or codec is not supported on this device."
+                    _isResolving.value = false
+                    _resolutionStage.value = ResolutionStage.IDLE
+                    playerManager.clearErrorState()
+                }
+                return@triggerRecovery
+            }
+
+            // Sustained zero-progress stall: first bounded attempt re-prepares the same URL
+            // without wiping D1 cache or forcing discovery. Subsequent failure switches candidate.
+            if (reason == PlaybackFailureReason.STALL_NO_PROGRESS &&
+                sessionRecoveryMarkers.add("stall:${providerId}:${source.id}")
+            ) {
+                val resumePos = playerManager.currentPosition.value.takeIf { it > 0L } ?: lastSavedPos
+                playerManager.initializePlayer(
+                    directData = currentDirectData,
+                    startPositionMs = resumePos,
+                    onPlaybackFailed = null,
+                    onRetryNeeded = {},
+                    onFailureSignal = { nextReason ->
+                        handlePlaybackFailureSignal(
+                            targetAnimeId = targetAnimeId,
+                            episode = episode,
+                            source = source,
+                            candidates = candidates,
+                            candidateIndex = candidateIndex,
+                            currentDirectData = currentDirectData,
+                            resolvedFromCache = resolvedFromCache,
+                            lastSavedPos = resumePos,
+                            requestGeneration = requestGeneration,
+                            reason = nextReason,
+                            discardPrepared = false
+                        )
+                    },
+                    providerName = source.displayProviderName,
+                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(
+                        targetAnimeId, episode.seasonNumber, episode.id, requestGeneration
+                    ),
+                    sourceQuality = source.quality,
+                    resolveDurationMs = 0L,
+                    isRecoveryAttempt = true
+                )
+                return@triggerRecovery
+            }
+
+            // Recoverable HTTP/expired/network failure on a cached URL: invalidate only that source
+            // and re-resolve once before falling back to alternative candidates.
+            if (resolvedFromCache &&
+                (reason == PlaybackFailureReason.HTTP_EXPIRED_OR_UNAUTHORIZED ||
+                    reason == PlaybackFailureReason.TRANSIENT_NETWORK_ERROR) &&
+                sessionRecoveryMarkers.add("cache_refresh:${providerId}:${source.id}")
+            ) {
+                repository.invalidateFailedCachedPlayback(
+                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id, providerId
+                )
+                _isResolving.value = true
+                _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
+                resolveWithFallback(
+                    targetAnimeId = targetAnimeId,
+                    episode = episode,
+                    candidates = candidates,
+                    startIndex = candidateIndex,
+                    startPositionOverrideMs = lastSavedPos,
+                    requestGeneration = requestGeneration,
+                    forceFresh = true,
+                    isRecoveryAttempt = true
+                )
+                return@triggerRecovery
+            }
+
+            sessionRecoveryMarkers.add("switched:${providerId}:${source.id}")
+            if (candidateIndex + 1 < candidates.size) {
+                _isResolving.value = true
+                _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
+                resolveWithFallback(
+                    targetAnimeId = targetAnimeId,
+                    episode = episode,
+                    candidates = candidates,
+                    startIndex = candidateIndex + 1,
+                    startPositionOverrideMs = lastSavedPos,
+                    requestGeneration = requestGeneration,
+                    isRecoveryAttempt = true
+                )
+                return@triggerRecovery
+            }
+
+            // Only force source rediscovery once per generation after existing candidates are exhausted.
+            if (sessionRecoveryMarkers.add("rediscover:${requestGeneration}")) {
+                _isResolving.value = true
+                _resolutionStage.value = ResolutionStage.FINDING_SOURCES
+                val refreshedSources = repository.discoverStreamsForScope(
+                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, episode.id,
+                    forceRefresh = true,
+                    allowBypassBackoff = true
+                ).getOrNull()?.sources ?: emptyList()
+                if (requestGeneration != playbackGeneration) return@triggerRecovery
+                if (refreshedSources.isNotEmpty()) {
+                    resolveWithFallback(
+                        targetAnimeId = targetAnimeId,
+                        episode = episode,
+                        candidates = refreshedSources,
+                        startIndex = 0,
+                        startPositionOverrideMs = lastSavedPos,
+                        requestGeneration = requestGeneration,
+                        forceFresh = true,
+                        isRecoveryAttempt = true
+                    )
+                    return@triggerRecovery
+                }
+            }
+
+            _resolutionError.value = "All available sources failed to start playback. Select Retry to try again."
+            _isResolving.value = false
+            _resolutionStage.value = ResolutionStage.IDLE
+            playerManager.clearErrorState()
+        }
+    }
+
     private suspend fun resolveWithFallback(
         targetAnimeId: String,
         episode: EpisodeEntry,
@@ -1352,7 +1379,8 @@ class PlayerViewModel(
         startPositionOverrideMs: Long? = null,
         requestGeneration: Long,
         preResolved: com.example.data.repository.VerifiedEpisodePlayback? = null,
-        forceFresh: Boolean = false
+        forceFresh: Boolean = false,
+        isRecoveryAttempt: Boolean = false
     ) {
         if (requestGeneration != playbackGeneration) return
         val orderedCandidates = if (prioritize && startIndex == 0) prioritizeSources(candidates) else candidates
@@ -1453,83 +1481,30 @@ class PlayerViewModel(
                 playerManager.initializePlayer(
                     directData = normalizedDirectData,
                     startPositionMs = lastSavedPos,
-                    onPlaybackFailed = {
-                        if (requestGeneration == playbackGeneration) {
-                            playbackResolutionJob?.cancel()
-                            playbackResolutionJob = viewModelScope.launch {
-                                if (resolvedFromCache) {
-                                    repository.invalidateFailedCachedPlayback(
-                                        targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id, providerId
-                                    )
-                                    if (retriedSourceIds.add("cache_refresh:${providerId}:${source.id}")) {
-                                        _isResolving.value = true
-                                        _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
-                                        resolveWithFallback(
-                                            targetAnimeId, episode, orderedCandidates, i,
-                                            startPositionOverrideMs = lastSavedPos,
-                                            requestGeneration = requestGeneration,
-                                            forceFresh = true
-                                        )
-                                        return@launch
-                                    }
-                                }
-                                if (i + 1 < orderedCandidates.size) {
-                                    _isResolving.value = true
-                                    _resolutionStage.value = ResolutionStage.RESOLVING_PLAYBACK
-                                    resolveWithFallback(
-                                        targetAnimeId, episode, orderedCandidates, i + 1,
-                                        startPositionOverrideMs = lastSavedPos,
-                                        requestGeneration = requestGeneration
-                                    )
-                                } else {
-                                    val diagCategory = playerManager.playbackDiagnostics.value.failureCategory
-                                    val existingPlayerError = playerManager.errorMessage.value
-                                    val unsupportedError = when (diagCategory) {
-                                        PlayerManager.PlaybackFailureCategory.AUDIO_DECODER,
-                                        PlayerManager.PlaybackFailureCategory.DECODER,
-                                        PlayerManager.PlaybackFailureCategory.CONTAINER,
-                                        PlayerManager.PlaybackFailureCategory.CONTENT_TYPE -> existingPlayerError
-                                            ?: "The media format or codec is not supported on this device."
-                                        else -> null
-                                    }
-                                    _resolutionError.value = unsupportedError
-                                        ?: "All available sources failed to start playback. Select Retry to try source discovery again."
-                                    _isResolving.value = false
-                                    _resolutionStage.value = ResolutionStage.IDLE
-                                    playerManager.clearErrorState()
-                                }
-                            }
-                        }
-                    },
-                    onRetryNeeded = {
-                        if (requestGeneration == playbackGeneration &&
-                            (retriedSourceGeneration != requestGeneration || retriedSourceIds.add("${providerId}:${source.id}"))) {
-                            retriedSourceGeneration = requestGeneration
-                            playbackResolutionJob?.cancel()
-                            playbackResolutionJob = viewModelScope.launch {
-                                _isResolving.value = true
-                                _resolutionStage.value = ResolutionStage.FINDING_SOURCES
-                                repository.invalidateFailedCachedPlayback(
-                                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, source.id, providerId
-                                )
-                                val refreshedSources = repository.discoverStreamsForScope(
-                                    targetAnimeId, episode.seasonNumber, episode.episodeNumber, episode.id, forceRefresh = true
-                                ).getOrNull()?.sources ?: emptyList()
-                                if (requestGeneration != playbackGeneration) return@launch
-                                val newCandidates = if (refreshedSources.isNotEmpty()) refreshedSources else listOf(source)
-                                resolveWithFallback(
-                                    targetAnimeId, episode, newCandidates, 0,
-                                    startPositionOverrideMs = lastSavedPos,
-                                    requestGeneration = requestGeneration,
-                                    forceFresh = true
-                                )
-                            }
-                        }
+                    onPlaybackFailed = null,
+                    onRetryNeeded = {},
+                    onFailureSignal = { reason ->
+                        handlePlaybackFailureSignal(
+                            targetAnimeId = targetAnimeId,
+                            episode = episode,
+                            source = source,
+                            candidates = orderedCandidates,
+                            candidateIndex = i,
+                            currentDirectData = normalizedDirectData,
+                            resolvedFromCache = resolvedFromCache,
+                            lastSavedPos = lastSavedPos,
+                            requestGeneration = requestGeneration,
+                            reason = reason,
+                            discardPrepared = false
+                        )
                     },
                     providerName = source.displayProviderName,
-                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(targetAnimeId, episode.seasonNumber, episode.id, 0L),
+                    sessionIdentity = PlayerManager.PlaybackSessionIdentity(
+                        targetAnimeId, episode.seasonNumber, episode.id, requestGeneration
+                    ),
                     sourceQuality = source.quality,
-                    resolveDurationMs = resolvedDurationMs
+                    resolveDurationMs = resolvedDurationMs,
+                    isRecoveryAttempt = isRecoveryAttempt
                 )
 
                 return
@@ -1697,7 +1672,7 @@ class PlayerViewModel(
     override fun onCleared() {
         super.onCleared()
         flushProgress()
-        scopedListenerJob?.cancel()
+        recoveryCoordinator.cancelAll()
         playbackResolutionJob?.cancel()
         preResolveManager.clear()
         playerManager.release()

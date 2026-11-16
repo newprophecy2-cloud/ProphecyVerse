@@ -12,24 +12,6 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
-enum class DiscoveryStatus {
-    NOT_DISCOVERED,
-    IN_PROGRESS,
-    COMPLETED,
-    PARTIAL,
-    TEMPORARY_FAILURE,
-    PERMANENTLY_UNAVAILABLE
-}
-
-enum class StreamRecordStatus {
-    AVAILABLE,
-    MISSING_URL,
-    EXPIRED,
-    FAILED,
-    TEMPORARILY_UNAVAILABLE,
-    REMOVED
-}
-
 data class CanonicalStreamIdentity(
     val canonicalTitle: String,
     val displayTitle: String,
@@ -46,30 +28,6 @@ data class CanonicalStreamIdentity(
     val cumulativeEpisodeOffset: Int
 )
 
-enum class FirestoreWriteOperation {
-    ADD,
-    UPDATE,
-    REMOVE
-}
-
-data class FirestoreWriteAuditEntry(
-    val operation: FirestoreWriteOperation,
-    val contentType: String, // "ANIME" or "MOVIE"
-    val canonicalTitle: String?,
-    val anilistId: String,
-    val backendId: String?,
-    val seasonId: String?,
-    val episodeId: String?,
-    val providerId: String?,
-    val sourceId: String?,
-    val targetPath: String,
-    val startedAtMs: Long,
-    val completedAtMs: Long,
-    val success: Boolean,
-    val failureReason: String? = null,
-    val firebaseErrorCode: String? = null
-)
-
 object ContentIdentityHelper {
     private val safeDocChars = Regex("[^a-zA-Z0-9._-]")
 
@@ -81,9 +39,9 @@ object ContentIdentityHelper {
     }
 
     /**
-     * Produces the stable Firestore/Room streaming container ID:
+     * Produces the stable canonical content key:
      * uses canonical prequel AniList ID for multi-season TV franchises when present,
-     * else own AniList numeric ID so shared documents are deterministic across devices.
+     * else own AniList numeric ID so metadata scopes remain deterministic.
      */
     fun canonicalContentKey(animeId: String, entry: AnimeEntry? = null): String {
         val isMovieEntry = isMovie(entry)
@@ -169,8 +127,8 @@ object ContentIdentityHelper {
     fun sourceDocId(sourceId: String): String = sanitizeDocId(sourceId)
 
     /**
-     * Deterministic provider document ID derived from normalized provider label hash,
-     * never using raw display titles directly as Firestore document IDs.
+     * Deterministic provider ID derived from normalized provider label hash,
+     * never using raw display titles directly as storage keys.
      */
     fun deterministicProviderId(providerLabel: String?): String {
         val normalized = providerLabel?.trim()?.lowercase(Locale.ROOT).orEmpty()
@@ -185,11 +143,6 @@ object ContentIdentityHelper {
     fun sanitizeDocId(raw: String): String {
         val cleaned = raw.trim().replace(safeDocChars, "_")
         return if (cleaned.isNotEmpty()) cleaned.take(120) else "unknown"
-    }
-
-    fun resolveLockKey(contentKey: String, isMovie: Boolean, providerId: String, sourceId: String, seasonNumber: Int = 0, episodeNumber: Int = 0): String {
-        val scope = if (isMovie) "movie_$contentKey" else "anime_${contentKey}_s${seasonNumber}_e${episodeNumber}"
-        return sanitizeDocId("${scope}_${providerId}_${sourceId}")
     }
 }
 
@@ -232,7 +185,7 @@ object SafePlaybackHeaders {
     /**
      * Sanitizes headers for the in-memory playback/download request only.
      * Unlike [sanitize], this intentionally preserves provider-required Cookie and
-     * Authorization headers. These values must never be sent to shared Firestore.
+     * Authorization headers. These values must never leave in-memory storage.
      */
     fun sanitizeRequestHeaders(headers: List<List<String>>): List<List<String>> {
         if (headers.isEmpty()) return emptyList()

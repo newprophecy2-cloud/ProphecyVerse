@@ -6,12 +6,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.EpisodeEntry
 import com.example.data.local.SeasonEntry
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.remote.AniListAiringScheduleNode
 import com.example.data.remote.AniListCoverImage
 import com.example.data.remote.AniListData
@@ -40,8 +39,6 @@ import com.example.data.repository.AnimeRepository
 import com.example.data.repository.EpisodeSourceAggregator
 import com.example.data.repository.EpisodeSourceResponseState
 import com.example.data.repository.TitleMatcher
-import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.FirestoreStreamingRepository
 import com.example.data.streaming.MonotonicMetrics
 import com.example.data.streaming.SafePlaybackHeaders
 import com.example.player.PreResolveQueueManager
@@ -424,19 +421,15 @@ class ArchitectureRemakeVerificationTest {
 
     private fun createRepository(
         aniList: FakeAniListService = FakeAniListService(),
-        backend: FakeBackendService = FakeBackendService()
+        backend: FakeBackendService = FakeBackendService(),
+        d1DataSource: CloudflareD1DataSource = createTestD1DataSource()
     ): Triple<AnimeRepository, FakeAniListService, FakeBackendService> {
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = database.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { true }
-        )
         val repo = AnimeRepository(
             database = database,
             prophecyApi = backend,
             aniListApi = aniList,
             applicationContext = context,
-            streamingRepository = streamingRepo
+            d1DataSource = d1DataSource
         )
         return Triple(repo, aniList, backend)
     }
@@ -536,40 +529,19 @@ class ArchitectureRemakeVerificationTest {
         ).getOrThrow()
         assertEquals(2, discovery.sources.size)
 
-        val container = database.streamCacheDao().getContainer("movie:204")!!
-        assertEquals("MOVIE", container.contentType)
-        assertNull(container.seasonCount)
-        assertNull(container.totalEpisodeCount)
-
-        val storedSources = database.streamCacheDao().getActiveSources("movie:204")
-        assertEquals(2, storedSources.size)
-        assertEquals("backend-movie-s1e1-id", storedSources.first().backendEpisodeId)
+        val snapshot = repo.getCachedEpisodeSourceSnapshot("anilist_204", "movie_anilist_204", 0, 1)!!
+        assertEquals(EpisodeSourceResponseState.AVAILABLE, snapshot.state)
+        assertTrue(database.episodeDao().getSeasonsForAnime("anilist_204").isEmpty())
+        assertTrue(database.episodeDao().getEpisodesForAnime("anilist_204").isEmpty())
+        assertEquals(2, snapshot.sources.size)
         assertTrue(backend.detailCalls.get() >= 1 || backend.episodeCalls.get() >= 1)
     }
 
     @Test
-    fun firestorePathsAndDeterministicProviderIdsFollowStrictContract() {
-        val fsRepo = FirestoreStreamingRepository(database.streamCacheDao())
-        val provId = ContentIdentityHelper.deterministicProviderId("VidStream HD")
-        assertTrue(provId.startsWith("prov_"))
-        assertEquals(provId, ContentIdentityHelper.deterministicProviderId("  vidstream hd "))
-        assertNotEquals(provId, "VidStream HD")
-
-        assertEquals(
-            "anime_streams/201/seasons/season_2/episodes/ep_5/providers/$provId/sources/src_1",
-            fsRepo.animeSourcePath("201", 2, 5, provId, "src_1")
-        )
-        assertEquals(
-            "movie_streams/204/providers/$provId/sources/src_1",
-            fsRepo.movieSourcePath("204", provId, "src_1")
-        )
-        assertFalse(fsRepo.movieSourcePath("204", provId, "src_1").contains("season"))
-        assertFalse(fsRepo.movieSourcePath("204", provId, "src_1").contains("ep_"))
-    }
-
-    @Test
-    fun cacheFirstResolutionReusesRoomUrlSanitizesHeadersAndPreservesValidUrlOnFailure() = runTest {
-        val (repo, _, backend) = createRepository()
+    fun cacheFirstResolutionReusesMemoryAndD1_sanitizesHeadersAndPreservesValidD1OnFailedForceResolve() = runTest {
+        val fakeD1Api = FakeInMemoryD1Api()
+        val d1 = createTestD1DataSource(api = fakeD1Api)
+        val (repo, _, backend) = createRepository(d1DataSource = d1)
         database.animeDao().upsertAnime(
             AnimeEntry(
                 id = "anilist_201",
@@ -583,7 +555,7 @@ class ArchitectureRemakeVerificationTest {
         repo.refreshAnimeDetails("anilist_201").getOrThrow()
         val ep1 = repo.observeEpisodes("anilist_201", 1).first().first()
 
-        // First play discovers & resolves once
+        // First play discovers, resolves once, and stores in D1
         val first = repo.resolvePlayableStream(
             animeId = "anilist_201",
             seasonNumber = ep1.seasonNumber,
@@ -594,9 +566,9 @@ class ArchitectureRemakeVerificationTest {
         assertEquals(1, backend.episodeCalls.get())
         assertEquals(1, backend.resolveCalls.get())
         assertEquals("https://cdn.example.com/streams/direct_1080p.m3u8", first.directData.playbackUrl)
+        assertEquals(1, fakeD1Api.records.size)
 
-        // Verify required transient playback headers are preserved; only shared Firestore
-        // publication applies the stricter redaction policy.
+        // Verify transient playback headers are preserved in memory for ExoPlayer
         val headerKeys = first.directData.headers.map { it[0].lowercase() }.toSet()
         assertTrue(headerKeys.contains("referer"))
         assertTrue(headerKeys.contains("user-agent"))
@@ -615,7 +587,7 @@ class ArchitectureRemakeVerificationTest {
         assertEquals(1, backend.episodeCalls.get())
         assertEquals(1, backend.resolveCalls.get())
 
-        // Simulate forced fresh resolve failure -> Room metadata must remain intact!
+        // Simulate forced fresh resolve failure -> existing D1 cached URL and Room source snapshot must remain intact!
         backend.resolveShouldFail = true
         val failedFresh = repo.resolvePlayableStream(
             animeId = "anilist_201",
@@ -626,93 +598,9 @@ class ArchitectureRemakeVerificationTest {
             forceResolveFresh = true
         )
         assertTrue(failedFresh.isFailure)
-        val cachedSources = database.streamCacheDao().getActiveSources("anime:201:s1:e1")
-        assertTrue(cachedSources.any { it.sourceId == first.source.id })
-    }
-
-    @Test
-    fun streamCacheDaoVersioningSoftDeletePreventsResurrectionAndPreservesMetadata() = runTest {
-        val dao = database.streamCacheDao()
-        val scope = "anime:500:s1:e1"
-        val provId = ContentIdentityHelper.deterministicProviderId("MegaCloud")
-
-        dao.syncScopeRecords(
-            scopeKey = scope,
-            incomingProviders = listOf(StreamProviderEntity("$scope|p|$provId", scope, provId, "MegaCloud", version = 2)),
-            incomingSources = listOf(
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$provId|s|s1",
-                    scopeKey = scope,
-                    providerId = provId,
-                    sourceId = "s1",
-                    sourceName = "MegaCloud",
-                    quality = "1080p",
-                    version = 2
-                )
-            ),
-            authoritativeComplete = false
-        )
-
-        // Incoming metadata update with version 3 preserves metadata cleanly
-        dao.syncScopeRecords(
-            scopeKey = scope,
-            incomingProviders = listOf(StreamProviderEntity("$scope|p|$provId", scope, provId, "MegaCloud", version = 3)),
-            incomingSources = listOf(
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$provId|s|s1",
-                    scopeKey = scope,
-                    providerId = provId,
-                    sourceId = "s1",
-                    sourceName = "MegaCloud 1080p",
-                    version = 3
-                )
-            ),
-            authoritativeComplete = false
-        )
-        val preserved = dao.getActiveSources(scope).single()
-        assertEquals("1080p", preserved.quality)
-        assertEquals("MegaCloud 1080p", preserved.sourceName)
-
-        // Soft delete with version 4
-        dao.softDeleteSource("$scope|p|$provId|s|s1", deletedAt = 10_000L, version = 4L)
-        assertTrue(dao.getActiveSources(scope).isEmpty())
-
-        // Stale ADD with older version 3 MUST NOT resurrect the deleted source!
-        dao.syncScopeRecords(
-            scopeKey = scope,
-            incomingProviders = emptyList(),
-            incomingSources = listOf(
-                StreamSourceEntity(
-                    sourceDocKey = "$scope|p|$provId|s|s1",
-                    scopeKey = scope,
-                    providerId = provId,
-                    sourceId = "s1",
-                    sourceName = "MegaCloud Stale",
-                    version = 3L
-                )
-            ),
-            authoritativeComplete = false
-        )
-        assertTrue("Removed source must never resurrect on older version", dao.getActiveSources(scope).isEmpty())
-    }
-
-    @Test
-    fun distributedResolveLeaseEnforcesSingleFlightAndReleasesCleanly() = runTest {
-        val fsRepo = FirestoreStreamingRepository(database.streamCacheDao(), ownerId = "owner_A")
-        val peerRepo = FirestoreStreamingRepository(database.streamCacheDao(), ownerId = "owner_B")
-        val lock1 = fsRepo.acquireResolveLease("201", false, "prov_1", "src_1", 1, 1, ttlMs = 5_000L)
-        assertNotNull(lock1)
-
-        // Different owner respects active local/remote lock wait via shared map or transaction
-        val sameOwner = fsRepo.acquireResolveLease("201", false, "prov_1", "src_1", 1, 1, ttlMs = 5_000L)
-        assertNotNull(sameOwner)
-        assertEquals("owner_A", sameOwner!!.ownerId)
-        assertNotNull(peerRepo)
-
-        fsRepo.releaseResolveLease(lock1!!, "COMPLETED")
-        val lock3 = fsRepo.acquireResolveLease("201", false, "prov_1", "src_1", 1, 1, ttlMs = 5_000L)
-        assertNotNull(lock3)
-        fsRepo.releaseResolveLease(lock3!!, "COMPLETED")
+        assertEquals(1, fakeD1Api.records.size)
+        val cachedSnapshot = repo.getCachedEpisodeSourceSnapshot("anilist_201", ep1.id, ep1.seasonNumber, ep1.episodeNumber)!!
+        assertTrue(cachedSnapshot.sources.any { it.id == first.source.id })
     }
 
     @Test
@@ -780,13 +668,14 @@ class ArchitectureRemakeVerificationTest {
     }
 
     @Test
-    fun roomMigration9To10PreservesUserDataAndCreatesStreamCacheTables() {
-        val dbName = "migration_9_to_10_test.db"
+    fun roomMigration9To14PreservesUserDataAndDropsObsoleteStreamAndCatalogTables() {
+        val dbName = "migration_9_to_14_test.db"
         File(context.getDatabasePath(dbName).path).delete()
 
         val v9Callback = object : SupportSQLiteOpenHelper.Callback(9) {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS anime_entries (id TEXT NOT NULL PRIMARY KEY, aniListId INTEGER, backendAnimeId TEXT, titleRomaji TEXT, titleEnglish TEXT, titleNative TEXT, preferredTitle TEXT NOT NULL, synopsis TEXT, year TEXT, season TEXT, format TEXT, status TEXT, genres TEXT NOT NULL, score REAL, episodeCount INTEGER, duration INTEGER, studios TEXT, posterUrl TEXT, bannerUrl TEXT, isPlayable INTEGER NOT NULL, isTrending INTEGER NOT NULL, isSeasonal INTEGER NOT NULL, isPopular INTEGER NOT NULL, mediaCategory TEXT NOT NULL DEFAULT 'ANIME', updatedAt INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS episode_entries (id TEXT NOT NULL PRIMARY KEY, animeId TEXT NOT NULL, seasonNumber INTEGER NOT NULL, episodeNumber INTEGER NOT NULL, title TEXT, overview TEXT, isAvailable INTEGER NOT NULL, sourceEpisodeIds TEXT)")
                 db.execSQL("CREATE TABLE IF NOT EXISTS playback_history (id TEXT NOT NULL PRIMARY KEY, animeId TEXT NOT NULL, episodeId TEXT NOT NULL, seasonNumber INTEGER NOT NULL, episodeNumber INTEGER NOT NULL, episodeTitle TEXT, positionMs INTEGER NOT NULL, durationMs INTEGER NOT NULL, completed INTEGER NOT NULL, animeTitle TEXT, posterUrl TEXT, mediaType TEXT, lastPlayedAt INTEGER NOT NULL)")
                 db.execSQL("CREATE TABLE IF NOT EXISTS watchlist_entries (animeId TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL, isFavorite INTEGER NOT NULL, userScore INTEGER, addedAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL)")
                 db.execSQL("CREATE TABLE IF NOT EXISTS download_entries (id TEXT NOT NULL PRIMARY KEY, animeId TEXT NOT NULL, animeTitle TEXT NOT NULL, posterUrl TEXT, seasonNumber INTEGER NOT NULL, episodeNumber INTEGER NOT NULL, episodeTitle TEXT, localFilePath TEXT, downloadStatus TEXT NOT NULL, downloadedBytes INTEGER NOT NULL, totalBytes INTEGER NOT NULL, downloadUrl TEXT, mediaType TEXT, errorMessage TEXT, quality TEXT, audioLanguage TEXT, createdAt INTEGER NOT NULL)")
@@ -814,6 +703,11 @@ class ArchitectureRemakeVerificationTest {
         )
         val sqliteDb = helper.writableDatabase
         AppDatabase.MIGRATION_9_10.migrate(sqliteDb)
+        AppDatabase.MIGRATION_10_11.migrate(sqliteDb)
+        AppDatabase.MIGRATION_11_12.migrate(sqliteDb)
+        AppDatabase.MIGRATION_12_13.migrate(sqliteDb)
+        AppDatabase.MIGRATION_13_14.migrate(sqliteDb)
+        AppDatabase.MIGRATION_14_15.migrate(sqliteDb)
 
         sqliteDb.query("SELECT preferredTitle, metadataCompleteness FROM anime_entries WHERE id = 'anilist_1'").use {
             assertTrue(it.moveToFirst())
@@ -846,10 +740,8 @@ class ArchitectureRemakeVerificationTest {
             assertTrue(it.moveToFirst())
             assertEquals("Japanese", it.getString(0))
         }
-        sqliteDb.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stream_%'").use {
-            val tables = mutableSetOf<String>()
-            while (it.moveToNext()) tables += it.getString(0)
-            assertEquals(setOf("stream_containers", "stream_seasons", "stream_episodes", "stream_providers", "stream_sources"), tables)
+        sqliteDb.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'stream_%' OR name LIKE 'shared_catalog_%')").use {
+            assertFalse("All obsolete stream_% and shared_catalog_% tables must be dropped by v14", it.moveToFirst())
         }
         sqliteDb.close()
         File(context.getDatabasePath(dbName).path).delete()
@@ -879,6 +771,9 @@ class ArchitectureRemakeVerificationTest {
         for (i in 1..20) {
             val startupStart = MonotonicMetrics.nowMs()
 
+            if (i == 1) {
+                repo.refreshHomeDiscovery(force = true)
+            }
             val tAniList = MonotonicMetrics.nowMs()
             repo.refreshAnimeDetails("anilist_201")
             MonotonicMetrics.recordDuration("anilist_request_ms", tAniList)
@@ -902,7 +797,7 @@ class ArchitectureRemakeVerificationTest {
             MonotonicMetrics.recordDuration("url_validation_ms", tVal)
 
             val tRoomRead = MonotonicMetrics.nowMs()
-            database.streamCacheDao().getActiveSources("anime:777:s1:e1")
+            database.episodeDao().getEpisodesForAnime("anilist_777")
             MonotonicMetrics.recordDuration("room_read_ms", tRoomRead)
 
             MonotonicMetrics.recordDuration("playback_startup_ms", startupStart)
@@ -1130,17 +1025,12 @@ class ArchitectureRemakeVerificationTest {
             }
         }
 
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = database.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false }
-        )
         val repo = AnimeRepository(
             database = database,
             prophecyApi = mockApi,
             aniListApi = FakeAniListService(),
             applicationContext = context,
-            streamingRepository = streamingRepo
+            d1DataSource = createTestD1DataSource()
         )
 
         database.animeDao().upsertAnime(

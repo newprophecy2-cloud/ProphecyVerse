@@ -12,8 +12,6 @@ import com.example.data.cache.MemoryCacheManager
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.EpisodeEntry
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.AniListData
 import com.example.data.remote.AniListGraphQLRequest
@@ -26,11 +24,9 @@ import com.example.data.remote.ProphecyAnimeDetailsResponse
 import com.example.data.remote.ProphecyEpisodeDto
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySearchResponse
+import com.example.data.remote.ProphecySourceDto
 import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
-import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.FirestoreStreamingRepository
-import com.example.data.streaming.StreamRecordStatus
 import com.example.player.PlayerManager
 import com.example.player.PreResolveQueueManager
 import com.google.firebase.FirebaseApp
@@ -158,11 +154,11 @@ class Fix6PlaybackBufferingTest {
         assertFalse(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 11, hasRecentTransfer = false))
         assertTrue(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 12, hasRecentTransfer = false))
 
-        // Active high-bitrate download must NOT trigger spurious fallback at 12s or 15s
+        // Active high-bitrate transfer must NEVER trigger spurious fallback regardless of buffering duration
         assertFalse(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 12, hasRecentTransfer = true))
         assertFalse(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 15, hasRecentTransfer = true))
         assertFalse(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 29, hasRecentTransfer = true))
-        assertTrue(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 30, hasRecentTransfer = true))
+        assertFalse(PlayerManager.shouldTriggerBufferingStallFallback(bufferingSeconds = 30, hasRecentTransfer = true))
 
         // Redirect-sensitive headers remain filtered
         assertTrue(PlayerManager.isRedirectSensitiveHeader("Authorization"))
@@ -186,22 +182,24 @@ class Fix6PlaybackBufferingTest {
             .build()
         val tracker = DatabaseMetricsTracker()
         val animeId = "anilist_601"
-        val providerId = ContentIdentityHelper.deterministicProviderId("AnimePahe")
         val resolveCalls = AtomicInteger(0)
 
         try {
             db.animeDao().upsertAnime(
                 AnimeEntry(id = animeId, aniListId = 601, backendAnimeId = "b_601", titleRomaji = "Fix6 Show", preferredTitle = "Fix6 Show")
             )
+            val memoryCache = MemoryCacheManager(metricsTracker = tracker)
             val ep1 = EpisodeEntry(id = "ep_601_1", animeId = animeId, seasonNumber = 1, episodeNumber = 1, title = "Ep 1")
             val ep2 = EpisodeEntry(id = "ep_601_2", animeId = animeId, seasonNumber = 1, episodeNumber = 2, title = "Ep 2")
             db.episodeDao().upsertEpisodes(listOf(ep1, ep2))
             val scopeKey2 = "anime:601:s1:e2"
-            db.streamCacheDao().upsertProviders(
-                listOf(StreamProviderEntity("$scopeKey2|p|$providerId", scopeKey2, providerId, "AnimePahe", sourceCount = 1, updatedAt = 1000L))
-            )
-            db.streamCacheDao().upsertSource(
-                StreamSourceEntity("$scopeKey2|p|$providerId|s|src2", scopeKey2, providerId, "src2", "AnimePahe 1080p", status = StreamRecordStatus.MISSING_URL.name, updatedAt = 1000L)
+            seedEpisodeSourceSnapshot(
+                memoryCache = memoryCache,
+                scopeKey = scopeKey2,
+                seasonNumber = 1,
+                episodeNumber = 2,
+                sources = listOf(ProphecySourceDto(id = "src2", label = "AnimePahe", quality = "1080p")),
+                fetchedAtMs = System.currentTimeMillis()
             )
 
             val api = object : ProphecyVerseApiService {
@@ -228,15 +226,15 @@ class Fix6PlaybackBufferingTest {
                 override suspend fun postQuery(request: AniListGraphQLRequest) =
                     Response.success(AniListGraphQLResponse(AniListData(null)))
             }
-            val streamingRepo = FirestoreStreamingRepository(
-                streamCacheDao = db.streamCacheDao(),
-                firestoreProvider = { null },
-                isClientWriteAuthorized = { false },
-                cloudStoreProvider = { null },
-                d1DataSource = null,
+            val repo = AnimeRepository(
+                database = db,
+                prophecyApi = api,
+                aniListApi = aniList,
+                applicationContext = context,
+                d1DataSource = createTestD1DataSource(tracker),
+                memoryCache = memoryCache,
                 metricsTracker = tracker
             )
-            val repo = AnimeRepository(db, api, aniList, context, streamingRepo, null, MemoryCacheManager(metricsTracker = tracker), tracker)
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             try {
                 val queueManager = PreResolveQueueManager(repo, scope)

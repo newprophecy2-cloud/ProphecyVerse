@@ -28,7 +28,61 @@ object NetworkModule {
             return when (rawType) {
                 ProphecyEpisodeFullResponse::class.java -> createEpisodeFullAdapter(moshi)
                 ProphecySourceDto::class.java -> createSourceDtoAdapter(moshi)
+                DirectPlayRequest::class.java -> createDirectPlayRequestAdapter(moshi)
                 else -> null
+            }
+        }
+
+        private fun createDirectPlayRequestAdapter(moshi: Moshi): JsonAdapter<DirectPlayRequest> {
+            val stringAdapter = moshi.adapter(String::class.java)
+            val options = JsonReader.Options.of("source_id", "anime_id", "episode_id")
+            return object : JsonAdapter<DirectPlayRequest>() {
+                override fun fromJson(reader: JsonReader): DirectPlayRequest? {
+                    if (reader.peek() == JsonReader.Token.NULL) return reader.nextNull()
+                    var sourceId = ""
+                    var animeId = ""
+                    var episodeId = ""
+                    reader.beginObject()
+                    while (reader.hasNext()) {
+                        when (reader.selectName(options)) {
+                            0 -> sourceId = if (reader.peek() == JsonReader.Token.NULL) {
+                                reader.nextNull<String?>()
+                                ""
+                            } else {
+                                stringAdapter.fromJson(reader).orEmpty()
+                            }
+                            1 -> animeId = if (reader.peek() == JsonReader.Token.NULL) {
+                                reader.nextNull<String?>()
+                                ""
+                            } else {
+                                stringAdapter.fromJson(reader).orEmpty()
+                            }
+                            2 -> episodeId = if (reader.peek() == JsonReader.Token.NULL) {
+                                reader.nextNull<String?>()
+                                ""
+                            } else {
+                                stringAdapter.fromJson(reader).orEmpty()
+                            }
+                            else -> {
+                                reader.skipName()
+                                reader.skipValue()
+                            }
+                        }
+                    }
+                    reader.endObject()
+                    return DirectPlayRequest(animeId = animeId, episodeId = episodeId, sourceId = sourceId)
+                }
+
+                override fun toJson(writer: JsonWriter, value: DirectPlayRequest?) {
+                    if (value == null) {
+                        writer.nullValue()
+                        return
+                    }
+                    writer.beginObject()
+                    writer.name("source_id")
+                    writer.value(value.sourceId.trim())
+                    writer.endObject()
+                }
             }
         }
 
@@ -37,6 +91,8 @@ object NetworkModule {
             val episodeAdapter = moshi.adapter(ProphecyEpisodeDto::class.java)
             val sourcesListType = Types.newParameterizedType(List::class.java, ProphecySourceDto::class.java)
             val sourcesAdapter = moshi.adapter<List<ProphecySourceDto>>(sourcesListType)
+            val providerStatusType = Types.newParameterizedType(Map::class.java, String::class.java, String::class.java)
+            val providerStatusAdapter = moshi.adapter<Map<String, String>>(providerStatusType)
             val stringAdapter = moshi.adapter(String::class.java)
             val booleanAdapter = moshi.adapter(Boolean::class.javaObjectType)
             val options = JsonReader.Options.of(
@@ -45,7 +101,8 @@ object NetworkModule {
                 "sources",
                 "sources_status",
                 "sources_partial",
-                "source_error"
+                "source_error",
+                "provider_status"
             )
             return object : JsonAdapter<ProphecyEpisodeFullResponse>() {
                 override fun fromJson(reader: JsonReader): ProphecyEpisodeFullResponse? {
@@ -56,6 +113,7 @@ object NetworkModule {
                     var sourcesStatus: String? = null
                     var sourcesPartial: Boolean? = null
                     var sourceError: String? = null
+                    var providerStatus: Map<String, String>? = null
 
                     reader.beginObject()
                     while (reader.hasNext()) {
@@ -66,6 +124,7 @@ object NetworkModule {
                             3 -> sourcesStatus = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else stringAdapter.fromJson(reader)
                             4 -> sourcesPartial = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else booleanAdapter.fromJson(reader)
                             5 -> sourceError = readFlexibleSourceError(reader)
+                            6 -> providerStatus = if (reader.peek() == JsonReader.Token.NULL) reader.nextNull() else readFlexibleProviderStatus(reader)
                             else -> {
                                 reader.skipName()
                                 reader.skipValue()
@@ -79,7 +138,8 @@ object NetworkModule {
                         sources = sources,
                         sourcesStatus = sourcesStatus,
                         sourcesPartial = sourcesPartial,
-                        sourceError = sourceError
+                        sourceError = sourceError,
+                        providerStatus = providerStatus
                     )
                 }
 
@@ -95,9 +155,51 @@ object NetworkModule {
                     writer.name("sources_status"); writer.value(value.sourcesStatus)
                     writer.name("sources_partial"); writer.value(value.sourcesPartial)
                     writer.name("source_error"); writer.value(value.sourceError)
+                    if (value.providerStatus != null) {
+                        writer.name("provider_status")
+                        providerStatusAdapter.toJson(writer, value.providerStatus)
+                    }
                     writer.endObject()
                 }
             }
+        }
+
+        private fun readFlexibleProviderStatus(reader: JsonReader): Map<String, String>? {
+            if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+                reader.skipValue()
+                return null
+            }
+            val map = linkedMapOf<String, String>()
+            reader.beginObject()
+            while (reader.hasNext()) {
+                val key = reader.nextName()
+                val value = when (reader.peek()) {
+                    JsonReader.Token.NULL -> {
+                        reader.nextNull<Any?>()
+                        null
+                    }
+                    JsonReader.Token.BEGIN_OBJECT -> {
+                        var status: String? = null
+                        var msg: String? = null
+                        reader.beginObject()
+                        while (reader.hasNext()) {
+                            when (reader.nextName()) {
+                                "status", "state" -> status = readScalarAsString(reader) ?: status
+                                "message", "error" -> msg = readScalarAsString(reader) ?: msg
+                                else -> reader.skipValue()
+                            }
+                        }
+                        reader.endObject()
+                        status ?: msg
+                    }
+                    else -> readScalarAsString(reader)
+                }
+                if (!value.isNullOrBlank()) {
+                    map[key] = value
+                }
+            }
+            reader.endObject()
+            return map
         }
 
         private fun readFlexibleSourceError(reader: JsonReader): String? = when (reader.peek()) {
@@ -110,7 +212,7 @@ object NetworkModule {
                 reader.beginObject()
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
-                        "message" -> message = readScalarAsString(reader) ?: message
+                        "message", "detail" -> message = readScalarAsString(reader) ?: message
                         "code" -> code = readScalarAsString(reader) ?: code
                         "provider" -> provider = readScalarAsString(reader) ?: provider
                         "error" -> {
@@ -120,7 +222,7 @@ object NetworkModule {
                                     reader.beginObject()
                                     while (reader.hasNext()) {
                                         when (reader.nextName()) {
-                                            "message" -> message = readScalarAsString(reader) ?: message
+                                            "message", "detail" -> message = readScalarAsString(reader) ?: message
                                             "code" -> code = readScalarAsString(reader) ?: code
                                             "provider" -> provider = readScalarAsString(reader) ?: provider
                                             else -> reader.skipValue()
@@ -296,10 +398,10 @@ object NetworkModule {
         OkHttpClient.Builder()
             .connectionPool(sharedConnectionPool)
             .apply { diskHttpCache?.let { cache(it) } }
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(14, TimeUnit.SECONDS)
-            .writeTimeout(14, TimeUnit.SECONDS)
-            .callTimeout(20, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(35, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(40, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
                     .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME} (Android)")

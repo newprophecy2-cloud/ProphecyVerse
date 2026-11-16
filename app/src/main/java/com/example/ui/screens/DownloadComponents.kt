@@ -699,7 +699,7 @@ private fun CurrentEpisodeDownloadContent(
                     ) {
                         Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Download Episode in $selectedQuality", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text("Download Episode in ${selectedQuality ?: "Best"}", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
 
@@ -1099,7 +1099,7 @@ private fun BatchDownloadContent(
             Spacer(modifier = Modifier.width(6.dp))
             Text(
                 text = if (selectedEpisodeIds.isNotEmpty()) {
-                    "Download ${selectedEpisodeIds.size} Episodes in $selectedQuality"
+                    "Download ${selectedEpisodeIds.size} Episodes in ${selectedQuality ?: "Best"}"
                 } else {
                     "Select episodes to download"
                 },

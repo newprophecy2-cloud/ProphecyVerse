@@ -9,9 +9,6 @@ import com.example.data.d1.CloudflareD1DataSource
 import com.example.data.d1.D1BooleanAdapterFactory
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
-import com.example.data.local.StreamContainerEntity
-import com.example.data.local.StreamProviderEntity
-import com.example.data.local.StreamSourceEntity
 import com.example.data.metrics.DatabaseMetricsTracker
 import com.example.data.remote.AniListData
 import com.example.data.remote.AniListGraphQLRequest
@@ -24,14 +21,11 @@ import com.example.data.remote.ProphecyAnimeDetailsResponse
 import com.example.data.remote.ProphecyEpisodeDto
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySearchResponse
+import com.example.data.remote.ProphecySourceDto
 import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.SourceIdentityValidator
 import com.example.data.streaming.ContentIdentityHelper
-import com.example.data.streaming.DiscoveryStatus
-import com.example.data.streaming.FirestoreStreamingRepository
-import com.example.data.streaming.StreamRecordStatus
-import com.example.data.streaming.StreamingCloudStore
 import com.google.firebase.FirebaseApp
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -111,67 +105,19 @@ class Fix4CacheSecurityTest {
             override suspend fun resolveDirectPlay(request: DirectPlayRequest) = directResolver(request)
         }
 
-    private class FakeCloudStore : StreamingCloudStore {
-        val docs = ConcurrentHashMap<String, Map<String, Any?>>()
-        override suspend fun getDoc(operation: String, path: String, preferCache: Boolean): StreamingCloudStore.RemoteSnapshot? {
-            val data = docs[path] ?: return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, false, emptyMap())
-            return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, true, data)
-        }
-        override suspend fun listCollection(operation: String, collectionPath: String, preferCache: Boolean): List<StreamingCloudStore.RemoteSnapshot> {
-            val prefix = "$collectionPath/"
-            return docs.entries
-                .filter { it.key.startsWith(prefix) && !it.key.removePrefix(prefix).contains('/') }
-                .map { StreamingCloudStore.RemoteSnapshot(it.key.removePrefix(prefix), it.key, true, it.value) }
-        }
-        override suspend fun commitBatch(operation: String, writes: List<StreamingCloudStore.DocWrite>) {
-            writes.forEach { docs[it.path] = it.data }
-        }
-        override suspend fun mergeDoc(operation: String, path: String, data: Map<String, Any?>) {
-            val existing = docs[path].orEmpty().toMutableMap()
-            existing.putAll(data)
-            docs[path] = existing
-        }
-        override suspend fun <T> runTx(operation: String, readPath: String, block: (StreamingCloudStore.RemoteSnapshot?) -> Pair<T, List<StreamingCloudStore.DocWrite>>): T {
-            val snap = docs[readPath]?.let { StreamingCloudStore.RemoteSnapshot(readPath.substringAfterLast('/'), readPath, true, it) }
-            val (result, writes) = block(snap)
-            writes.forEach { docs[it.path] = it.data }
-            return result
-        }
-        override fun observeDoc(path: String, onUpdate: (StreamingCloudStore.RemoteSnapshot?) -> Unit, onError: (Throwable) -> Unit): () -> Unit = {}
-        override fun observeCollection(collectionPath: String, onUpdate: (List<StreamingCloudStore.RemoteSnapshot>) -> Unit, onError: (Throwable) -> Unit): () -> Unit = {}
-    }
-
     @Test
     fun fix4_sensitiveHeadersKeptInMemoryOnly_roomMetadataOnly_andD1NeverStoresHeaders() = runTest {
         val animeId = "anilist_401"
         val scopeKey = "anime:401:s1:e1"
-        val providerId = ContentIdentityHelper.deterministicProviderId("AnimePahe")
-        val now = System.currentTimeMillis()
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 401, backendAnimeId = "b_401", titleRomaji = "Test 401", preferredTitle = "Test 401")
         )
-        db.streamCacheDao().upsertProviders(
-            listOf(
-                StreamProviderEntity(
-                    providerDocKey = "$scopeKey|p|$providerId",
-                    scopeKey = scopeKey,
-                    providerId = providerId,
-                    providerName = "AnimePahe",
-                    sourceCount = 1,
-                    updatedAt = now
-                )
-            )
-        )
-        db.streamCacheDao().upsertSource(
-            StreamSourceEntity(
-                sourceDocKey = "$scopeKey|p|$providerId|s|src_401",
-                scopeKey = scopeKey,
-                providerId = providerId,
-                sourceId = "src_401",
-                sourceName = "AnimePahe 1080p",
-                status = StreamRecordStatus.MISSING_URL.name,
-                updatedAt = now
-            )
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
+            scopeKey = scopeKey,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            sources = listOf(ProphecySourceDto(id = "src_401", label = "AnimePahe", quality = "1080p"))
         )
 
         val api = noOpApi { req ->
@@ -201,7 +147,6 @@ class Fix4CacheSecurityTest {
         val capturedD1Bodies = CopyOnWriteArrayList<String>()
         val server = HttpServer.create(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 0)
         server.createContext("/v1/") { exchange ->
-            val path = exchange.requestURI.path
             val method = exchange.requestMethod
             if (method == "POST") {
                 capturedD1Bodies.add(exchange.requestBody.bufferedReader().readText())
@@ -227,16 +172,7 @@ class Fix4CacheSecurityTest {
             .create(CloudflareD1ApiService::class.java)
         val d1 = CloudflareD1DataSource(d1Api, metricsTracker)
 
-        val cloudStore = FakeCloudStore()
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { true },
-            cloudStoreProvider = { cloudStore },
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
-        val repo = AnimeRepository(db, api, noOpAniList(), context, streamingRepo, d1, memoryCache, metricsTracker)
+        val repo = AnimeRepository(db, api, noOpAniList(), context, d1, memoryCache, metricsTracker)
 
         val resolved = repo.resolvePlayableStream(animeId = animeId, seasonNumber = 1, episodeNumber = 1)
         assertTrue(resolved.isSuccess)
@@ -246,24 +182,14 @@ class Fix4CacheSecurityTest {
         assertTrue("In-memory playback keeps Authorization", "Authorization" in memHeaderNames)
         assertTrue("In-memory playback keeps Cookie", "Cookie" in memHeaderNames)
 
-        // Wait briefly for async D1 save
-        val deadline = System.currentTimeMillis() + 2000L
-        while (capturedD1Bodies.isEmpty() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20L)
-        }
+        // D1 write is awaited inline before returning resolved playback
+        assertTrue("D1 save should have completed before return", capturedD1Bodies.isNotEmpty())
         val d1Joined = capturedD1Bodies.joinToString("\n")
         assertTrue("D1 stream_urls must store resolved stream_url", d1Joined.contains("https://cdn.example.com/secure/stream.m3u8"))
         assertFalse("D1 stream_urls must never persist Authorization", d1Joined.contains("top-secret-jwt"))
         assertFalse("D1 stream_urls must never persist Cookie", d1Joined.contains("secret_cookie"))
         assertFalse("D1 stream_urls must never persist Referer header", d1Joined.contains("kwik.si"))
         assertFalse("D1 stream_urls must never persist Session-Id", d1Joined.contains("sess_999"))
-
-        val fsDoc = cloudStore.docs["anime_streams/401/seasons/season_1/episodes/ep_1/providers/$providerId/sources/src_401"]
-        assertNotNull("Firestore source doc should be written", fsDoc)
-        val fsSerialized = fsDoc.toString()
-        assertFalse("Firestore must never store secret JWT", fsSerialized.contains("top-secret-jwt"))
-        assertFalse("Firestore must never store Cookie", fsSerialized.contains("secret_cookie"))
-        assertFalse("Firestore must never store Session-Id", fsSerialized.contains("sess_999"))
     }
 
     @Test
@@ -271,24 +197,15 @@ class Fix4CacheSecurityTest {
         val animeId = "anilist_402"
         val scopeKey = "anime:402:s1:e1"
         val providerId = ContentIdentityHelper.deterministicProviderId("MegaCloud")
-        val now = System.currentTimeMillis()
         db.animeDao().upsertAnime(
             AnimeEntry(id = animeId, aniListId = 402, backendAnimeId = "b_402", titleRomaji = "Test 402", preferredTitle = "Test 402")
         )
-        db.streamCacheDao().upsertProviders(
-            listOf(StreamProviderEntity("$scopeKey|p|$providerId", scopeKey, providerId, "MegaCloud", sourceCount = 1, updatedAt = now))
-        )
-        db.streamCacheDao().upsertSource(
-            StreamSourceEntity(
-                sourceDocKey = "$scopeKey|p|$providerId|s|src_402",
-                scopeKey = scopeKey,
-                providerId = providerId,
-                sourceId = "src_402",
-                sourceName = "MegaCloud 1080p",
-                expiresAt = "2020-01-01T00:00:00Z",
-                status = StreamRecordStatus.AVAILABLE.name,
-                updatedAt = now
-            )
+        seedEpisodeSourceSnapshot(
+            memoryCache = memoryCache,
+            scopeKey = scopeKey,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            sources = listOf(ProphecySourceDto(id = "src_402", label = "MegaCloud", quality = "1080p"))
         )
         // Seed expired entry in memory cache
         memoryCache.putResolvedPlayback(
@@ -379,15 +296,7 @@ class Fix4CacheSecurityTest {
                 )
             }
         }
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { false },
-            cloudStoreProvider = null,
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
-        val repo = AnimeRepository(db, api, noOpAniList(), context, streamingRepo, d1, memoryCache, metricsTracker)
+        val repo = AnimeRepository(db, api, noOpAniList(), context, d1, memoryCache, metricsTracker)
 
         // First call: expired D1 entry must be treated as cache miss & trigger fresh backend resolve
         val res1 = repo.resolvePlayableStream(animeId, 1, 1)
@@ -395,10 +304,6 @@ class Fix4CacheSecurityTest {
         assertEquals("https://fresh.cdn.example/working.m3u8", res1.getOrThrow().directData.playbackUrl)
         assertEquals(1, resolveCalls.get())
 
-        val deadline = System.currentTimeMillis() + 2000L
-        while (d1Store[recId]?.contains("working.m3u8") != true && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20L)
-        }
         assertTrue("D1 must be updated with fresh working URL", d1Store[recId]?.contains("working.m3u8") == true)
 
         // Verify forced resolve failure does NOT wipe the now-valid D1 cached URL
@@ -411,47 +316,19 @@ class Fix4CacheSecurityTest {
     }
 
     @Test
-    fun fix4_firestoreExpiredRemoteDocRejectedOnHydration() = runBlocking {
-        val cloudStore = FakeCloudStore()
-        val scopePath = "anime_streams/404/seasons/season_1/episodes/ep_1"
-        val provId = "prov_test404"
-        cloudStore.docs["anime_streams/404"] = mapOf(
-            "anilist_id" to 404L,
-            "content_type" to "ANIME",
-            "discovery_status" to DiscoveryStatus.COMPLETED.name,
-            "version" to 2L
+    fun fix4_d1ExpiredRemoteRecordRejectedOnRead() = runBlocking {
+        val fakeD1 = FakeInMemoryD1Api()
+        val recId = CloudflareD1DataSource.deterministicRecordId("be_404", "ep_404_1", "src_404")
+        fakeD1.records[recId] = com.example.data.d1.D1StreamUrlRecordDto(
+            id = recId,
+            animeId = "be_404",
+            episodeId = "ep_404_1",
+            sourceId = "src_404",
+            streamUrl = "https://cdn.example/expired.m3u8",
+            expiresAt = "2020-05-01T00:00:00Z"
         )
-        cloudStore.docs[scopePath] = mapOf(
-            "discovery_status" to DiscoveryStatus.COMPLETED.name,
-            "version" to 2L
-        )
-        cloudStore.docs["$scopePath/providers/$provId"] = mapOf(
-            "provider_id" to provId,
-            "provider_name" to "TestProv",
-            "status" to "AVAILABLE",
-            "source_count" to 1L
-        )
-        cloudStore.docs["$scopePath/providers/$provId/sources/src_404"] = mapOf(
-            "provider_id" to provId,
-            "source_id" to "src_404",
-            "source_name" to "TestProv 1080p",
-            "expires_at" to "2020-05-01T00:00:00Z",
-            "status" to "AVAILABLE",
-            "version" to 2L
-        )
-
-        val streamingRepo = FirestoreStreamingRepository(
-            streamCacheDao = db.streamCacheDao(),
-            firestoreProvider = { null },
-            isClientWriteAuthorized = { true },
-            cloudStoreProvider = { cloudStore },
-            d1DataSource = null,
-            metricsTracker = metricsTracker
-        )
-        val outcome = streamingRepo.fetchAndSyncScopeWithOutcome("404", isMovie = false, seasonNumber = 1, episodeNumber = 1, requirePlayableUrl = true)
-        assertNotNull("status=${outcome.status}, msg=${outcome.message}", outcome.data)
-        val parsed = outcome.data!!.sources.single()
-        assertEquals(StreamRecordStatus.EXPIRED.name, parsed.status)
+        val d1 = createTestD1DataSource(metricsTracker, fakeD1)
+        assertNull("Expired D1 record must be rejected as null", d1.getValidStreamUrl("be_404", "ep_404_1", "src_404"))
     }
 
     @Test

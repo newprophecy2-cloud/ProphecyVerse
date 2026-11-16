@@ -20,18 +20,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PlaybackHistory::class,
         UserPreference::class,
         DownloadEntry::class,
-        LocalProfile::class,
-        EpisodeSourceSnapshotRecord::class,
-        EpisodeSourceCandidateRecord::class,
-        SharedCatalogCacheEntry::class,
-        SharedCatalogPendingEntry::class,
-        StreamContainerEntity::class,
-        StreamSeasonEntity::class,
-        StreamEpisodeEntity::class,
-        StreamProviderEntity::class,
-        StreamSourceEntity::class
+        LocalProfile::class
     ],
-    version = 13,
+    version = 15,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -43,8 +34,6 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun userPreferenceDao(): UserPreferenceDao
     abstract fun downloadDao(): DownloadDao
     abstract fun localProfileDao(): LocalProfileDao
-    abstract fun sharedCatalogDao(): SharedCatalogDao
-    abstract fun streamCacheDao(): StreamCacheDao
 
     companion object {
         @Volatile
@@ -447,6 +436,25 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS `shared_catalog_cache`")
+                db.execSQL("DROP TABLE IF EXISTS `shared_catalog_pending`")
+                db.execSQL("DROP TABLE IF EXISTS `stream_sources`")
+                db.execSQL("DROP TABLE IF EXISTS `stream_providers`")
+                db.execSQL("DROP TABLE IF EXISTS `stream_episodes`")
+                db.execSQL("DROP TABLE IF EXISTS `stream_seasons`")
+                db.execSQL("DROP TABLE IF EXISTS `stream_containers`")
+            }
+        }
+
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS `episode_source_candidates`")
+                db.execSQL("DROP TABLE IF EXISTS `episode_source_snapshots`")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -466,7 +474,9 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_9_10,
                         MIGRATION_10_11,
                         MIGRATION_11_12,
-                        MIGRATION_12_13
+                        MIGRATION_12_13,
+                        MIGRATION_13_14,
+                        MIGRATION_14_15
                     )
                     .build()
                 INSTANCE = instance

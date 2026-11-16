@@ -8,15 +8,12 @@ import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.firebase.CloudHistoryRepository
-import com.example.data.firebase.FirestoreFailureCategory
-import com.example.data.firebase.FirestoreOperationException
 import com.example.data.local.AnimeEntry
 import com.example.data.local.AppDatabase
 import com.example.data.local.DownloadEntry
 import com.example.data.local.EpisodeEntry
 import com.example.data.local.PlaybackHistory
 import com.example.data.local.SeasonEntry
-import com.example.data.local.StreamSourceEntity
 import com.example.data.local.WatchlistEntry
 import com.example.data.remote.AniListData
 import com.example.data.remote.AniListGraphQLRequest
@@ -30,13 +27,9 @@ import com.example.data.remote.ProphecyVerseApiService
 import com.example.data.repository.AnimeRepository
 import com.example.data.repository.ExpiryState
 import com.example.data.repository.SourceExpiryTime
-import com.example.data.streaming.DiscoveryStatus
-import com.example.data.streaming.FirestoreStreamingRepository
-import com.example.data.streaming.StreamingCloudStore
 import com.example.player.PlayerManager
 import com.example.ui.navigation.Screen
 import com.google.firebase.FirebaseApp
-import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -270,21 +263,43 @@ class RepairV3RootCauseVerificationTest {
                 AppDatabase.MIGRATION_9_10,
                 AppDatabase.MIGRATION_10_11,
                 AppDatabase.MIGRATION_11_12,
-                AppDatabase.MIGRATION_12_13
+                AppDatabase.MIGRATION_12_13,
+                AppDatabase.MIGRATION_13_14,
+                AppDatabase.MIGRATION_14_15
             )
             .build()
         try {
             val anime = migrated.animeDao().getAnimeById("anilist_1")
-            assertNotNull("Migrated anime must survive v$startVersion -> v13", anime)
+            assertNotNull("Migrated anime must survive v$startVersion -> v15", anime)
             assertEquals("Cowboy Bebop", anime!!.preferredTitle)
 
             val watchlist = migrated.watchlistDao().getWatchlistEntry("anilist_1")
-            assertNotNull("Migrated watchlist must survive v$startVersion -> v13", watchlist)
+            assertNotNull("Migrated watchlist must survive v$startVersion -> v15", watchlist)
             assertTrue(watchlist!!.isFavorite)
 
             val history = migrated.playbackHistoryDao().getHistoryForEpisode("anilist_1", "ep1")
-            assertNotNull("Migrated history must survive v$startVersion -> v13", history)
+            assertNotNull("Migrated history must survive v$startVersion -> v15", history)
             assertEquals(50000L, history!!.positionMs)
+
+            // Verify all 9 obsolete streaming/shared-catalog/source-cache tables are dropped by v15
+            migrated.openHelper.readableDatabase.query(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).use { cursor ->
+                val tables = mutableSetOf<String>()
+                while (cursor.moveToNext()) tables += cursor.getString(0)
+                val obsolete = setOf(
+                    "shared_catalog_cache",
+                    "shared_catalog_pending",
+                    "stream_containers",
+                    "stream_seasons",
+                    "stream_episodes",
+                    "stream_providers",
+                    "stream_sources",
+                    "episode_source_snapshots",
+                    "episode_source_candidates"
+                )
+                assertTrue("Obsolete tables must be dropped in v15: ${tables intersect obsolete}", (tables intersect obsolete).isEmpty())
+            }
         } finally {
             migrated.close()
             dbFile.delete()
@@ -519,7 +534,7 @@ class RepairV3RootCauseVerificationTest {
     }
 
     @Test
-    fun streamingContracts_expiryEvaluation_readOutcome_andOutboxFlushWorkEndToEnd() = runTest {
+    fun d1AndExpiryContracts_evaluateExpiry_andHandleD1FailuresSafely() = runTest {
         assertEquals(ExpiryState.MISSING, SourceExpiryTime.evaluateExpiry(null))
         assertEquals(ExpiryState.MISSING, SourceExpiryTime.evaluateExpiry("  "))
         assertEquals(ExpiryState.INVALID, SourceExpiryTime.evaluateExpiry("not-a-timestamp"))
@@ -530,111 +545,25 @@ class RepairV3RootCauseVerificationTest {
         assertTrue(SourceExpiryTime.isExpiredOrInvalid("2020-01-01T00:00:00Z"))
         assertFalse(SourceExpiryTime.isExpiredOrInvalid("2099-01-01T00:00:00Z"))
 
-        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).allowMainThreadQueries().build()
-        try {
-            val docs = ConcurrentHashMap<String, LinkedHashMap<String, Any?>>()
-            var authorized = false
-            var simulatePermissionDeniedOnRead = false
-            val fakeStore = object : StreamingCloudStore {
-                override suspend fun getDoc(operation: String, path: String, preferCache: Boolean): StreamingCloudStore.RemoteSnapshot? {
-                    if (simulatePermissionDeniedOnRead) {
-                        throw FirestoreOperationException(
-                            FirestoreFailureCategory.PERMISSION_DENIED, operation, 0L,
-                            FirebaseFirestoreException("denied", FirebaseFirestoreException.Code.PERMISSION_DENIED)
-                        )
-                    }
-                    val d = docs[path] ?: return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, false)
-                    return StreamingCloudStore.RemoteSnapshot(path.substringAfterLast('/'), path, true, d)
-                }
+        val fakeD1Api = FakeInMemoryD1Api()
+        val d1 = createTestD1DataSource(api = fakeD1Api)
 
-                override suspend fun listCollection(operation: String, collectionPath: String, preferCache: Boolean): List<StreamingCloudStore.RemoteSnapshot> {
-                    if (simulatePermissionDeniedOnRead) {
-                        throw FirestoreOperationException(
-                            FirestoreFailureCategory.PERMISSION_DENIED, operation, 0L,
-                            FirebaseFirestoreException("denied", FirebaseFirestoreException.Code.PERMISSION_DENIED)
-                        )
-                    }
-                    val prefix = "$collectionPath/"
-                    return docs.entries
-                        .filter { it.key.startsWith(prefix) && !it.key.removePrefix(prefix).contains('/') }
-                        .map { StreamingCloudStore.RemoteSnapshot(it.key.substringAfterLast('/'), it.key, true, it.value) }
-                }
+        // Invalid stream URLs must never be saved to D1
+        assertFalse(d1.saveStreamUrl("be_1", "ep_1", "src_1", "ftp://invalid.example/v.mp4", "2099-01-01T00:00:00Z"))
+        assertEquals(0, fakeD1Api.writeCount)
 
-                override suspend fun commitBatch(operation: String, writes: List<StreamingCloudStore.DocWrite>) {
-                    writes.forEach { w -> docs[w.path] = LinkedHashMap(w.data) }
-                }
+        // Valid save + read hit
+        assertTrue(d1.saveStreamUrl("be_1", "ep_1", "src_1", "https://cdn.example/video.mp4", "2099-01-01T00:00:00Z"))
+        assertEquals(1, fakeD1Api.writeCount)
+        assertEquals("https://cdn.example/video.mp4", d1.getValidStreamUrl("be_1", "ep_1", "src_1")?.streamUrl)
 
-                override suspend fun mergeDoc(operation: String, path: String, data: Map<String, Any?>) {
-                    val m = docs.getOrPut(path) { LinkedHashMap() }
-                    m.putAll(data)
-                }
+        // D1 read/write failures degrade safely without throwing
+        fakeD1Api.failReads = true
+        assertNull(d1.getValidStreamUrl("be_1", "ep_1", "src_1"))
+        fakeD1Api.failReads = false
 
-                override suspend fun <T> runTx(operation: String, readPath: String, block: (StreamingCloudStore.RemoteSnapshot?) -> Pair<T, List<StreamingCloudStore.DocWrite>>): T {
-                    val (res, writes) = block(getDoc(operation, readPath, false))
-                    writes.forEach { w -> docs[w.path] = LinkedHashMap(w.data) }
-                    return res
-                }
-
-                override fun observeDoc(path: String, onUpdate: (StreamingCloudStore.RemoteSnapshot?) -> Unit, onError: (Throwable) -> Unit) = {}
-                override fun observeCollection(collectionPath: String, onUpdate: (List<StreamingCloudStore.RemoteSnapshot>) -> Unit, onError: (Throwable) -> Unit) = {}
-            }
-
-            val streamingRepo = FirestoreStreamingRepository(
-                streamCacheDao = db.streamCacheDao(),
-                firestoreProvider = { null },
-                isClientWriteAuthorized = { authorized },
-                cloudStoreProvider = { fakeStore }
-            )
-
-            // Queue write while unauthenticated
-            val src = StreamSourceEntity(
-                sourceDocKey = "anime:999:s1:e1|p|prov1|s|src1",
-                scopeKey = "anime:999:s1:e1",
-                providerId = "prov1",
-                sourceId = "src1",
-                sourceName = "Provider 1"
-            )
-            val publishedWhileUnauth = streamingRepo.publishResolvedStreamUrl(
-                sourceEntity = src,
-                contentKey = "999",
-                isMovie = false,
-                seasonNumber = 1,
-                episodeNumber = 1,
-                streamUrl = "https://cdn.example/video.mp4",
-                urlType = "direct",
-                contentType = "video/mp4",
-                safeHeaders = emptyList(),
-                expiresAt = "2099-01-01T00:00:00Z",
-                canonicalTitle = "Test Anime"
-            )
-            assertFalse(publishedWhileUnauth)
-            assertEquals(
-                FirestoreStreamingRepository.WriteOutcomeState.DEFERRED_UNAUTHENTICATED,
-                streamingRepo.lastWriteOutcome?.state
-            )
-            assertEquals(1, streamingRepo.pendingOutboxCount())
-
-            // Authorize and flush outbox
-            authorized = true
-            val flushed = streamingRepo.flushPendingOutbox()
-            assertEquals(1, flushed)
-            assertEquals(0, streamingRepo.pendingOutboxCount())
-            assertEquals(
-                FirestoreStreamingRepository.WriteOutcomeState.SUCCEEDED,
-                streamingRepo.lastWriteOutcome?.state
-            )
-
-            val hit = streamingRepo.fetchAndSyncScopeWithOutcome("999", isMovie = false, seasonNumber = 1, episodeNumber = 1)
-            assertEquals(FirestoreStreamingRepository.ScopeReadStatus.HIT, hit.status)
-            assertFalse(hit.isHardError)
-
-            simulatePermissionDeniedOnRead = true
-            val denied = streamingRepo.fetchAndSyncScopeWithOutcome("999", isMovie = false, seasonNumber = 1, episodeNumber = 1)
-            assertEquals(FirestoreStreamingRepository.ScopeReadStatus.PERMISSION_DENIED, denied.status)
-            assertTrue(denied.isHardError)
-        } finally {
-            db.close()
-        }
+        fakeD1Api.failWrites = true
+        assertFalse(d1.saveStreamUrl("be_1", "ep_1", "src_2", "https://cdn.example/video2.mp4", null))
 
         // Player diagnostics default contract check
         val diagnostics = PlayerManager.PlaybackDiagnostics(
@@ -643,6 +572,137 @@ class RepairV3RootCauseVerificationTest {
         )
         assertEquals("1080p", diagnostics.sourceQuality)
         assertEquals(123L, diagnostics.resolveDurationMs)
+    }
+
+    @Test
+    fun roomV13ToV14_dropsAllObsoleteStreamingAndCatalogTables_whilePreservingAnimeAndUserData() = runTest {
+        val dbName = "migration_13_14_cleanup_test.db"
+        val dbFile = context.getDatabasePath(dbName)
+        dbFile.delete()
+        File("${dbFile.path}-wal").delete()
+        File("${dbFile.path}-shm").delete()
+
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(13) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `anime_entries` (`id` TEXT NOT NULL, `aniListId` INTEGER, `backendAnimeId` TEXT, `titleRomaji` TEXT, `titleEnglish` TEXT, `titleNative` TEXT, `preferredTitle` TEXT NOT NULL, `synopsis` TEXT, `year` TEXT, `season` TEXT, `format` TEXT, `status` TEXT, `genres` TEXT NOT NULL, `score` REAL, `episodeCount` INTEGER, `duration` INTEGER, `studios` TEXT, `posterUrl` TEXT, `bannerUrl` TEXT, `isPlayable` INTEGER NOT NULL, `isTrending` INTEGER NOT NULL, `isSeasonal` INTEGER NOT NULL, `isPopular` INTEGER NOT NULL, `mediaCategory` TEXT NOT NULL DEFAULT 'ANIME', `metadataCompleteness` TEXT NOT NULL DEFAULT 'UNKNOWN', `canonicalAnimeId` INTEGER DEFAULT NULL, `canonicalTitle` TEXT DEFAULT NULL, `canonicalSeasonNumber` INTEGER DEFAULT NULL, `cumulativeEpisodeOffset` INTEGER DEFAULT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `watchlist_entries` (`animeId` TEXT NOT NULL, `status` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, `userScore` INTEGER, `addedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`animeId`))")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `playback_history` (`id` TEXT NOT NULL, `animeId` TEXT NOT NULL, `episodeId` TEXT NOT NULL, `seasonNumber` INTEGER NOT NULL, `episodeNumber` INTEGER NOT NULL, `episodeTitle` TEXT, `positionMs` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `completed` INTEGER NOT NULL, `animeTitle` TEXT DEFAULT NULL, `posterUrl` TEXT DEFAULT NULL, `mediaType` TEXT DEFAULT NULL, `lastPlayedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `download_entries` (`id` TEXT NOT NULL, `animeId` TEXT NOT NULL, `animeTitle` TEXT NOT NULL, `posterUrl` TEXT, `seasonNumber` INTEGER NOT NULL, `episodeNumber` INTEGER NOT NULL, `episodeTitle` TEXT, `localFilePath` TEXT, `downloadStatus` TEXT NOT NULL, `downloadedBytes` INTEGER NOT NULL, `totalBytes` INTEGER NOT NULL, `downloadUrl` TEXT, `mediaType` TEXT, `errorMessage` TEXT, `quality` TEXT DEFAULT NULL, `audioLanguage` TEXT DEFAULT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `shared_catalog_cache` (`documentId` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `shared_catalog_pending` (`documentId` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_containers` (`scopeKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_seasons` (`seasonDocKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_episodes` (`episodeDocKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_providers` (`providerDocKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `stream_sources` (`sourceDocKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("INSERT INTO anime_entries VALUES ('anilist_21', 21, 'be_op', 'One Piece', 'One Piece', NULL, 'One Piece', 'Pirates', '1999', 'FALL', 'TV', 'RELEASING', 'Action', 8.7, 1100, 24, 'Toei', NULL, NULL, 1, 1, 1, 1, 'ANIME', 'COMPLETE', NULL, NULL, NULL, NULL, 1000)")
+                        db.execSQL("INSERT INTO watchlist_entries VALUES ('anilist_21', 'WATCHING', 1, 9, 1000, 2000)")
+                        db.execSQL("INSERT INTO playback_history VALUES ('h_op_1', 'anilist_21', 'ep1', 1, 1, 'I Am Luffy!', 120000, 1440000, 0, 'One Piece', NULL, 'TV', 3000)")
+                        db.execSQL("INSERT INTO download_entries VALUES ('dl_op_1', 'anilist_21', 'One Piece', NULL, 1, 1, 'Ep 1', '/tmp/ep1.mp4', 'COMPLETED', 100, 100, NULL, 'anime', NULL, '1080p', 'Japanese', 4000)")
+                    }
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+                })
+                .build()
+        )
+        val sqlDb = helper.writableDatabase
+        try {
+            AppDatabase.MIGRATION_13_14.migrate(sqlDb)
+            sqlDb.query("SELECT name FROM sqlite_master WHERE type='table'").use { cursor ->
+                val tables = mutableSetOf<String>()
+                while (cursor.moveToNext()) tables += cursor.getString(0)
+                assertFalse(tables.contains("shared_catalog_cache"))
+                assertFalse(tables.contains("shared_catalog_pending"))
+                assertFalse(tables.contains("stream_containers"))
+                assertFalse(tables.contains("stream_seasons"))
+                assertFalse(tables.contains("stream_episodes"))
+                assertFalse(tables.contains("stream_providers"))
+                assertFalse(tables.contains("stream_sources"))
+                assertTrue(tables.contains("anime_entries"))
+                assertTrue(tables.contains("watchlist_entries"))
+                assertTrue(tables.contains("playback_history"))
+                assertTrue(tables.contains("download_entries"))
+            }
+            sqlDb.query("SELECT preferredTitle FROM anime_entries WHERE id = 'anilist_21'").use {
+                assertTrue(it.moveToFirst())
+                assertEquals("One Piece", it.getString(0))
+            }
+            sqlDb.query("SELECT isFavorite FROM watchlist_entries WHERE animeId = 'anilist_21'").use {
+                assertTrue(it.moveToFirst())
+                assertEquals(1, it.getInt(0))
+            }
+            sqlDb.query("SELECT positionMs FROM playback_history WHERE id = 'h_op_1'").use {
+                assertTrue(it.moveToFirst())
+                assertEquals(120000L, it.getLong(0))
+            }
+            sqlDb.query("SELECT localFilePath FROM download_entries WHERE id = 'dl_op_1'").use {
+                assertTrue(it.moveToFirst())
+                assertEquals("/tmp/ep1.mp4", it.getString(0))
+            }
+        } finally {
+            sqlDb.close()
+            dbFile.delete()
+        }
+    }
+
+    @Test
+    fun roomV14ToV15_dropsEpisodeSourceCacheTables_whilePreservingAnimeAndUserData() = runTest {
+        val dbName = "migration_14_15_source_cleanup_test.db"
+        val dbFile = context.getDatabasePath(dbName)
+        dbFile.delete()
+        File("${dbFile.path}-wal").delete()
+        File("${dbFile.path}-shm").delete()
+
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(14) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `anime_entries` (`id` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `episode_entries` (`id` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `watchlist_entries` (`animeId` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `playback_history` (`id` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `download_entries` (`id` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `local_profiles` (`id` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `user_preferences` (`prefKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `episode_source_snapshots` (`cacheKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("CREATE TABLE IF NOT EXISTS `episode_source_candidates` (`candidateKey` TEXT NOT NULL PRIMARY KEY)")
+                        db.execSQL("INSERT INTO anime_entries VALUES ('anilist_21')")
+                        db.execSQL("INSERT INTO episode_entries VALUES ('ep_21_1')")
+                        db.execSQL("INSERT INTO watchlist_entries VALUES ('anilist_21')")
+                        db.execSQL("INSERT INTO playback_history VALUES ('h_21_1')")
+                        db.execSQL("INSERT INTO download_entries VALUES ('dl_21_1')")
+                        db.execSQL("INSERT INTO local_profiles VALUES ('default')")
+                        db.execSQL("INSERT INTO user_preferences VALUES ('theme')")
+                        db.execSQL("INSERT INTO episode_source_snapshots VALUES ('scope_1')")
+                        db.execSQL("INSERT INTO episode_source_candidates VALUES ('cand_1')")
+                    }
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+                })
+                .build()
+        )
+        val sqlDb = helper.writableDatabase
+        try {
+            AppDatabase.MIGRATION_14_15.migrate(sqlDb)
+            sqlDb.query("SELECT name FROM sqlite_master WHERE type='table'").use { cursor ->
+                val tables = mutableSetOf<String>()
+                while (cursor.moveToNext()) tables += cursor.getString(0)
+                assertFalse("episode_source_snapshots must be dropped in v15", tables.contains("episode_source_snapshots"))
+                assertFalse("episode_source_candidates must be dropped in v15", tables.contains("episode_source_candidates"))
+                assertTrue(tables.contains("anime_entries"))
+                assertTrue(tables.contains("episode_entries"))
+                assertTrue(tables.contains("watchlist_entries"))
+                assertTrue(tables.contains("playback_history"))
+                assertTrue(tables.contains("download_entries"))
+                assertTrue(tables.contains("local_profiles"))
+                assertTrue(tables.contains("user_preferences"))
+            }
+        } finally {
+            sqlDb.close()
+            dbFile.delete()
+        }
     }
 
     private fun createStubRepo(db: AppDatabase): AnimeRepository {
@@ -662,6 +722,6 @@ class RepairV3RootCauseVerificationTest {
             override suspend fun resolveDirectPlay(request: com.example.data.remote.DirectPlayRequest) =
                 Response.success(com.example.data.remote.DirectPlayResponse(false, null))
         }
-        return AnimeRepository(db, prophecyApi, aniList, context)
+        return AnimeRepository(db, prophecyApi, aniList, context, d1DataSource = createTestD1DataSource())
     }
 }

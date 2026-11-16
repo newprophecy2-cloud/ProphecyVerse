@@ -152,46 +152,6 @@ interface EpisodeDao {
     @Query("SELECT * FROM season_entries WHERE animeId = :animeId ORDER BY seasonNumber ASC")
     suspend fun getSeasonsForAnime(animeId: String): List<SeasonEntry>
 
-    @Query("SELECT * FROM episode_source_snapshots WHERE cacheKey = :cacheKey LIMIT 1")
-    suspend fun getSourceSnapshot(cacheKey: String): EpisodeSourceSnapshotRecord?
-
-    @Query("SELECT * FROM episode_source_candidates WHERE cacheKey = :cacheKey ORDER BY candidateKey ASC")
-    suspend fun getSourceCandidates(cacheKey: String): List<EpisodeSourceCandidateRecord>
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertSourceSnapshot(snapshot: EpisodeSourceSnapshotRecord)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertSourceCandidates(candidates: List<EpisodeSourceCandidateRecord>)
-
-    @Query("DELETE FROM episode_source_candidates WHERE cacheKey = :cacheKey")
-    suspend fun deleteSourceCandidates(cacheKey: String)
-
-    @Query("SELECT cacheKey FROM episode_source_snapshots ORDER BY fetchedAtMs DESC LIMIT -1 OFFSET :keep")
-    suspend fun sourceSnapshotKeysOverLimit(keep: Int): List<String>
-
-    @Query("DELETE FROM episode_source_candidates WHERE cacheKey IN (:cacheKeys)")
-    suspend fun deleteSourceCandidatesForKeys(cacheKeys: List<String>)
-
-    @Query("DELETE FROM episode_source_snapshots WHERE cacheKey IN (:cacheKeys)")
-    suspend fun deleteSourceSnapshots(cacheKeys: List<String>)
-
-    @Transaction
-    suspend fun replaceSourceSnapshot(
-        snapshot: EpisodeSourceSnapshotRecord,
-        candidates: List<EpisodeSourceCandidateRecord>,
-        keep: Int
-    ) {
-        deleteSourceCandidates(snapshot.cacheKey)
-        upsertSourceSnapshot(snapshot)
-        if (candidates.isNotEmpty()) upsertSourceCandidates(candidates)
-        val evictedKeys = sourceSnapshotKeysOverLimit(keep)
-        if (evictedKeys.isNotEmpty()) {
-            deleteSourceCandidatesForKeys(evictedKeys)
-            deleteSourceSnapshots(evictedKeys)
-        }
-    }
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSeasons(seasons: List<SeasonEntry>)
 
@@ -219,12 +179,14 @@ interface EpisodeDao {
         seasons: List<SeasonEntry>,
         episodes: List<EpisodeEntry>
     ) {
+        val txStarted = com.example.data.streaming.MonotonicMetrics.nowMs()
         deleteEpisodesForAnime(animeId)
         deleteSeasonsForAnime(animeId)
         val canonicalSeasons = seasons.distinctBy { it.animeId to it.seasonNumber }
         val canonicalEpisodes = EpisodeCanonicalizer.canonicalize(emptyList(), episodes)
         if (canonicalSeasons.isNotEmpty()) upsertSeasons(canonicalSeasons)
         if (canonicalEpisodes.isNotEmpty()) upsertEpisodes(canonicalEpisodes)
+        com.example.data.streaming.MonotonicMetrics.recordDuration("room_transaction_ms", txStarted, "op=replaceEpisodeSnapshot")
     }
 
     /** Merge a partial response and persist only new/changed season and episode rows in one Room transaction. */
@@ -234,6 +196,7 @@ interface EpisodeDao {
         incomingSeasons: List<SeasonEntry>,
         incomingEpisodes: List<EpisodeEntry>
     ) {
+        val txStarted = com.example.data.streaming.MonotonicMetrics.nowMs()
         val existingSeasons = getSeasonsForAnime(animeId)
         val existingSeasonsById = existingSeasons.associateBy { it.id }
         val mergedSeasons = (existingSeasons + incomingSeasons)
@@ -278,17 +241,20 @@ interface EpisodeDao {
         ) {
             metrics.recordRoomWriteSkipped()
         }
+        com.example.data.streaming.MonotonicMetrics.recordDuration("room_transaction_ms", txStarted, "op=mergeEpisodeSnapshot")
     }
 
     @Transaction
     suspend fun rekeyAnime(fromAnimeId: String, toAnimeId: String) {
         if (fromAnimeId == toAnimeId) return
+        val txStarted = com.example.data.streaming.MonotonicMetrics.nowMs()
         val incomingSeasons = getSeasonsForAnime(fromAnimeId)
             .map { it.copy(animeId = toAnimeId, id = "${toAnimeId}_s${it.seasonNumber}") }
         val incomingEpisodes = getEpisodesForAnime(fromAnimeId).map { it.copy(animeId = toAnimeId) }
         deleteEpisodesForAnime(fromAnimeId)
         deleteSeasonsForAnime(fromAnimeId)
         mergeEpisodeSnapshot(toAnimeId, incomingSeasons, incomingEpisodes)
+        com.example.data.streaming.MonotonicMetrics.recordDuration("room_transaction_ms", txStarted, "op=rekeyAnime")
     }
 }
 

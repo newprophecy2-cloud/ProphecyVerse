@@ -4,7 +4,6 @@ import android.util.Base64
 import android.util.Log
 import com.example.data.d1.D1StreamUrlRecordDto
 import com.example.data.local.AnimeEntry
-import com.example.data.local.StreamSourceEntity
 import com.example.data.remote.DirectPlayData
 import com.example.data.remote.ProphecyEpisodeFullResponse
 import com.example.data.remote.ProphecySearchResultItem
@@ -245,99 +244,6 @@ object SourceIdentityValidator {
     }
 
     /**
-     * Validates a cached Room [StreamSourceEntity] metadata record in [expectedScopeKey].
-     * Room stores source metadata only; stream URLs reside in Cloudflare D1.
-     */
-    fun validateCachedSourceEntity(
-        entity: StreamSourceEntity,
-        expectedScopeKey: String,
-        expectedSourceId: String? = null,
-        nowMs: Long = System.currentTimeMillis(),
-        expectedProviderId: String? = null,
-        expectedBackendEpisodeId: String? = null,
-        allowedBackendEpisodeIds: Set<String> = emptySet()
-    ): SourceValidationResult {
-        val normEntityScope = normalizeId(entity.scopeKey)
-        val normExpectedScope = normalizeId(expectedScopeKey)
-        if (normEntityScope != normExpectedScope) {
-            val code = if (extractSeasonToken(normEntityScope) != extractSeasonToken(normExpectedScope)) {
-                SourceDiagnosticCode.SEASON_MISMATCH
-            } else {
-                SourceDiagnosticCode.EPISODE_ID_MISMATCH
-            }
-            return SourceValidationResult.Invalid(
-                code,
-                "Cached source scope '$normEntityScope' did not match '$normExpectedScope'."
-            )
-        }
-        val normEntitySourceId = normalizeId(entity.sourceId)
-        val normExpectedSourceId = expectedSourceId?.let(::normalizeId)?.takeIf { it.isNotEmpty() }
-        if (normExpectedSourceId != null && normEntitySourceId != normExpectedSourceId) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
-                "Cached sourceId '$normEntitySourceId' did not match '$normExpectedSourceId'."
-            )
-        }
-        val normEntityProviderId = normalizeId(entity.providerId)
-        if (normEntityProviderId.isEmpty()) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
-                "Cached source '${normEntitySourceId.ifEmpty { "blank" }}' lacks required providerId."
-            )
-        }
-        val normExpectedProviderId = expectedProviderId?.let(::normalizeId)?.takeIf { it.isNotEmpty() }
-        if (normExpectedProviderId != null && normEntityProviderId != normExpectedProviderId) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
-                "Cached providerId '$normEntityProviderId' did not match '$normExpectedProviderId'."
-            )
-        }
-        val normDocKey = normalizeId(entity.sourceDocKey)
-        val expectedRawDocKey = "$normExpectedScope|p|$normEntityProviderId|s|$normEntitySourceId"
-        val expectedSanitizedDocKey = "$normExpectedScope|p|$normEntityProviderId|s|${ContentIdentityHelper.sanitizeDocId(normEntitySourceId)}"
-        if (normDocKey.isEmpty() || (normDocKey != expectedRawDocKey && normDocKey != expectedSanitizedDocKey)) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
-                "Cached sourceDocKey '$normDocKey' did not match scope/provider identity."
-            )
-        }
-        val expectedBackendIds = buildSet {
-            expectedBackendEpisodeId?.let(::normalizeId)?.takeIf { it.isNotEmpty() }?.let(::add)
-            allowedBackendEpisodeIds.map(::normalizeId).filter { it.isNotEmpty() }.forEach(::add)
-        }
-        if (expectedBackendIds.isNotEmpty()) {
-            val normEntityBackendEp = normalizeId(entity.backendEpisodeId)
-            if (normEntityBackendEp.isEmpty()) {
-                return SourceValidationResult.Invalid(
-                    SourceDiagnosticCode.EPISODE_ID_MISMATCH,
-                    "Cached source '$normEntitySourceId' lacks expected backendEpisodeId."
-                )
-            }
-            val backendMatch = normEntityBackendEp in expectedBackendIds ||
-                expectedBackendIds.any { sameTokenCore(it, normEntityBackendEp) }
-            if (!backendMatch) {
-                return SourceValidationResult.Invalid(
-                    SourceDiagnosticCode.EPISODE_ID_MISMATCH,
-                    "Cached backendEpisodeId '$normEntityBackendEp' did not match expected $expectedBackendIds."
-                )
-            }
-        }
-        if (normEntitySourceId.isEmpty() || entity.status == "REMOVED" || entity.status == "FAILED" || entity.deletedAt != null) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.SOURCE_NOT_PLAYABLE,
-                "Cached source '${normEntitySourceId.ifEmpty { "blank" }}' has non-playable status=${entity.status}."
-            )
-        }
-        if (entity.status == "EXPIRED" || SourceExpiryTime.isExpiredOrInvalid(entity.expiresAt, nowMs)) {
-            return SourceValidationResult.Invalid(
-                SourceDiagnosticCode.SOURCE_EXPIRED,
-                "Cached source '$normEntitySourceId' is expired."
-            )
-        }
-        return SourceValidationResult.Valid
-    }
-
-    /**
      * Validates a Cloudflare D1 Stream URL record keyed by (anime_id, episode_id, source_id).
      */
     fun validateD1StreamUrlRecord(
@@ -407,7 +313,13 @@ object SourceIdentityValidator {
                 "Expected source ID is empty."
             )
         }
-        if (normActual.isEmpty() || normActual != normExpected) {
+        val exactMatch = normActual.isNotEmpty() && normActual == normExpected
+        val fallbackMatch = !exactMatch && normActual.isNotEmpty() && isValidFallbackTokenMatch(
+            data = data,
+            expectedSourceId = normExpected,
+            actualSourceId = normActual
+        )
+        if (!exactMatch && !fallbackMatch) {
             return SourceValidationResult.Invalid(
                 SourceDiagnosticCode.PROVIDER_ID_MISMATCH,
                 "Direct-play response sourceId '$normActual' did not match requested '$normExpected'."
@@ -426,6 +338,25 @@ object SourceIdentityValidator {
             )
         }
         return SourceValidationResult.Valid
+    }
+
+    private fun isValidFallbackTokenMatch(
+        data: DirectPlayData,
+        expectedSourceId: String,
+        actualSourceId: String
+    ): Boolean {
+        val expectedToken = decodeTokenCore(expectedSourceId) ?: return false
+        val actualToken = decodeTokenCore(actualSourceId) ?: return false
+        if (expectedToken.season != null && actualToken.season != null && expectedToken.season != actualToken.season) {
+            return false
+        }
+        if (expectedToken.episode != null && actualToken.episode != null && expectedToken.episode != actualToken.episode) {
+            return false
+        }
+        val isFallbackDeclared = data.message?.contains("fallback provider", ignoreCase = true) == true
+        val sameCore = (expectedToken.canonicalId != null && expectedToken.canonicalId == actualToken.canonicalId) ||
+            (expectedToken.provider == actualToken.provider && expectedToken.value == actualToken.value)
+        return isFallbackDeclared || sameCore
     }
 
     fun normalizeDto(dto: ProphecySourceDto): ProphecySourceDto {
@@ -451,18 +382,30 @@ object SourceIdentityValidator {
     private fun extractSeasonToken(scopeKey: String): String? =
         Regex(""":s(\d+):""").find(scopeKey)?.groupValues?.getOrNull(1)
 
-    private data class DecodedTokenCore(val provider: String, val value: String, val canonicalId: String?)
+    private data class DecodedTokenCore(
+        val provider: String,
+        val value: String,
+        val canonicalId: String?,
+        val season: Int? = null,
+        val episode: Int? = null
+    )
 
     private fun decodeTokenCore(rawId: String?): DecodedTokenCore? {
         val norm = normalizeId(rawId)
         if (norm.length < 8 || !norm.startsWith("eyJ")) return null
         return runCatching {
-            val bytes = Base64.decode(norm, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            val bytes = try {
+                Base64.decode(norm, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            } catch (_: Throwable) {
+                decodeUrlSafeBase64Fallback(norm)
+            }
             val json = JSONObject(String(bytes, Charsets.UTF_8))
             val p = json.optString("p", "").trim()
             val v = json.optString("v", "").trim()
             val c = json.optString("canonical_id", "").trim().takeIf { it.isNotEmpty() }
-            if (p.isNotEmpty() && v.isNotEmpty()) DecodedTokenCore(p, v, c) else null
+            val s = if (json.has("s") && !json.isNull("s")) json.optInt("s", -1).takeIf { it >= 0 } else null
+            val e = if (json.has("e") && !json.isNull("e")) json.optInt("e", -1).takeIf { it >= 0 } else null
+            if (p.isNotEmpty() && v.isNotEmpty()) DecodedTokenCore(p, v, c, s, e) else null
         }.getOrNull()
     }
 
@@ -471,5 +414,31 @@ object SourceIdentityValidator {
         val cb = decodeTokenCore(b) ?: return false
         if (ca.canonicalId != null && cb.canonicalId != null && ca.canonicalId == cb.canonicalId) return true
         return ca.provider == cb.provider && ca.value == cb.value
+    }
+
+    private fun decodeUrlSafeBase64Fallback(input: String): ByteArray {
+        val clean = input.replace('-', '+').replace('_', '/')
+        val table = IntArray(128) { -1 }
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        for (idx in alphabet.indices) {
+            table[alphabet[idx].code] = idx
+        }
+        val out = java.io.ByteArrayOutputStream((clean.length * 3) / 4 + 3)
+        var buffer = 0
+        var bitsLeft = 0
+        for (ch in clean) {
+            if (ch == '=') break
+            if (ch.isWhitespace()) continue
+            val code = ch.code
+            val value = if (code < table.size) table[code] else -1
+            if (value < 0) continue
+            buffer = (buffer shl 6) or value
+            bitsLeft += 6
+            if (bitsLeft >= 8) {
+                bitsLeft -= 8
+                out.write((buffer shr bitsLeft) and 0xFF)
+            }
+        }
+        return out.toByteArray()
     }
 }

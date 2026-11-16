@@ -146,15 +146,26 @@ object EpisodeSourceAggregator {
         val raw = apiCandidates.orEmpty()
         val nonExpired = raw.filterNot { candidate ->
             val expiry = SourceExpiryTime.parseEpochMillis(candidate.expiresAt)
-            expiry != null && expiry <= nowMs
+            val isExpired = expiry != null && expiry <= nowMs
+            if (isExpired) {
+                com.example.data.metrics.PlaybackDiagnosticsLogger.log(
+                    event = com.example.data.metrics.PlaybackDiagnosticEvent.SOURCE_CANDIDATE_REJECTED,
+                    sourceId = candidate.id.takeIf { it.isNotBlank() },
+                    reason = "expired",
+                    detail = "provider=${candidate.displayProviderName}"
+                )
+            }
+            isExpired
         }
         val candidates = mergeBySourceIdentity(nonExpired)
         val status = rawStatus?.trim()?.takeIf(String::isNotEmpty)
+        val normalizedStatus = status?.lowercase(Locale.US)
         val declaredState = status?.uppercase(Locale.US)
             ?.let { value -> EpisodeSourceResponseState.values().firstOrNull { it.name == value } }
         val explicitTimeout = errorMessage?.contains("timed out", ignoreCase = true) == true ||
             errorMessage?.contains("timeout", ignoreCase = true) == true ||
             declaredState == EpisodeSourceResponseState.TIMEOUT
+        val isUnavailableStatus = normalizedStatus == "unavailable" || normalizedStatus == "none"
         val state = when {
             explicitTimeout && candidates.isEmpty() -> EpisodeSourceResponseState.TIMEOUT
             !errorMessage.isNullOrBlank() && candidates.isEmpty() -> EpisodeSourceResponseState.FAILED
@@ -163,6 +174,8 @@ object EpisodeSourceAggregator {
             declaredState == EpisodeSourceResponseState.FAILED -> EpisodeSourceResponseState.FAILED
             declaredState == EpisodeSourceResponseState.STALE -> EpisodeSourceResponseState.STALE
             declaredState == EpisodeSourceResponseState.UNKNOWN -> EpisodeSourceResponseState.UNKNOWN
+            isUnavailableStatus && candidates.isEmpty() -> EpisodeSourceResponseState.EMPTY
+            isUnavailableStatus && candidates.isNotEmpty() -> EpisodeSourceResponseState.PARTIAL
             declaredState == EpisodeSourceResponseState.EMPTY && candidates.isEmpty() -> EpisodeSourceResponseState.EMPTY
             declaredState == EpisodeSourceResponseState.AVAILABLE && candidates.isNotEmpty() -> EpisodeSourceResponseState.AVAILABLE
             candidates.isNotEmpty() -> EpisodeSourceResponseState.AVAILABLE
