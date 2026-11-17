@@ -69,6 +69,295 @@ data class VersionControlConfig(
     val updatedBy: String = ""
 )
 
+internal sealed class VersionConfigParseResult {
+    data class Valid(val config: VersionControlConfig) : VersionConfigParseResult()
+    data class Invalid(val field: String, val reason: String) : VersionConfigParseResult()
+}
+
+private fun parseFlexibleBoolean(value: Any?): Boolean? = when (value) {
+    is Boolean -> value
+    is Number -> when (value.toInt()) {
+        1 -> true
+        0 -> false
+        else -> null
+    }
+    is String -> when (value.trim().lowercase()) {
+        "true", "1", "yes" -> true
+        "false", "0", "no" -> false
+        else -> null
+    }
+    else -> null
+}
+
+private fun parsePositiveVersionInt(value: Any?): Int? {
+    val numericLong: Long? = when (value) {
+        is Int -> value.toLong()
+        is Long -> value
+        is Short -> value.toLong()
+        is Byte -> value.toLong()
+        is Double -> if (value.isFinite() && value % 1.0 == 0.0) value.toLong() else null
+        is Float -> if (value.isFinite() && value % 1.0f == 0.0f) value.toLong() else null
+        is Number -> value.toLong()
+        is String -> value.trim().toLongOrNull()
+        else -> null
+    }
+    return numericLong?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+}
+
+private fun parseDownloadPriority(value: Any?, defaultValue: Int = 10): Int = when (value) {
+    is Number -> value.toInt()
+    is String -> value.trim().toIntOrNull() ?: defaultValue
+    else -> defaultValue
+}
+
+private fun parseValidHttpsUri(rawUrl: String): java.net.URI? {
+    val clean = rawUrl.trim()
+    if (clean.isEmpty()) return null
+    val uri = runCatching { java.net.URI(clean) }.getOrNull() ?: return null
+    if (!uri.scheme.equals("https", ignoreCase = true)) return null
+    if (uri.host.isNullOrBlank()) return null
+    return uri
+}
+
+private fun extractDownloadSourceFromMap(
+    fallbackId: String,
+    itemMap: Map<*, *>
+): DownloadSource? {
+    val isSourceEnabled = parseFlexibleBoolean(itemMap["enabled"]) ?: true
+    if (!isSourceEnabled) return null
+    val url = itemMap["url"]?.toString()?.trim().orEmpty()
+    val uri = parseValidHttpsUri(url) ?: return null
+    val id = itemMap["id"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: fallbackId
+    val label = itemMap["label"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: id.replaceFirstChar { it.uppercase() }
+    val priority = parseDownloadPriority(itemMap["priority"], 10)
+    val isDirect = parseFlexibleBoolean(
+        itemMap["isDirectApk"] ?: itemMap["is_direct_apk"] ?: itemMap["direct_apk"] ?: itemMap["direct"]
+    ) == true || uri.path?.endsWith(".apk", ignoreCase = true) == true
+    return DownloadSource(
+        id = id,
+        enabled = true,
+        label = label,
+        url = url,
+        priority = priority,
+        isDirectApk = isDirect
+    )
+}
+
+internal fun parseVersionControlConfig(
+    rawData: Map<String, Any?>?,
+    expectedPackageName: String = BuildConfig.APPLICATION_ID,
+    currentVersionCode: Int = BuildConfig.VERSION_CODE,
+    currentVersionName: String = BuildConfig.VERSION_NAME
+): VersionConfigParseResult {
+    if (rawData.isNullOrEmpty()) {
+        return VersionConfigParseResult.Invalid("document", "Version configuration document is empty or missing")
+    }
+
+    val rawEnabled = rawData["enabled"]
+    val enabled = if (rawEnabled != null) {
+        parseFlexibleBoolean(rawEnabled)
+            ?: return VersionConfigParseResult.Invalid("enabled", "Malformed enabled flag")
+    } else {
+        true
+    }
+
+    val expectedPkg = expectedPackageName.trim()
+    val pkgName = (rawData["package_name"] ?: rawData["packageName"])
+        ?.toString()
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: return VersionConfigParseResult.Invalid(
+            "package_name",
+            "Missing package_name (expected $expectedPkg)"
+        )
+
+    if (pkgName != expectedPkg) {
+        return VersionConfigParseResult.Invalid(
+            "package_name",
+            "Package mismatch: expected=$expectedPkg actual=$pkgName"
+        )
+    }
+
+    val rawForce = rawData["force_update"] ?: rawData["forceUpdate"]
+    val forceUpdate = if (rawForce != null) {
+        parseFlexibleBoolean(rawForce) ?: false
+    } else {
+        false
+    }
+
+    if (!enabled) {
+        val disabledLatest = parsePositiveVersionInt(
+            rawData["latest_version_code"]
+                ?: rawData["latestVersionCode"]
+                ?: rawData["version_code"]
+                ?: rawData["versionCode"]
+        ) ?: currentVersionCode.coerceAtLeast(1)
+        val disabledName = (rawData["latest_version_name"] ?: rawData["latestVersionName"])
+            ?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: currentVersionName
+        return VersionConfigParseResult.Valid(
+            VersionControlConfig(
+                enabled = false,
+                forceUpdate = false,
+                latestVersionName = disabledName,
+                latestVersionCode = disabledLatest,
+                minSupportedVersionCode = disabledLatest.coerceAtMost(currentVersionCode.coerceAtLeast(1)),
+                packageName = pkgName
+            )
+        )
+    }
+
+    val latestCode = parsePositiveVersionInt(
+        rawData["latest_version_code"]
+            ?: rawData["latestVersionCode"]
+            ?: rawData["version_code"]
+            ?: rawData["versionCode"]
+    ) ?: return VersionConfigParseResult.Invalid(
+        "latest_version_code",
+        "Missing or invalid latest_version_code"
+    )
+
+    val rawMinCode = rawData["min_supported_version_code"]
+        ?: rawData["minSupportedVersionCode"]
+        ?: rawData["minimum_version_code"]
+        ?: rawData["minimumVersionCode"]
+    val minCode = if (rawMinCode != null) {
+        parsePositiveVersionInt(rawMinCode)
+            ?: return VersionConfigParseResult.Invalid(
+                "min_supported_version_code",
+                "Invalid min_supported_version_code"
+            )
+    } else {
+        1
+    }
+
+    if (minCode > latestCode) {
+        return VersionConfigParseResult.Invalid(
+            "min_supported_version_code",
+            "min_supported_version_code ($minCode) exceeds latest_version_code ($latestCode)"
+        )
+    }
+
+    val latestName = (rawData["latest_version_name"]
+        ?: rawData["latestVersionName"]
+        ?: rawData["version_name"]
+        ?: rawData["versionName"])
+        ?.toString()
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: if (latestCode == currentVersionCode) currentVersionName else "v$latestCode"
+
+    val sha256 = (rawData["artifact_sha256"] ?: rawData["sha256"])?.toString()?.trim().orEmpty()
+    val signingCertificateSha256 = (rawData["signing_certificate_sha256"] ?: rawData["signingCertificateSha256"])
+        ?.toString()?.trim().orEmpty()
+    val updatedAt = parseAdminUpdatedAtMillis(rawData["updated_at"] ?: rawData["updatedAt"])
+        .takeIf { it > 0L } ?: System.currentTimeMillis()
+    val updatedBy = (rawData["updated_by"] ?: rawData["updatedBy"])?.toString()?.trim().orEmpty()
+
+    if (!requiresDownloadMetadata(currentVersionCode, latestCode, minCode)) {
+        return VersionConfigParseResult.Valid(
+            VersionControlConfig(
+                enabled = true,
+                forceUpdate = forceUpdate,
+                latestVersionName = latestName,
+                latestVersionCode = latestCode,
+                minSupportedVersionCode = minCode,
+                packageName = pkgName,
+                sha256 = sha256,
+                signingCertificateSha256 = signingCertificateSha256,
+                updatedAt = updatedAt,
+                updatedBy = updatedBy
+            )
+        )
+    }
+
+    val releaseNotesRaw = (rawData["release_notes"] ?: rawData["releaseNotes"]) as? Map<*, *>
+    val releaseNotesString = ((rawData["release_notes"] ?: rawData["releaseNotes"]) as? String)
+        ?.trim()?.takeIf { it.isNotEmpty() }
+    val bnNotes = releaseNotesRaw?.get("bn")?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: rawData["release_notes_bn"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: "Prophecy Verse V3"
+    val enNotes = releaseNotesRaw?.get("en")?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: rawData["release_notes_en"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: rawData["update_message"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        ?: releaseNotesString
+        ?: "A new version of Prophecy Verse is available."
+
+    val downloadsList = mutableListOf<DownloadSource>()
+    val rawDownloads = rawData["downloads"] ?: rawData["update_sources"] ?: rawData["updateSources"]
+    when (rawDownloads) {
+        is Map<*, *> -> {
+            if (rawDownloads.containsKey("url")) {
+                extractDownloadSourceFromMap("direct", rawDownloads)?.let(downloadsList::add)
+            } else {
+                rawDownloads.forEach { (key, value) ->
+                    val itemMap = value as? Map<*, *> ?: return@forEach
+                    val id = key?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "source"
+                    extractDownloadSourceFromMap(id, itemMap)?.let(downloadsList::add)
+                }
+            }
+        }
+        is List<*> -> {
+            rawDownloads.forEachIndexed { idx, value ->
+                val itemMap = value as? Map<*, *> ?: return@forEachIndexed
+                extractDownloadSourceFromMap("source_${idx + 1}", itemMap)?.let(downloadsList::add)
+            }
+        }
+    }
+
+    if (downloadsList.isEmpty()) {
+        val fallbackUrl = (rawData["apk_url"]
+            ?: rawData["direct_apk_url"]
+            ?: rawData["download_url"]
+            ?: rawData["url"])?.toString()?.trim().orEmpty()
+        val fallbackUri = parseValidHttpsUri(fallbackUrl)
+        if (fallbackUri != null) {
+            val isDirect = rawData["apk_url"] != null ||
+                rawData["direct_apk_url"] != null ||
+                fallbackUri.path?.endsWith(".apk", ignoreCase = true) == true
+            downloadsList.add(
+                DownloadSource(
+                    id = "primary",
+                    enabled = true,
+                    label = if (isDirect) "Direct APK Download" else "Official Download",
+                    url = fallbackUrl,
+                    priority = 1,
+                    isDirectApk = isDirect
+                )
+            )
+        }
+    }
+
+    val dedupedDownloads = downloadsList
+        .distinctBy { it.url }
+        .sortedBy { it.priority }
+
+    if (dedupedDownloads.isEmpty()) {
+        return VersionConfigParseResult.Invalid(
+            "downloads",
+            "Version configuration for code $latestCode has no enabled HTTPS download sources"
+        )
+    }
+
+    return VersionConfigParseResult.Valid(
+        VersionControlConfig(
+            enabled = true,
+            forceUpdate = forceUpdate,
+            latestVersionName = latestName,
+            latestVersionCode = latestCode,
+            minSupportedVersionCode = minCode,
+            packageName = pkgName,
+            downloads = dedupedDownloads,
+            sha256 = sha256,
+            signingCertificateSha256 = signingCertificateSha256,
+            releaseNotes = ReleaseNotes(bn = bnNotes, en = enNotes),
+            updatedAt = updatedAt,
+            updatedBy = updatedBy
+        )
+    )
+}
+
 internal fun parseAdminUpdatedAtMillis(value: Any?): Long = when (value) {
     is Timestamp -> value.toDate().time
     is Number -> value.toLong()
@@ -212,6 +501,8 @@ class VersionControlManager private constructor(private val context: Context) {
 
     private var activeDownloadJob: Job? = null
     private var activeCheckJob: Job? = null
+    @Volatile
+    private var lastServerCheckCompletedElapsedMs: Long = -1L
 
     val currentVersionCode: Int
         get() = BuildConfig.VERSION_CODE
@@ -240,7 +531,7 @@ class VersionControlManager private constructor(private val context: Context) {
             metricsTracker.recordDuplicateRequestPrevented()
             return
         }
-        if (!force) {
+        if (!force && hasFreshSessionCheck()) {
             val freshCached = readFreshCachedVerification()
             if (freshCached != null) {
                 if (_versionState.value != freshCached) {
@@ -277,143 +568,31 @@ class VersionControlManager private constructor(private val context: Context) {
                     return@launch
                 }
 
-                // Parse config with support for both V3 camelCase schema and V2 snake_case fallback
-                val enabled = snapshot.getBoolean("enabled")
-                    ?: throw IllegalArgumentException("Missing or invalid enabled flag")
-                if (!enabled) {
-                    publishVerifiedState(VersionCheckState.UpToDate(
-                        VersionControlConfig(
-                            enabled = false,
-                            latestVersionName = currentVersionName,
-                            latestVersionCode = currentVersionCode,
-                            minSupportedVersionCode = currentVersionCode,
-                            packageName = BuildConfig.APPLICATION_ID
+                when (val parsed = parseVersionControlConfig(
+                    rawData = snapshot.data,
+                    expectedPackageName = BuildConfig.APPLICATION_ID,
+                    currentVersionCode = currentVersionCode,
+                    currentVersionName = currentVersionName
+                )) {
+                    is VersionConfigParseResult.Invalid -> {
+                        Log.w(
+                            TAG,
+                            "[VERSION_CHECK] invalid_config field=${parsed.field} reason=${parsed.reason} installedCode=$currentVersionCode expectedPackage=${BuildConfig.APPLICATION_ID}"
                         )
-                    ))
-                    logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
-                    return@launch
-                }
-                val forceUpdate = snapshot.getBoolean("force_update")
-                    ?: snapshot.getBoolean("forceUpdate")
-                    ?: throw IllegalArgumentException("Missing force_update")
-                val latestCodeLong = (snapshot.getLong("latest_version_code")
-                    ?: snapshot.getLong("latestVersionCode")
-                    ?: throw IllegalArgumentException("Missing or invalid latest_version_code"))
-                val minCodeLong = (snapshot.getLong("min_supported_version_code")
-                    ?: snapshot.getLong("minSupportedVersionCode")
-                    ?: snapshot.getLong("minimum_version_code")
-                    ?: throw IllegalArgumentException("Missing or invalid min_supported_version_code"))
-                require(latestCodeLong in 1L..Int.MAX_VALUE.toLong()) {
-                    "latest_version_code is outside the supported numeric range"
-                }
-                require(minCodeLong in 1L..Int.MAX_VALUE.toLong()) {
-                    "min_supported_version_code is outside the supported numeric range"
-                }
-                val latestCode = latestCodeLong.toInt()
-                val minCode = minCodeLong.toInt()
-                val latestName = snapshot.getString("latest_version_name")
-                    ?: snapshot.getString("latestVersionName")
-                    ?: throw IllegalArgumentException("Missing latest_version_name")
-                val pkgName = snapshot.getString("package_name")
-                    ?: snapshot.getString("packageName")
-                    ?: throw IllegalArgumentException("Missing package_name")
-                val sha256 = snapshot.getString("artifact_sha256")
-                    ?: snapshot.getString("sha256") ?: ""
-                val signingCertificateSha256 = snapshot.getString("signing_certificate_sha256")
-                    ?: snapshot.getString("signingCertificateSha256") ?: ""
-                require(latestCode >= minCode && latestCode > 0 && minCode > 0)
-                require(pkgName == BuildConfig.APPLICATION_ID)
-
-                // A current/supported installation does not need release-download fields to determine
-                // its state. Older builds need at least one actionable HTTPS download source.
-                if (!requiresDownloadMetadata(currentVersionCode, latestCode, minCode)) {
-                    publishVerifiedState(VersionCheckState.UpToDate(
-                        VersionControlConfig(
-                            enabled = enabled,
-                            forceUpdate = forceUpdate,
-                            latestVersionName = latestName,
-                            latestVersionCode = latestCode,
-                            minSupportedVersionCode = minCode,
-                            packageName = pkgName,
-                            updatedAt = parseAdminUpdatedAtMillis(
-                                snapshot.get("updated_at") ?: snapshot.get("updatedAt")
-                            )
+                        logVersionCheck("INVALID_CONFIG", startedAt, message = "${parsed.field}:${parsed.reason}")
+                        _versionState.value = verificationFailureFallback(readCachedVerification(), getDefaultConfig())
+                    }
+                    is VersionConfigParseResult.Valid -> {
+                        lastServerCheckCompletedElapsedMs = SystemClock.elapsedRealtime()
+                        val evaluated = evaluateVersionState(currentVersionCode, parsed.config)
+                        publishVerifiedState(evaluated)
+                        logVersionCheck(
+                            "SUCCESS",
+                            startedAt,
+                            message = "${evaluated::class.simpleName}_latest_${parsed.config.latestVersionCode}_min_${parsed.config.minSupportedVersionCode}"
                         )
-                    ))
-                    logVersionCheck("SUCCESS", startedAt, message = "UP_TO_DATE")
-                    return@launch
-                }
-                // Release notes (map or strings)
-                val releaseNotesRaw = (snapshot.get("release_notes") ?: snapshot.get("releaseNotes")) as? Map<*, *>
-                val bnNotes = releaseNotesRaw?.get("bn")?.toString()
-                    ?: snapshot.getString("release_notes_bn")
-                    ?: "Prophecy Verse V3"
-                val enNotes = releaseNotesRaw?.get("en")?.toString()
-                    ?: snapshot.getString("release_notes_en")
-                    ?: snapshot.getString("update_message")
-                    ?: "A new version of Prophecy Verse is available."
-
-                // Parse downloads map
-                val downloadsList = mutableListOf<DownloadSource>()
-                val downloadsMap = (snapshot.get("downloads") as? Map<*, *>)
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: (snapshot.get("update_sources") as? Map<*, *>)
-                if (downloadsMap != null) {
-                    downloadsMap.forEach { (key, value) ->
-                        val itemMap = value as? Map<*, *>
-                        if (itemMap != null) {
-                            val id = key?.toString() ?: "source"
-                            val isSourceEnabled = itemMap["enabled"] as? Boolean ?: true
-                            val label = itemMap["label"]?.toString() ?: id.replaceFirstChar { it.uppercase() }
-                            val url = itemMap["url"]?.toString() ?: ""
-                            val priority = (itemMap["priority"] as? Number)?.toInt() ?: 10
-                            val uri = runCatching { Uri.parse(url) }.getOrNull()
-                            val validHttps = uri?.scheme == "https" && !uri.host.isNullOrBlank()
-                            val isDirect = itemMap["isDirectApk"] == true ||
-                                uri?.path?.endsWith(".apk", ignoreCase = true) == true
-
-                            if (isSourceEnabled && validHttps && url.isNotBlank()) {
-                                downloadsList.add(
-                                    DownloadSource(
-                                        id = id,
-                                        enabled = true,
-                                        label = label,
-                                        url = url,
-                                        priority = priority,
-                                        isDirectApk = isDirect
-                                    )
-                                )
-                            }
-                        }
                     }
                 }
-
-                if (downloadsList.isEmpty()) {
-                    throw IllegalArgumentException("Version configuration has no enabled HTTPS download sources")
-                }
-
-                // Sort by priority ascending
-                downloadsList.sortBy { it.priority }
-
-                val config = VersionControlConfig(
-                    enabled = enabled,
-                    forceUpdate = forceUpdate,
-                    latestVersionName = latestName,
-                    latestVersionCode = latestCode,
-                    minSupportedVersionCode = minCode,
-                    packageName = pkgName,
-                    downloads = downloadsList,
-                    sha256 = sha256,
-                    releaseNotes = ReleaseNotes(bn = bnNotes, en = enNotes),
-                    signingCertificateSha256 = signingCertificateSha256,
-                    // The Admin publisher writes FieldValue.serverTimestamp(), which resolves to Timestamp.
-                    updatedAt = parseAdminUpdatedAtMillis(snapshot.get("updated_at") ?: snapshot.get("updatedAt"))
-                        .takeIf { it > 0L } ?: System.currentTimeMillis(),
-                    updatedBy = snapshot.getString("updated_by") ?: snapshot.getString("updatedBy") ?: ""
-                )
-
-                publishVerifiedState(evaluateVersionState(currentVersionCode, config))
-                logVersionCheck("SUCCESS", startedAt, message = _versionState.value::class.simpleName ?: "UNKNOWN")
 
             } catch (e: CancellationException) {
                 logVersionCheck("CANCELLED", startedAt, message = "CancellationException")
@@ -585,7 +764,7 @@ class VersionControlManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "VersionControlManager"
-        private const val VERSION_CHECK_TTL_MS = 6 * 60 * 60 * 1000L
+        private const val VERSION_CHECK_TTL_MS = 5 * 60 * 1000L
 
         @Volatile
         private var instance: VersionControlManager? = null
@@ -612,6 +791,12 @@ class VersionControlManager private constructor(private val context: Context) {
             }
         }
     }
+
+    private fun hasFreshSessionCheck(): Boolean {
+        val last = lastServerCheckCompletedElapsedMs
+        return last >= 0L && (SystemClock.elapsedRealtime() - last) < VERSION_CHECK_TTL_MS
+    }
+
     private fun publishVerifiedState(state: VersionCheckState) {
         _versionState.value = state
         val config = when (state) {
@@ -655,27 +840,33 @@ class VersionControlManager private constructor(private val context: Context) {
     private fun readCachedVerification(): VersionCheckState? = runCatching {
         val prefs = context.getSharedPreferences("version_control_verification", Context.MODE_PRIVATE)
         val type = prefs.getString("state", null) ?: return null
+        if (type !in setOf("force", "optional", "current")) return null
+        val pkgName = prefs.getString("package", BuildConfig.APPLICATION_ID)
+            ?.trim()?.takeIf { it.isNotEmpty() } ?: BuildConfig.APPLICATION_ID
+        if (pkgName != BuildConfig.APPLICATION_ID) return null
         val items = JSONArray(prefs.getString("downloads", "[]"))
         val downloads = (0 until items.length()).mapNotNull { i -> items.optJSONObject(i)?.let { item ->
-            DownloadSource(item.optString("id"), item.optBoolean("enabled"), item.optString("label"),
-                item.optString("url"), item.optInt("priority"), item.optBoolean("direct"))
+            val url = item.optString("url").trim()
+            if (parseValidHttpsUri(url) == null) return@let null
+            DownloadSource(item.optString("id"), item.optBoolean("enabled", true), item.optString("label"),
+                url, item.optInt("priority", 10), item.optBoolean("direct", false))
         } }
         val config = VersionControlConfig(
             enabled = prefs.getBoolean("enabled", true), forceUpdate = prefs.getBoolean("force", false),
             latestVersionName = prefs.getString("name", currentVersionName) ?: currentVersionName,
             latestVersionCode = prefs.getInt("code", currentVersionCode),
             minSupportedVersionCode = prefs.getInt("minimum", currentVersionCode),
-            packageName = prefs.getString("package", BuildConfig.APPLICATION_ID) ?: BuildConfig.APPLICATION_ID,
+            packageName = pkgName,
             downloads = downloads, sha256 = prefs.getString("sha256", "") ?: "",
             signingCertificateSha256 = prefs.getString("cert", "") ?: "",
             releaseNotes = ReleaseNotes(prefs.getString("notesBn", "") ?: "", prefs.getString("notesEn", "") ?: ""),
             updatedAt = prefs.getLong("updated", 0L), updatedBy = prefs.getString("updatedBy", "") ?: ""
         )
-        when (type) {
-            "force" -> VersionCheckState.ForceUpdate(config)
-            "optional" -> VersionCheckState.OptionalUpdate(config)
-            "current" -> VersionCheckState.UpToDate(config)
-            else -> null
+        if (requiresDownloadMetadata(currentVersionCode, config.latestVersionCode, config.minSupportedVersionCode) &&
+            config.enabled && downloads.isEmpty()
+        ) {
+            return null
         }
+        evaluateVersionState(currentVersionCode, config)
     }.getOrNull()
 }

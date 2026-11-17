@@ -383,6 +383,14 @@ object TitleMatcher {
         if (providerCount > 1) {
             selectionScore += 0.05f + (providerCount.coerceAtMost(5) * 0.005f)
         }
+        val providers = com.example.data.identity.ProviderPriorityPolicy()
+            .allProvidersForSearchItem(prophecyItem)
+        when {
+            com.example.data.identity.ProviderPriorityPolicy.PROVIDER_4KHDHUB in providers ->
+                selectionScore += 0.04f
+            com.example.data.identity.ProviderPriorityPolicy.PROVIDER_DRAMACHI in providers ->
+                selectionScore += 0.015f
+        }
         return baseConfidence to selectionScore
     }
 

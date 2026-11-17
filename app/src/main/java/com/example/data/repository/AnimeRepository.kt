@@ -2,10 +2,14 @@ package com.example.data.repository
 
 import android.content.Context
 import android.util.Log
+import com.example.data.identity.CanonicalEpisodeCatalogBuilder
+import com.example.data.identity.CanonicalProviderCatalogResult
 import com.example.data.identity.EpisodeCanonicalizer
 import com.example.data.identity.EpisodeSourceEpisodeIds
 import com.example.data.identity.CanonicalAnimeIdentity
 import com.example.data.identity.CanonicalAnimeRoute
+import com.example.data.identity.ProviderCatalogPayload
+import com.example.data.identity.ProviderPriorityPolicy
 import com.example.data.local.AnimeAlias
 import com.example.data.local.AnimeDao
 import com.example.data.local.AnimeEntry
@@ -24,8 +28,10 @@ import com.example.data.local.SeasonEntry
 import com.example.data.local.WatchlistDao
 import com.example.data.local.WatchlistEntry
 import com.example.data.remote.AniListGraphQLRequest
+import com.example.data.remote.AniListGraphQLResponse
 import com.example.data.remote.AniListGraphQLService
 import com.example.data.remote.AniListMedia
+import com.example.data.remote.AniListPage
 import com.example.data.remote.AniListQueries
 import com.example.data.remote.AniListRelatedMediaNode
 import com.example.data.remote.DirectPlayData
@@ -43,6 +49,7 @@ import com.example.data.streaming.SafePlaybackHeaders
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
@@ -58,6 +65,9 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import androidx.room.withTransaction
+import retrofit2.Response
+import java.io.IOException
+import java.net.SocketTimeoutException
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 
@@ -105,7 +115,8 @@ class AnimeRepository(
     private val applicationContext: Context? = null,
     private val d1DataSource: com.example.data.d1.CloudflareD1DataSource = NetworkModule.d1DataSource,
     private val memoryCache: com.example.data.cache.MemoryCacheManager = com.example.data.cache.MemoryCacheManager(),
-    private val metricsTracker: com.example.data.metrics.DatabaseMetricsTracker = com.example.data.metrics.DatabaseMetricsTracker.getInstance()
+    private val metricsTracker: com.example.data.metrics.DatabaseMetricsTracker = com.example.data.metrics.DatabaseMetricsTracker.getInstance(),
+    private val providerPolicy: ProviderPriorityPolicy = ProviderPriorityPolicy()
 ) {
     private val animeDao: AnimeDao = database.animeDao()
     private val episodeDao: EpisodeDao = database.episodeDao()
@@ -113,6 +124,17 @@ class AnimeRepository(
     private val watchlistDao: WatchlistDao = database.watchlistDao()
     private val historyDao: PlaybackHistoryDao = database.playbackHistoryDao()
     private val discoveredBackendEpisodeIds = ConcurrentHashMap<String, String>()
+    private val providerBackendEpisodeIds = ConcurrentHashMap<String, String>()
+    private data class PendingProviderTier(
+        val tierRank: Int,
+        val backendId: String,
+        val episodeIds: List<String>,
+        val effectiveBackendSeason: Int,
+        val allowedEpisodeNumbers: Set<Int>
+    )
+    private val unqueriedFallbackTiers = ConcurrentHashMap<String, MutableList<PendingProviderTier>>()
+    private val canonical4khdConfirmedAnimeIds = ConcurrentHashMap.newKeySet<String>()
+    private val homeDiscoveryInFlight = ConcurrentHashMap<Boolean, CompletableDeferred<Result<Unit>>>()
 
     data class SearchPageResult(
         val totalReturnedInPage: Int,
@@ -294,6 +316,35 @@ class AnimeRepository(
     // ============================================================================================
 
     suspend fun refreshHomeDiscovery(force: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+        while (true) {
+            val existingFlight = homeDiscoveryInFlight[force]
+            if (existingFlight != null) {
+                metricsTracker.recordDuplicateRequestPrevented()
+                return@withContext existingFlight.await()
+            }
+            val createdFlight = CompletableDeferred<Result<Unit>>()
+            if (homeDiscoveryInFlight.putIfAbsent(force, createdFlight) == null) {
+                try {
+                    val res = executeRefreshHomeDiscovery(force)
+                    createdFlight.complete(res)
+                    return@withContext res
+                } catch (cancelled: CancellationException) {
+                    createdFlight.cancel(cancelled)
+                    throw cancelled
+                } catch (t: Throwable) {
+                    val failure = Result.failure<Unit>(t)
+                    createdFlight.complete(failure)
+                    return@withContext failure
+                } finally {
+                    homeDiscoveryInFlight.remove(force, createdFlight)
+                }
+            }
+        }
+        @Suppress("UNREACHABLE_CODE")
+        Result.failure(IllegalStateException("Unreachable home discovery state"))
+    }
+
+    private suspend fun executeRefreshHomeDiscovery(force: Boolean): Result<Unit> =
         homeRefreshMutex.withLock {
             val now = System.currentTimeMillis()
             if (force) {
@@ -301,7 +352,7 @@ class AnimeRepository(
             } else {
                 if (now - lastHomeRefreshTimestamp < 5 * 60 * 1000L && memoryCache.isHomeFresh("home_bundle")) {
                     memoryCache.getHomeSection("home_bundle")
-                    return@withContext Result.success(Unit)
+                    return@withLock Result.success(Unit)
                 }
 
                 val latestHomeAt = animeDao.getLatestHomeUpdatedAt() ?: 0L
@@ -314,7 +365,7 @@ class AnimeRepository(
                         memoryCache.putHomeSection("home_bundle", localHome)
                         localHome.forEach { memoryCache.putAnime(it) }
                         lastHomeRefreshTimestamp = now
-                        return@withContext Result.success(Unit)
+                        return@withLock Result.success(Unit)
                     }
                 }
                 metricsTracker.recordRoomMiss()
@@ -332,28 +383,72 @@ class AnimeRepository(
                     else -> "FALL"
                 }
 
-                val response = aniListApi.postQuery(
-                    AniListGraphQLRequest(
-                        query = AniListQueries.DISCOVERY_FEEDS,
-                        variables = mapOf("season" to season, "seasonYear" to year)
-                    )
+                val request = AniListGraphQLRequest(
+                    query = AniListQueries.DISCOVERY_FEEDS,
+                    variables = mapOf("season" to season, "seasonYear" to year)
                 )
-                metricsTracker.recordApiRequest(response.isSuccessful)
+                val response = postAniListDiscoveryWithRetry(request)
                 MonotonicMetrics.recordDuration("anilist_request_ms", reqStarted, "op=home_feeds status=${response.code()}")
 
                 if (!response.isSuccessful) {
-                    return@withContext Result.failure(IllegalStateException("AniList home feeds failed: HTTP ${response.code()}"))
+                    val errBody = runCatching { response.errorBody()?.string() }.getOrNull()
+                    Log.w("AnimeRepository", httpFailureDiagnostic("anilist_home", response.code(), response.headers()["X-Request-ID"], errBody))
+                    return@withLock Result.failure(IllegalStateException("AniList home feeds failed: HTTP ${response.code()}"))
                 }
 
-                val data = response.body()?.data
-                    ?: return@withContext Result.failure(IllegalStateException("AniList home feeds returned empty data"))
+                val body = response.body()
+                if (body == null) {
+                    Log.w("AnimeRepository", "AniList home feeds returned null HTTP body")
+                    return@withLock Result.failure(IllegalStateException("AniList home feeds returned empty body"))
+                }
 
-                val trendingMedia = data.trending?.media.orEmpty()
-                val seasonalMedia = data.seasonal?.media.orEmpty()
-                val popularMedia = data.popular?.media.orEmpty()
-                val movieMedia = data.movies?.media.orEmpty()
+                val gqlErrors = body.errors.orEmpty().filter { !it.message.isNullOrBlank() || it.status != null }
+                val gqlErrorSummary = gqlErrors.joinToString("; ") { err ->
+                    val statusTag = err.status?.let { "($it) " }.orEmpty()
+                    val msg = err.message.orEmpty().replace(Regex("""[\r\n\t]+"""), " ").take(120)
+                    "$statusTag$msg"
+                }.take(300)
+
+                val data = body.data
+                if (data == null) {
+                    Log.w("AnimeRepository", "AniList home feeds returned null data; errors=[$gqlErrorSummary]")
+                    return@withLock Result.failure(
+                        IllegalStateException(
+                            if (gqlErrorSummary.isNotBlank()) "AniList GraphQL errors: $gqlErrorSummary"
+                            else "AniList home feeds returned empty data"
+                        )
+                    )
+                }
+
+                fun safeSectionMedia(page: AniListPage?): List<AniListMedia> =
+                    page?.media.orEmpty()
+                        .filterNotNull()
+                        .filter { it.id > 0 }
+                        .distinctBy { it.id }
+
+                val trendingMedia = safeSectionMedia(data.trending)
+                val seasonalMedia = safeSectionMedia(data.seasonal)
+                val popularMedia = safeSectionMedia(data.popular)
+                val movieMedia = safeSectionMedia(data.movies)
 
                 val allMedia = uniqueAniListMedia(trendingMedia + seasonalMedia + popularMedia + movieMedia)
+                if (allMedia.isEmpty()) {
+                    Log.w(
+                        "AnimeRepository",
+                        "AniList home feeds contained zero valid media items; preserving cached catalog. errors=[$gqlErrorSummary]"
+                    )
+                    return@withLock Result.failure(
+                        IllegalStateException(
+                            if (gqlErrorSummary.isNotBlank()) "AniList home feeds unavailable: $gqlErrorSummary"
+                            else "AniList home feeds returned zero media items"
+                        )
+                    )
+                }
+
+                val trendingAuthoritative = trendingMedia.isNotEmpty() || (data.trending?.media != null && gqlErrors.isEmpty())
+                val seasonalAuthoritative = seasonalMedia.isNotEmpty() || (data.seasonal?.media != null && gqlErrors.isEmpty())
+                val popularAuthoritative = popularMedia.isNotEmpty() || (data.popular?.media != null && gqlErrors.isEmpty())
+
                 val trendingIds = trendingMedia.map { it.id }.toSet()
                 val seasonalIds = seasonalMedia.map { it.id }.toSet()
                 val popularIds = popularMedia.map { it.id }.toSet()
@@ -366,7 +461,11 @@ class AnimeRepository(
                     val existing = animeDao.getAnimeByAniListId(m.id)
                         ?: animeDao.getAnimeById("anilist_${m.id}")
                     val mapping = animeDao.getMappingForAniList(m.id)
-                    val preferredTitle = m.title?.english ?: m.title?.romaji ?: m.title?.native ?: "Anime #${m.id}"
+                    val preferredTitle = m.title?.english?.takeIf { it.isNotBlank() }
+                        ?: m.title?.romaji?.takeIf { it.isNotBlank() }
+                        ?: m.title?.native?.takeIf { it.isNotBlank() }
+                        ?: existing?.preferredTitle
+                        ?: "Anime #${m.id}"
                     val isMovieFormat = m.format.equals("MOVIE", ignoreCase = true) || m.id in movieIds
                     val canonicalInfo = inferShallowCanonicalInfo(m, existing)
 
@@ -378,16 +477,16 @@ class AnimeRepository(
                         canonicalTitle = canonicalInfo.canonicalTitle ?: existing?.canonicalTitle,
                         canonicalSeasonNumber = canonicalInfo.canonicalSeasonNumber ?: existing?.canonicalSeasonNumber,
                         cumulativeEpisodeOffset = canonicalInfo.cumulativeEpisodeOffset ?: existing?.cumulativeEpisodeOffset,
-                        titleRomaji = m.title?.romaji,
-                        titleEnglish = m.title?.english,
-                        titleNative = m.title?.native,
+                        titleRomaji = m.title?.romaji ?: existing?.titleRomaji,
+                        titleEnglish = m.title?.english ?: existing?.titleEnglish,
+                        titleNative = m.title?.native ?: existing?.titleNative,
                         preferredTitle = preferredTitle,
                         synopsis = m.description ?: existing?.synopsis,
                         year = (m.startDate?.year ?: m.seasonYear)?.toString() ?: existing?.year,
                         season = m.season ?: existing?.season,
                         format = m.format ?: existing?.format,
                         status = m.status ?: existing?.status,
-                        genres = m.genres?.joinToString(", ") ?: existing?.genres.orEmpty(),
+                        genres = m.genres?.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: existing?.genres.orEmpty(),
                         score = m.averageScore?.let { it / 10.0 } ?: existing?.score,
                         episodeCount = resolveKnownEpisodeCount(m, existing?.episodeCount),
                         duration = m.duration ?: existing?.duration,
@@ -395,10 +494,10 @@ class AnimeRepository(
                         posterUrl = m.coverImage?.large ?: m.coverImage?.medium ?: existing?.posterUrl,
                         bannerUrl = m.bannerImage ?: existing?.bannerUrl,
                         isPlayable = true,
-                        isTrending = m.id in trendingIds,
-                        isSeasonal = m.id in seasonalIds,
-                        isPopular = m.id in popularIds,
-                        mediaCategory = if (isMovieFormat) "MOVIE" else "ANIME",
+                        isTrending = if (trendingAuthoritative) (m.id in trendingIds) else (existing?.isTrending ?: false),
+                        isSeasonal = if (seasonalAuthoritative) (m.id in seasonalIds) else (existing?.isSeasonal ?: false),
+                        isPopular = if (popularAuthoritative) (m.id in popularIds) else (existing?.isPopular ?: false),
+                        mediaCategory = if (isMovieFormat) "MOVIE" else (existing?.mediaCategory ?: "ANIME"),
                         metadataCompleteness = existing?.metadataCompleteness ?: "UNKNOWN",
                         updatedAt = System.currentTimeMillis()
                     )
@@ -409,9 +508,9 @@ class AnimeRepository(
                 val distinctAliases = aliasesToInsert.distinctBy { it.animeId to it.alias }
                 val roomStarted = MonotonicMetrics.nowMs()
                 database.withTransaction {
-                    animeDao.clearTrendingFlags()
-                    animeDao.clearSeasonalFlags()
-                    animeDao.clearPopularFlags()
+                    if (trendingAuthoritative) animeDao.clearTrendingFlags()
+                    if (seasonalAuthoritative) animeDao.clearSeasonalFlags()
+                    if (popularAuthoritative) animeDao.clearPopularFlags()
                     if (entriesToUpsert.isNotEmpty()) animeDao.upsertAnimeList(entriesToUpsert)
                     if (distinctAliases.isNotEmpty()) animeDao.insertAliases(distinctAliases)
                 }
@@ -420,15 +519,61 @@ class AnimeRepository(
                 memoryCache.putHomeSection("home_bundle", entriesToUpsert)
                 entriesToUpsert.forEach { memoryCache.putAnime(it) }
                 lastHomeRefreshTimestamp = System.currentTimeMillis()
-                Result.success(Unit)
+                if (gqlErrors.isNotEmpty()) {
+                    Log.w("AnimeRepository", "AniList home feeds succeeded partially with GraphQL errors=[$gqlErrorSummary]")
+                    Result.failure(IllegalStateException("AniList home feeds partially failed: $gqlErrorSummary"))
+                } else {
+                    Result.success(Unit)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
                 metricsTracker.recordApiRequest(false)
                 MonotonicMetrics.recordDuration("anilist_request_ms", reqStarted, "op=home_feeds error=${e::class.simpleName}")
+                Log.w("AnimeRepository", "AniList home feeds exception (${e::class.simpleName}); preserving cached catalog.")
                 Result.failure(e)
             }
         }
+
+    private suspend fun postAniListDiscoveryWithRetry(
+        request: AniListGraphQLRequest,
+        maxRetries: Int = 2
+    ): Response<AniListGraphQLResponse> {
+        val backoffsMs = longArrayOf(100L, 250L)
+        var lastError: Throwable? = null
+        for (attempt in 0..maxRetries) {
+            try {
+                val response = withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
+                    aniListApi.postQuery(request)
+                }
+                metricsTracker.recordApiRequest(response.isSuccessful)
+                val code = response.code()
+                val retryableHttp = code == 429 || code in 500..599
+                if (!retryableHttp || attempt >= maxRetries) {
+                    return response
+                }
+                val retryAfterSec = response.headers()["Retry-After"]?.trim()?.toLongOrNull()
+                val retryDelayMs = retryAfterSec
+                    ?.let { (it * 1000L).coerceIn(50L, 1_500L) }
+                    ?: backoffsMs.getOrElse(attempt) { 250L }
+                Log.w("AnimeRepository", "AniList home feeds HTTP $code on attempt=${attempt + 1}; retrying in ${retryDelayMs}ms")
+                delay(retryDelayMs)
+            } catch (cancelled: CancellationException) {
+                if (cancelled !is TimeoutCancellationException) {
+                    throw cancelled
+                }
+                metricsTracker.recordApiRequest(false)
+                lastError = cancelled
+                if (attempt >= maxRetries) throw cancelled
+                delay(backoffsMs.getOrElse(attempt) { 250L })
+            } catch (e: IOException) {
+                metricsTracker.recordApiRequest(false)
+                lastError = e
+                if (attempt >= maxRetries) throw e
+                delay(backoffsMs.getOrElse(attempt) { 250L })
+            }
+        }
+        throw lastError ?: SocketTimeoutException("AniList home feeds failed after retries")
     }
 
     suspend fun searchAnime(query: String): Result<Int> =
@@ -1006,10 +1151,103 @@ class AnimeRepository(
                     isDedicatedSequelBackendEntry(entry, details, rawDtoEpisodes, entry.canonicalSeasonNumber)
                 val targetCatalogSeasonOverride = if (remapDedicatedSequelSeason) entry!!.canonicalSeasonNumber else null
 
-                val mappedSeasons = if (isMovie) {
-                    emptyList()
+                val episodeProviders = rawDtoEpisodes.map { ep ->
+                    ep to providerPolicy.identifyProviderFromEpisode(ep)
+                }
+                val hasExplicit4khdEpisodes = episodeProviders.any {
+                    it.second == ProviderPriorityPolicy.PROVIDER_4KHDHUB
+                }
+                val hasExplicitNon4khdEpisodes = episodeProviders.any {
+                    it.second != ProviderPriorityPolicy.PROVIDER_UNKNOWN &&
+                        it.second != ProviderPriorityPolicy.PROVIDER_4KHDHUB
+                }
+                val existingSeasonsBeforeSync = if (!isMovie) episodeDao.getSeasonsForAnime(animeId) else emptyList()
+                val existingEpisodesBeforeSync = if (!isMovie) episodeDao.getEpisodesForAnime(animeId) else emptyList()
+                val existingIs4khdConfirmed = !isMovie && (
+                    animeId in canonical4khdConfirmedAnimeIds ||
+                        existingEpisodesBeforeSync.any { ep ->
+                            ProviderPriorityPolicy.identifyProviderFromPrefixOrMarker(ep.id) == ProviderPriorityPolicy.PROVIDER_4KHDHUB ||
+                                ProviderPriorityPolicy.identifyProviderFromToken(ep.id) == ProviderPriorityPolicy.PROVIDER_4KHDHUB
+                        }
+                    )
+                val shouldReconcileMultiProvider = !isMovie && rawDtoEpisodes.isNotEmpty() && (
+                    (hasExplicit4khdEpisodes && hasExplicitNon4khdEpisodes) ||
+                        (!hasExplicit4khdEpisodes && existingIs4khdConfirmed && hasExplicitNon4khdEpisodes)
+                    )
+                if (hasExplicit4khdEpisodes && !isMovie) {
+                    canonical4khdConfirmedAnimeIds += animeId
+                }
+
+                var canonicalReconcileResult: CanonicalProviderCatalogResult? = null
+                val mappedSeasons: List<SeasonEntry>
+                val mappedEpisodes: List<EpisodeEntry>
+                val finalSeasons: List<SeasonEntry>
+
+                if (isMovie) {
+                    mappedSeasons = emptyList()
+                    mappedEpisodes = emptyList()
+                    finalSeasons = emptyList()
+                } else if (shouldReconcileMultiProvider) {
+                    val providerPayloads = buildList {
+                        if (hasExplicit4khdEpisodes) {
+                            val primaryEps = episodeProviders
+                                .filter { it.second == ProviderPriorityPolicy.PROVIDER_4KHDHUB }
+                                .map { it.first }
+                            val primarySeasonNums = primaryEps.mapNotNull { it.season?.takeIf { s -> s > 0 } }.toSet()
+                            val primarySeasons = seasonDtos.filter {
+                                primarySeasonNums.isEmpty() || it.number in primarySeasonNums
+                            }
+                            add(
+                                ProviderCatalogPayload(
+                                    providerId = ProviderPriorityPolicy.PROVIDER_4KHDHUB,
+                                    animeIdentity = details.canonicalId ?: entry?.canonicalAnimeId?.toString() ?: preferredTitle,
+                                    animeTitle = preferredTitle,
+                                    seasons = primarySeasons,
+                                    episodes = primaryEps,
+                                    isAvailable = primaryEps.isNotEmpty(),
+                                    cumulativeEpisodeOffset = 0
+                                )
+                            )
+                        }
+                        val fallbackGroups = episodeProviders
+                            .filter { it.second != ProviderPriorityPolicy.PROVIDER_4KHDHUB }
+                            .groupBy { (_, prov) ->
+                                if (prov == ProviderPriorityPolicy.PROVIDER_UNKNOWN) ProviderPriorityPolicy.PROVIDER_DRAMACHI else prov
+                            }
+                        fallbackGroups.forEach { (prov, pairs) ->
+                            val eps = pairs.map { it.first }
+                            val sNums = eps.mapNotNull { it.season?.takeIf { s -> s > 0 } }.toSet()
+                            add(
+                                ProviderCatalogPayload(
+                                    providerId = prov,
+                                    animeIdentity = details.canonicalId ?: entry?.canonicalAnimeId?.toString() ?: preferredTitle,
+                                    animeTitle = preferredTitle,
+                                    seasons = seasonDtos.filter { sNums.isEmpty() || it.number in sNums },
+                                    episodes = eps,
+                                    isAvailable = eps.isNotEmpty(),
+                                    cumulativeEpisodeOffset = entry?.cumulativeEpisodeOffset ?: 0
+                                )
+                            )
+                        }
+                    }
+                    val reconciled = CanonicalEpisodeCatalogBuilder.build(
+                        animeId = animeId,
+                        canonicalAnimeIdentity = details.canonicalId ?: entry?.canonicalAnimeId?.toString() ?: preferredTitle,
+                        payloads = providerPayloads,
+                        existingCanonicalSeasons = existingSeasonsBeforeSync,
+                        existingCanonicalEpisodes = existingEpisodesBeforeSync,
+                        targetCatalogSeasonOverride = targetCatalogSeasonOverride,
+                        policy = providerPolicy
+                    )
+                    canonicalReconcileResult = reconciled
+                    if (reconciled.primaryAuthorityAvailable) {
+                        canonical4khdConfirmedAnimeIds += animeId
+                    }
+                    mappedSeasons = reconciled.seasons
+                    finalSeasons = reconciled.seasons
+                    mappedEpisodes = reconciled.episodes
                 } else {
-                    seasonDtos.map { seasonDto ->
+                    mappedSeasons = seasonDtos.map { seasonDto ->
                         val effectiveSeasonNum = if (targetCatalogSeasonOverride != null && seasonDto.number == 1) {
                             targetCatalogSeasonOverride
                         } else {
@@ -1024,11 +1262,7 @@ class AnimeRepository(
                             title = seasonDto.title?.takeIf { it.isNotBlank() } ?: "Season $effectiveSeasonNum"
                         )
                     }.distinctBy { it.seasonNumber }
-                }
 
-                val mappedEpisodes = if (isMovie) {
-                    emptyList()
-                } else {
                     val rawMapped = mutableListOf<EpisodeEntry>()
                     for (seasonDto in seasonDtos) {
                         for (epDto in seasonDto.episodes.orEmpty()) {
@@ -1081,15 +1315,11 @@ class AnimeRepository(
                             }
                         }
                     }
-                    rawMapped.distinctBy { it.id }
-                }
+                    mappedEpisodes = rawMapped.distinctBy { it.id }
 
-                val finalSeasons = if (isMovie) {
-                    emptyList()
-                } else {
                     val missingSeasonNums = mappedEpisodes.map { it.seasonNumber }.distinct() -
                         mappedSeasons.map { it.seasonNumber }.toSet()
-                    (mappedSeasons + missingSeasonNums.map { sNum ->
+                    finalSeasons = (mappedSeasons + missingSeasonNums.map { sNum ->
                         SeasonEntry(
                             id = "${animeId}_s$sNum",
                             animeId = animeId,
@@ -1100,13 +1330,21 @@ class AnimeRepository(
                     }).sortedBy { it.seasonNumber }
                 }
 
-                val declaredTotalCount = details.episodeCount?.takeIf { it > 0 }
-                    ?: mappedEpisodes.size.takeIf { it > 0 }
-                    ?: entry?.episodeCount
-                val authoritativeComplete = isAuthoritativeEpisodeSnapshot(details.partial, details.seasons) ||
-                    (details.partial == false && mappedEpisodes.isNotEmpty())
+                val preservedPriorCatalog = canonicalReconcileResult?.preservedPriorCatalog == true
+                val declaredTotalCount = if (preservedPriorCatalog) {
+                    existingEpisodesBeforeSync.size.takeIf { it > 0 } ?: entry?.episodeCount
+                } else {
+                    details.episodeCount?.takeIf { it > 0 }
+                        ?: mappedEpisodes.size.takeIf { it > 0 }
+                        ?: entry?.episodeCount
+                }
+                val authoritativeComplete = !preservedPriorCatalog && (
+                    isAuthoritativeEpisodeSnapshot(details.partial, details.seasons) ||
+                        (details.partial == false && mappedEpisodes.isNotEmpty())
+                    )
                 val metadataCompleteness = when {
                     isMovie -> "NOT_APPLICABLE"
+                    preservedPriorCatalog && existingEpisodesBeforeSync.isNotEmpty() -> entry?.metadataCompleteness ?: "COMPLETE"
                     authoritativeComplete && mappedEpisodes.isNotEmpty() -> "COMPLETE"
                     details.partial == false && details.status.equals("FINISHED", ignoreCase = true) && mappedEpisodes.isNotEmpty() -> "COMPLETE"
                     mappedEpisodes.isNotEmpty() -> "PARTIAL"
@@ -1191,10 +1429,51 @@ class AnimeRepository(
                     episodeDao.deleteOtherSeasonEpisodes(animeId, targetCatalogSeasonOverride)
                     episodeDao.deleteOtherSeasons(animeId, targetCatalogSeasonOverride)
                 }
-                if (authoritativeComplete) {
+                if (preservedPriorCatalog) {
+                    if (mappedEpisodes.isNotEmpty()) {
+                        episodeDao.mergeEpisodeSnapshot(animeId, finalSeasons, mappedEpisodes)
+                    }
+                } else if (authoritativeComplete || (canonicalReconcileResult?.primaryAuthorityAvailable == true && mappedEpisodes.isNotEmpty())) {
                     episodeDao.replaceEpisodeSnapshot(animeId, finalSeasons, mappedEpisodes)
                 } else if (finalSeasons.isNotEmpty() || mappedEpisodes.isNotEmpty()) {
                     episodeDao.mergeEpisodeSnapshot(animeId, finalSeasons, mappedEpisodes)
+                }
+
+                // Record verified per-provider backendEpisodeId bindings for sequential tier resolution
+                val contentKey = ContentIdentityHelper.canonicalContentKey(animeId, updatedEntry)
+                val reconcileSnapshot = canonicalReconcileResult
+                if (reconcileSnapshot != null) {
+                    reconcileSnapshot.bindingsByCanonicalId.values.forEach { perProv ->
+                        val sample = perProv.values.firstOrNull() ?: return@forEach
+                        val epScopeKey = ContentIdentityHelper.scopeKey(
+                            contentKey = contentKey,
+                            isMovie = false,
+                            seasonNumber = sample.seasonNumber,
+                            episodeNumber = sample.episodeNumber
+                        )
+                        perProv.forEach { (prov, binding) ->
+                            providerBackendEpisodeIds["$epScopeKey|prov:$prov"] = binding.backendEpisodeId
+                        }
+                    }
+                } else {
+                    episodeProviders.forEach { (dto, prov) ->
+                        val dtoId = dto.id.trim()
+                        if (dtoId.isNotEmpty() && prov != ProviderPriorityPolicy.PROVIDER_UNKNOWN) {
+                            val rawEpSeason = dto.season?.takeIf { it > 0 } ?: 1
+                            val epSeason = if (targetCatalogSeasonOverride != null && rawEpSeason == 1) {
+                                targetCatalogSeasonOverride
+                            } else {
+                                rawEpSeason
+                            }
+                            val epScopeKey = ContentIdentityHelper.scopeKey(
+                                contentKey = contentKey,
+                                isMovie = false,
+                                seasonNumber = epSeason,
+                                episodeNumber = dto.number
+                            )
+                            providerBackendEpisodeIds["$epScopeKey|prov:$prov"] = dtoId
+                        }
+                    }
                 }
 
                 val persistedSeasons = episodeDao.getSeasonsForAnime(animeId)
@@ -1207,7 +1486,7 @@ class AnimeRepository(
                 if (firstPageEps.isNotEmpty()) memoryCache.putEpisodesPage(animeId, firstSeasonNum, 0, firstPageEps)
 
                 val catalogState = resolveEpisodeCatalogState(
-                    snapshotComplete = authoritativeComplete,
+                    snapshotComplete = authoritativeComplete || preservedPriorCatalog,
                     cachedEpisodeCount = persistedEpisodes.size,
                     backendIdKnown = true,
                     detailsEndpointSucceeded = true,
@@ -1228,6 +1507,104 @@ class AnimeRepository(
                 Result.failure(e)
             }
         }
+    }
+
+    /**
+     * Reconciles multi-provider episode payloads into Room with 4KHDHUB as sole canonical mapping authority.
+     * Fallback providers attach verified sourceEpisodeIds without altering canonical season/episode counts.
+     */
+    suspend fun syncMultiProviderCatalog(
+        animeId: String,
+        payloads: List<ProviderCatalogPayload>,
+        targetCatalogSeasonOverride: Int? = null
+    ): CanonicalProviderCatalogResult = withContext(Dispatchers.IO) {
+        detailRefreshMutexes.computeIfAbsent(animeId) { Mutex() }.withLock {
+            val entry = animeDao.getAnimeById(animeId)
+            val existingSeasons = episodeDao.getSeasonsForAnime(animeId)
+            val existingEpisodes = episodeDao.getEpisodesForAnime(animeId)
+            val canonicalAnimeIdentity = entry?.canonicalAnimeId?.toString()
+                ?: entry?.preferredTitle
+                ?: animeId
+
+            val result = CanonicalEpisodeCatalogBuilder.build(
+                animeId = animeId,
+                canonicalAnimeIdentity = canonicalAnimeIdentity,
+                payloads = payloads,
+                existingCanonicalSeasons = existingSeasons,
+                existingCanonicalEpisodes = existingEpisodes,
+                targetCatalogSeasonOverride = targetCatalogSeasonOverride,
+                policy = providerPolicy
+            )
+
+            if (result.primaryAuthorityAvailable) {
+                canonical4khdConfirmedAnimeIds += animeId
+                episodeDao.replaceEpisodeSnapshot(animeId, result.seasons, result.episodes)
+                if (entry != null && result.episodes.isNotEmpty() && entry.episodeCount != result.episodes.size) {
+                    animeDao.upsertAnime(
+                        entry.copy(
+                            episodeCount = result.episodes.size,
+                            metadataCompleteness = "COMPLETE",
+                            updatedAt = System.currentTimeMillis()
+                        )
+                    )
+                    memoryCache.invalidateAnime(animeId)
+                }
+            } else if (result.preservedPriorCatalog && result.episodes.isNotEmpty()) {
+                episodeDao.mergeEpisodeSnapshot(animeId, result.seasons, result.episodes)
+            }
+            memoryCache.invalidateEpisodes(animeId)
+
+            val contentKey = ContentIdentityHelper.canonicalContentKey(animeId, entry)
+            result.bindingsByCanonicalId.values.forEach { perProv ->
+                val sample = perProv.values.firstOrNull() ?: return@forEach
+                val epScopeKey = ContentIdentityHelper.scopeKey(
+                    contentKey = contentKey,
+                    isMovie = false,
+                    seasonNumber = sample.seasonNumber,
+                    episodeNumber = sample.episodeNumber
+                )
+                perProv.forEach { (prov, binding) ->
+                    providerBackendEpisodeIds["$epScopeKey|prov:$prov"] = binding.backendEpisodeId
+                }
+            }
+            result
+        }
+    }
+
+    private fun identifyProviderForEpisodeId(scopeKey: String, epId: String): String {
+        val clean = epId.trim()
+        if (clean.isEmpty()) return ProviderPriorityPolicy.PROVIDER_UNKNOWN
+        val prefix = "$scopeKey|prov:"
+        providerBackendEpisodeIds.entries
+            .firstOrNull { it.key.startsWith(prefix) && it.value == clean }
+            ?.let { return it.key.removePrefix(prefix) }
+        ProviderPriorityPolicy.identifyProviderFromToken(clean)?.let { return it }
+        ProviderPriorityPolicy.identifyProviderFromPrefixOrMarker(clean)?.let { return it }
+        ProviderPriorityPolicy.identifyProviderFromText(clean)?.let { return it }
+        return ProviderPriorityPolicy.PROVIDER_UNKNOWN
+    }
+
+    private fun resolveProviderBackendEpisodeId(
+        scopeKey: String,
+        candidateProvider: String,
+        preferredBackendEpisodeId: String?,
+        knownBackendEpisodeIds: Set<String>
+    ): String? {
+        val cleanPreferred = preferredBackendEpisodeId?.trim()?.takeIf { it.isNotEmpty() }
+        if (cleanPreferred != null) return cleanPreferred
+        if (candidateProvider != ProviderPriorityPolicy.PROVIDER_UNKNOWN) {
+            providerBackendEpisodeIds["$scopeKey|prov:$candidateProvider"]
+                ?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { return it }
+            knownBackendEpisodeIds.firstOrNull { epId ->
+                identifyProviderForEpisodeId(scopeKey, epId) == candidateProvider
+            }?.let { return it }
+            // Never reuse a different known provider's backendEpisodeId as this provider's ID
+            return knownBackendEpisodeIds.firstOrNull { epId ->
+                identifyProviderForEpisodeId(scopeKey, epId) == ProviderPriorityPolicy.PROVIDER_UNKNOWN
+            }
+        }
+        return knownBackendEpisodeIds.firstOrNull { it.isNotBlank() }
     }
 
     suspend fun loadEpisodePage(
@@ -1546,7 +1923,53 @@ class AnimeRepository(
             }
         }
 
-        fetchCandidatesFromBackend(backendId, backendEpisodeIds, effectiveBackendSeason, allowedEpisodeNumbers)
+        suspend fun fetchTierIdsSequential(
+            targetBackendId: String,
+            epIds: List<String>,
+            expectedSeason: Int,
+            allowedNumbers: Set<Int>
+        ) {
+            val groupedByRank = epIds
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .groupBy { epId ->
+                    providerPolicy.tierRank(identifyProviderForEpisodeId(scopeKey, epId))
+                }
+                .toSortedMap()
+
+            if (groupedByRank.isEmpty()) {
+                unqueriedFallbackTiers.remove(scopeKey)
+                return
+            }
+
+            val rankEntries = groupedByRank.entries.toList()
+            unqueriedFallbackTiers.remove(scopeKey)
+            for ((index, entryRank) in rankEntries.withIndex()) {
+                val tierEpIds = entryRank.value
+                fetchCandidatesFromBackend(targetBackendId, tierEpIds, expectedSeason, allowedNumbers)
+                if (aggregatedCandidates.any { it.second.hasUsableSourceId }) {
+                    val remaining = rankEntries.drop(index + 1).map { (remRank, remIds) ->
+                        PendingProviderTier(
+                            tierRank = remRank,
+                            backendId = targetBackendId,
+                            episodeIds = remIds,
+                            effectiveBackendSeason = expectedSeason,
+                            allowedEpisodeNumbers = allowedNumbers
+                        )
+                    }.toMutableList()
+                    if (remaining.isNotEmpty()) {
+                        unqueriedFallbackTiers[scopeKey] = remaining
+                    } else {
+                        unqueriedFallbackTiers.remove(scopeKey)
+                    }
+                    // Higher-priority provider returned usable sources: stop without querying lower tiers
+                    break
+                }
+            }
+        }
+
+        fetchTierIdsSequential(backendId, backendEpisodeIds, effectiveBackendSeason, allowedEpisodeNumbers)
 
         // If a duplicate/addon-only backend entry yielded zero usable candidates, try canonical re-match
         if (aggregatedCandidates.none { it.second.hasUsableSourceId } && !hadHttpOrNetworkError && canSelfHealBackend) {
@@ -1573,7 +1996,7 @@ class AnimeRepository(
                     rawStatus = null
                     anyPartial = false
                     lastErrorMsg = null
-                    fetchCandidatesFromBackend(backendId, backendEpisodeIds, effectiveBackendSeason, allowedEpisodeNumbers)
+                    fetchTierIdsSequential(backendId, backendEpisodeIds, effectiveBackendSeason, allowedEpisodeNumbers)
                 }
             }
         }
@@ -1603,8 +2026,14 @@ class AnimeRepository(
             if (backendEpId.isNotBlank() && normSourceId.isNotEmpty()) {
                 discoveredBackendEpisodeIds["$scopeKey|$providerId|$normSourceId"] = backendEpId
             }
+            val canonicalProv = providerPolicy.identifyProviderFromSource(dto)
+            if (backendEpId.isNotBlank() && canonicalProv != ProviderPriorityPolicy.PROVIDER_UNKNOWN) {
+                providerBackendEpisodeIds.putIfAbsent("$scopeKey|prov:$canonicalProv", backendEpId)
+            }
         }
-        backendEpisodeIds.firstOrNull { it.isNotBlank() }?.let { firstBackendEpId ->
+        val winningBackendEpId = aggregatedCandidates.firstOrNull { it.second.hasUsableSourceId }?.first
+            ?: backendEpisodeIds.firstOrNull { it.isNotBlank() }
+        winningBackendEpId?.let { firstBackendEpId ->
             discoveredBackendEpisodeIds[scopeKey] = firstBackendEpId
         }
 
@@ -1860,9 +2289,19 @@ class AnimeRepository(
             seasonNumber = seasonNumber,
             episodeNumber = if (isMovie) 1 else episodeNumber
         )
+        val knownProviderEpIds = providerBackendEpisodeIds.entries
+            .filter { it.key.startsWith("$scopeKey|prov:") && it.value.isNotBlank() }
+            .sortedBy { providerPolicy.tierRank(it.key.removePrefix("$scopeKey|prov:")) }
+            .map { it.value }
+        fun prioritizeBackendIds(ids: List<String>): List<String> =
+            ids.filter { it.isNotBlank() }
+                .distinct()
+                .sortedBy { id -> providerPolicy.tierRank(identifyProviderForEpisodeId(scopeKey, id)) }
+
         if (!isMovie && allowCachedIds) {
             discoveredBackendEpisodeIds[scopeKey]?.takeIf { it.isNotBlank() }?.let { cachedId ->
-                return BackendEpisodeResolution(listOf(cachedId), defaultAllowedNumbers, seasonNumber)
+                val ordered = prioritizeBackendIds(listOf(cachedId) + knownProviderEpIds)
+                return BackendEpisodeResolution(ordered, defaultAllowedNumbers, seasonNumber)
             }
         }
         if (!isMovie && !bypassCatalogEpisodeIds) {
@@ -1870,9 +2309,10 @@ class AnimeRepository(
                 episodeDao.getEpisodeById(id)?.let { ep ->
                     val decoded = EpisodeSourceEpisodeIds.decode(ep.sourceEpisodeIds)
                         .filter { it.isNotBlank() && !it.startsWith("anilist_ep_") && !it.startsWith("movie_") }
-                    if (decoded.isNotEmpty()) {
+                    val combined = prioritizeBackendIds(decoded + knownProviderEpIds)
+                    if (combined.isNotEmpty()) {
                         return BackendEpisodeResolution(
-                            decoded,
+                            combined,
                             defaultAllowedNumbers,
                             seasonNumber
                         )
@@ -1893,9 +2333,16 @@ class AnimeRepository(
                     }
                 }
             }
+            if (knownProviderEpIds.isNotEmpty()) {
+                return BackendEpisodeResolution(
+                    prioritizeBackendIds(knownProviderEpIds),
+                    defaultAllowedNumbers,
+                    seasonNumber
+                )
+            }
         } else if (isMovie && allowCachedIds) {
             discoveredBackendEpisodeIds[scopeKey]?.takeIf { it.isNotBlank() }?.let { movieBackendEpId ->
-                return BackendEpisodeResolution(listOf(movieBackendEpId), setOf(1), 1)
+                return BackendEpisodeResolution(prioritizeBackendIds(listOf(movieBackendEpId) + knownProviderEpIds), setOf(1), 1)
             }
         }
 
@@ -2185,7 +2632,8 @@ class AnimeRepository(
         episodeNumber: Int,
         catalogEpisodeId: String?,
         preferredBackendEpisodeId: String? = null,
-        knownBackendEpisodeIds: Set<String> = emptySet()
+        knownBackendEpisodeIds: Set<String> = emptySet(),
+        candidateProvider: String = ProviderPriorityPolicy.PROVIDER_UNKNOWN
     ): D1StreamKeys {
         val isMovie = identity.isMovie
         val resolvedAnimeId = anime?.backendAnimeId?.trim()?.takeIf { it.isNotEmpty() }
@@ -2203,15 +2651,33 @@ class AnimeRepository(
                 id == syntheticLocalMovieFallback ||
                 id == "movie_$animeId"
 
-        val resolvedEpisodeId = preferredBackendEpisodeId?.trim()?.takeIf {
+        val scopeKey = ContentIdentityHelper.scopeKey(
+            contentKey = identity.contentKey,
+            isMovie = isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = if (isMovie) 1 else episodeNumber
+        )
+        val filteredKnown = knownBackendEpisodeIds.filter {
+            it.isNotBlank() && !isSyntheticCatalogId(it)
+        }.toSet()
+        val providerMatchedId = resolveProviderBackendEpisodeId(
+            scopeKey = scopeKey,
+            candidateProvider = candidateProvider,
+            preferredBackendEpisodeId = preferredBackendEpisodeId?.trim()?.takeIf {
                 it.isNotEmpty() && !isSyntheticCatalogId(it)
-            }
-            ?: knownBackendEpisodeIds.firstOrNull {
-                it.isNotBlank() && !isSyntheticCatalogId(it)
-            }
-            ?: catalogEpisodeId?.trim()?.takeIf {
-                it.isNotEmpty() && !isSyntheticCatalogId(it)
-            }
+            },
+            knownBackendEpisodeIds = filteredKnown
+        )
+        val catalogFallbackId = catalogEpisodeId?.trim()?.takeIf { cleanCat ->
+            cleanCat.isNotEmpty() &&
+                !isSyntheticCatalogId(cleanCat) &&
+                (candidateProvider == ProviderPriorityPolicy.PROVIDER_UNKNOWN ||
+                    identifyProviderForEpisodeId(scopeKey, cleanCat) == candidateProvider ||
+                    identifyProviderForEpisodeId(scopeKey, cleanCat) == ProviderPriorityPolicy.PROVIDER_UNKNOWN)
+        }
+
+        val resolvedEpisodeId = providerMatchedId
+            ?: catalogFallbackId
             ?: if (isMovie) {
                 syntheticLocalMovieFallback
             } else {
@@ -2229,7 +2695,8 @@ class AnimeRepository(
         episodeNumber: Int,
         catalogEpisodeId: String?,
         preferredBackendEpisodeId: String? = null,
-        knownBackendEpisodeIds: Set<String> = emptySet()
+        knownBackendEpisodeIds: Set<String> = emptySet(),
+        candidateProvider: String = ProviderPriorityPolicy.PROVIDER_UNKNOWN
     ): List<D1StreamKeys> {
         val primary = resolveD1StreamKeys(
             animeId = animeId,
@@ -2239,7 +2706,8 @@ class AnimeRepository(
             episodeNumber = episodeNumber,
             catalogEpisodeId = catalogEpisodeId,
             preferredBackendEpisodeId = preferredBackendEpisodeId,
-            knownBackendEpisodeIds = knownBackendEpisodeIds
+            knownBackendEpisodeIds = knownBackendEpisodeIds,
+            candidateProvider = candidateProvider
         )
         val syntheticLocalMovieId = "movie_${identity.contentKey}"
         val syntheticLocalMovieFallback = "movie_${identity.contentKey}_e1"
@@ -2248,6 +2716,13 @@ class AnimeRepository(
                 id == syntheticLocalMovieId ||
                 id == syntheticLocalMovieFallback ||
                 id == "movie_$animeId"
+
+        val scopeKey = ContentIdentityHelper.scopeKey(
+            contentKey = identity.contentKey,
+            isMovie = identity.isMovie,
+            seasonNumber = seasonNumber,
+            episodeNumber = if (identity.isMovie) 1 else episodeNumber
+        )
 
         val hasResolvedBackendAnime = primary.animeId != animeId.trim() ||
             !anime?.backendAnimeId.isNullOrBlank() ||
@@ -2264,17 +2739,24 @@ class AnimeRepository(
         val cleanPreferredEp = preferredBackendEpisodeId?.trim()?.takeIf {
             it.isNotEmpty() && !isSyntheticCatalogId(it)
         }
-        val hasRealBackendEpisode = cleanPreferredEp != null ||
-            knownBackendEpisodeIds.any { it.isNotBlank() && !isSyntheticCatalogId(it.trim()) }
+        val matchingKnown = knownBackendEpisodeIds.mapNotNull { epId ->
+            val clean = epId.trim()
+            if (clean.isEmpty() || isSyntheticCatalogId(clean)) {
+                null
+            } else if (candidateProvider != ProviderPriorityPolicy.PROVIDER_UNKNOWN) {
+                val epProv = identifyProviderForEpisodeId(scopeKey, clean)
+                clean.takeIf { epProv == candidateProvider || epProv == ProviderPriorityPolicy.PROVIDER_UNKNOWN }
+            } else {
+                clean
+            }
+        }
+        val hasRealBackendEpisode = cleanPreferredEp != null || matchingKnown.isNotEmpty()
         val candidateEpisodeIds = buildList {
             add(primary.episodeId)
             if (cleanPreferredEp != null) {
                 add(cleanPreferredEp)
             } else {
-                knownBackendEpisodeIds.forEach { epId ->
-                    val clean = epId.trim()
-                    if (clean.isNotEmpty() && !isSyntheticCatalogId(clean)) add(clean)
-                }
+                addAll(matchingKnown)
                 if (!hasRealBackendEpisode) {
                     catalogEpisodeId?.trim()?.takeIf { it.isNotEmpty() && !isSyntheticCatalogId(it) }?.let(::add)
                 }
@@ -2409,15 +2891,39 @@ class AnimeRepository(
             else -> orderedSources
         }
 
+        val targetSources = if (normPreferred != null && !allowFallbackToOtherSources) {
+            orderedSources.filter(::matchesPreferred)
+        } else {
+            orderedSources.filter { SourceIdentityValidator.normalizeId(it.id).isNotEmpty() }
+        }
+
+        if (normPreferred != null && targetSources.isEmpty()) {
+            val notFoundErr = SourceResolutionDiagnosticException(
+                diagnosticCode = SourceDiagnosticCode.PROVIDER_UNAVAILABLE,
+                message = "Requested source '$normPreferred' is not available for this episode."
+            )
+            SourceIdentityValidator.recordDiagnostic(
+                code = SourceDiagnosticCode.PROVIDER_UNAVAILABLE,
+                scopeKey = scopeKey,
+                sourceId = normPreferred,
+                detail = notFoundErr.message.orEmpty()
+            )
+            return@withContext Result.failure(notFoundErr)
+        }
+
         val checkedCacheKeys = HashSet<String>()
-        // 1. Check Memory first across ALL candidates, then Cloudflare D1 Stream URL cache BEFORE calling Backend resolution
-        if (!forceResolveFresh) {
-            val resolvedKeysByCandidate = ArrayList<Pair<ProphecySourceDto, List<D1StreamKeys>>>(cacheCheckPool.size)
-            for (candidate in cacheCheckPool) {
+
+        suspend fun tryCachePoolForCandidates(pool: List<ProphecySourceDto>): ResolvedStreamPlayback? {
+            if (forceResolveFresh || pool.isEmpty()) return null
+            val resolvedKeysByCandidate = ArrayList<Pair<ProphecySourceDto, List<D1StreamKeys>>>(pool.size)
+            for (candidate in pool) {
                 val normSourceId = SourceIdentityValidator.normalizeId(candidate.id)
                 if (normSourceId.isEmpty()) continue
                 val candidateProviderId = providerIdOf(candidate)
+                val canonicalProv = providerPolicy.identifyProviderFromSource(candidate)
                 val preferredEpId = discoveredBackendEpisodeIds["$scopeKey|$candidateProviderId|$normSourceId"]
+                    ?: canonicalProv.takeIf { it != ProviderPriorityPolicy.PROVIDER_UNKNOWN }
+                        ?.let { providerBackendEpisodeIds["$scopeKey|prov:$it"] }
                 val d1KeyCandidates = resolveD1StreamKeyCandidates(
                     animeId = animeId,
                     anime = anime,
@@ -2426,32 +2932,31 @@ class AnimeRepository(
                     episodeNumber = effectiveEpisode,
                     catalogEpisodeId = catalogEpisode?.id ?: catalogEpisodeId,
                     preferredBackendEpisodeId = preferredEpId,
-                    knownBackendEpisodeIds = knownBackendEpisodeIds
+                    knownBackendEpisodeIds = knownBackendEpisodeIds,
+                    candidateProvider = canonicalProv
                 )
                 val primaryEpKey = d1KeyCandidates.firstOrNull()?.episodeId
                 if (SourceExpiryTime.isExpiredOrInvalid(candidate.expiresAt)) {
                     memoryCache.invalidatePlayback(normSourceId, scopeKey, candidateProviderId, primaryEpKey)
                 }
 
-                // 1a. In-memory validated playback cache
+                // In-memory validated playback cache
                 val memHit = memoryCache.getResolvedPlayback(normSourceId, scopeKey, candidateProviderId, primaryEpKey)
                 if (memHit != null && SourceIdentityValidator.validateDirectPlayData(memHit, normSourceId).isValid) {
                     val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=MEMORY")
-                    return@withContext Result.success(
-                        ResolvedStreamPlayback(
-                            source = candidate,
-                            directData = memHit,
-                            candidates = filterRemainingCandidates(orderedSources, candidate, candidateProviderId),
-                            fromCache = true,
-                            cacheTier = "MEMORY",
-                            resolveDurationMs = elapsed
-                        )
+                    return ResolvedStreamPlayback(
+                        source = candidate,
+                        directData = memHit,
+                        candidates = filterRemainingCandidates(orderedSources, candidate, candidateProviderId),
+                        fromCache = true,
+                        cacheTier = "MEMORY",
+                        resolveDurationMs = elapsed
                     )
                 }
                 resolvedKeysByCandidate += candidate to d1KeyCandidates
             }
 
-            // 1b. Cloudflare D1 Stream URL lookup: batch single episode query when multiple candidates share primary keys
+            // Cloudflare D1 Stream URL lookup: batch single episode query when multiple candidates share primary keys
             val primaryBatchKey = resolvedKeysByCandidate.firstOrNull()?.second?.firstOrNull()
             val batchStreamsBySource: Map<String, List<com.example.data.d1.CloudflareD1DataSource.CachedStreamUrl>>? =
                 if (resolvedKeysByCandidate.size > 1 && primaryBatchKey != null) {
@@ -2483,7 +2988,6 @@ class AnimeRepository(
                             row.providerId.equals("direct", ignoreCase = true) ||
                             SourceIdentityValidator.normalizedIdsEqual(row.providerId, candidateProviderId)
                     }
-                    // Only query secondary keys if batch returned empty for this candidate and there are alternative keys
                     if (d1Hit == null && d1KeyCandidates.size > 1) {
                         for (extraKeys in d1KeyCandidates.drop(1)) {
                             val found = d1DataSource.getValidStreamUrl(
@@ -2535,43 +3039,26 @@ class AnimeRepository(
                             backendEpisodeId = d1Hit.episodeId
                         )
                         val elapsed = MonotonicMetrics.recordDuration("playback_startup_ms", playbackResolveStarted, "tier=D1")
-                        return@withContext Result.success(
-                            ResolvedStreamPlayback(
-                                source = candidate,
-                                directData = data,
-                                candidates = filterRemainingCandidates(orderedSources, candidate, candidateProviderId),
-                                fromCache = true,
-                                cacheTier = "D1",
-                                resolveDurationMs = elapsed
-                            )
+                        return ResolvedStreamPlayback(
+                            source = candidate,
+                            directData = data,
+                            candidates = filterRemainingCandidates(orderedSources, candidate, candidateProviderId),
+                            fromCache = true,
+                            cacheTier = "D1",
+                            resolveDurationMs = elapsed
                         )
                     }
                 }
             }
-        }
-
-        val targetSources = if (normPreferred != null && !allowFallbackToOtherSources) {
-            orderedSources.filter(::matchesPreferred)
-        } else {
-            orderedSources.filter { SourceIdentityValidator.normalizeId(it.id).isNotEmpty() }
-        }
-
-        if (normPreferred != null && targetSources.isEmpty()) {
-            val notFoundErr = SourceResolutionDiagnosticException(
-                diagnosticCode = SourceDiagnosticCode.PROVIDER_UNAVAILABLE,
-                message = "Requested source '$normPreferred' is not available for this episode."
-            )
-            SourceIdentityValidator.recordDiagnostic(
-                code = SourceDiagnosticCode.PROVIDER_UNAVAILABLE,
-                scopeKey = scopeKey,
-                sourceId = normPreferred,
-                detail = notFoundErr.message.orEmpty()
-            )
-            return@withContext Result.failure(notFoundErr)
+            return null
         }
 
         // Helper for single-source direct playback resolution with D1 check -> Backend API -> D1 save
-        suspend fun resolveSingleCandidate(candidate: ProphecySourceDto): Result<ResolvedStreamPlayback> {
+        suspend fun resolveSingleCandidate(
+            candidate: ProphecySourceDto,
+            explicitEpisodeId: String? = null,
+            explicitAllCandidates: List<ProphecySourceDto> = orderedSources
+        ): Result<ResolvedStreamPlayback> {
             val normSourceId = SourceIdentityValidator.normalizeId(candidate.id)
             if (normSourceId.isEmpty()) {
                 return Result.failure(
@@ -2583,7 +3070,11 @@ class AnimeRepository(
                 )
             }
             val candidateProviderId = providerIdOf(candidate)
-            val preferredEpId = discoveredBackendEpisodeIds["$scopeKey|$candidateProviderId|$normSourceId"]
+            val canonicalProv = providerPolicy.identifyProviderFromSource(candidate)
+            val preferredEpId = explicitEpisodeId?.takeIf { it.isNotBlank() }
+                ?: discoveredBackendEpisodeIds["$scopeKey|$candidateProviderId|$normSourceId"]
+                ?: canonicalProv.takeIf { it != ProviderPriorityPolicy.PROVIDER_UNKNOWN }
+                    ?.let { providerBackendEpisodeIds["$scopeKey|prov:$it"] }
             val d1Keys = resolveD1StreamKeys(
                 animeId = animeId,
                 anime = anime,
@@ -2592,7 +3083,8 @@ class AnimeRepository(
                 episodeNumber = effectiveEpisode,
                 catalogEpisodeId = catalogEpisode?.id ?: catalogEpisodeId,
                 preferredBackendEpisodeId = preferredEpId,
-                knownBackendEpisodeIds = knownBackendEpisodeIds
+                knownBackendEpisodeIds = knownBackendEpisodeIds,
+                candidateProvider = canonicalProv
             )
             val alreadyCheckedCache = "$candidateProviderId|$normSourceId" in checkedCacheKeys
             val res = resolveDirectPlayback(
@@ -2624,7 +3116,7 @@ class AnimeRepository(
                     ResolvedStreamPlayback(
                         source = candidate,
                         directData = sanitizedData,
-                        candidates = filterRemainingCandidates(orderedSources, candidate, candidateProviderId),
+                        candidates = filterRemainingCandidates(explicitAllCandidates, candidate, candidateProviderId),
                         fromCache = false,
                         cacheTier = "BACKEND_RESOLVE",
                         resolveDurationMs = elapsed
@@ -2645,18 +3137,21 @@ class AnimeRepository(
             }
         }
 
-        // 3. No valid cached Stream URL -> Primary-first with hedged bounded concurrent fallback
-        var lastError: Throwable? = null
-        if (targetSources.size <= 1 || normPreferred != null) {
-            for (candidate in targetSources) {
-                val attempt = resolveSingleCandidate(candidate)
-                if (attempt.isSuccess) return@withContext attempt
-                lastError = attempt.exceptionOrNull()
-                if (normPreferred != null && !allowFallbackToOtherSources) break
+        suspend fun resolveBatchHedged(
+            candidates: List<ProphecySourceDto>,
+            explicitEpisodeId: String? = null,
+            explicitAllCandidates: List<ProphecySourceDto> = orderedSources
+        ): Pair<ResolvedStreamPlayback?, Throwable?> {
+            var tierError: Throwable? = null
+            if (candidates.size <= 1) {
+                candidates.firstOrNull()?.let { c ->
+                    val attempt = resolveSingleCandidate(c, explicitEpisodeId, explicitAllCandidates)
+                    if (attempt.isSuccess) return attempt.getOrNull() to null
+                    tierError = attempt.exceptionOrNull()
+                }
+                return null to tierError
             }
-        } else {
-            // Hedged bounded concurrency (max 3 providers per batch)
-            for ((batchIndex, batch) in targetSources.chunked(3).withIndex()) {
+            for ((batchIndex, batch) in candidates.chunked(3).withIndex()) {
                 var batchWinner: ResolvedStreamPlayback? = null
                 coroutineScope {
                     val channel = Channel<Result<ResolvedStreamPlayback>>(batch.size)
@@ -2664,7 +3159,7 @@ class AnimeRepository(
                     fun launchCandidate(candidate: ProphecySourceDto) {
                         jobs += launch {
                             val result = try {
-                                resolveSingleCandidate(candidate)
+                                resolveSingleCandidate(candidate, explicitEpisodeId, explicitAllCandidates)
                             } catch (c: CancellationException) {
                                 throw c
                             } catch (t: Throwable) {
@@ -2685,7 +3180,7 @@ class AnimeRepository(
                             if (firstResult.isSuccess && firstResult.getOrNull() != null) {
                                 batchWinner = firstResult.getOrNull()
                             } else {
-                                lastError = firstResult.exceptionOrNull() ?: lastError
+                                tierError = firstResult.exceptionOrNull() ?: tierError
                             }
                         }
                         if (batchWinner == null) {
@@ -2706,8 +3201,8 @@ class AnimeRepository(
                             if (result.isSuccess && result.getOrNull() != null) {
                                 batchWinner = result.getOrNull()
                                 break
-                            } else if (lastError == null || result.exceptionOrNull() !is CancellationException) {
-                                lastError = result.exceptionOrNull() ?: lastError
+                            } else if (tierError == null || result.exceptionOrNull() !is CancellationException) {
+                                tierError = result.exceptionOrNull() ?: tierError
                             }
                         }
                     }
@@ -2715,7 +3210,103 @@ class AnimeRepository(
                     channel.close()
                 }
                 if (batchWinner != null) {
-                    return@withContext Result.success(batchWinner!!)
+                    return batchWinner to null
+                }
+            }
+            return null to tierError
+        }
+
+        var lastError: Throwable? = null
+        if (normPreferred != null) {
+            tryCachePoolForCandidates(cacheCheckPool)?.let { return@withContext Result.success(it) }
+            for (candidate in targetSources) {
+                val attempt = resolveSingleCandidate(candidate)
+                if (attempt.isSuccess) return@withContext attempt
+                lastError = attempt.exceptionOrNull()
+                if (!allowFallbackToOtherSources) break
+            }
+        } else {
+            // Try each provider priority tier sequentially: 4KHDHUB -> Dramachi -> future providers.
+            // Only fall back to lower-priority tiers after the higher-priority tier fails.
+            val tierRanks = (cacheCheckPool + targetSources)
+                .map { providerPolicy.tierRankForSource(it) }
+                .distinct()
+                .sorted()
+            for (tierRank in tierRanks) {
+                val tierCachePool = cacheCheckPool.filter { providerPolicy.tierRankForSource(it) == tierRank }
+                tryCachePoolForCandidates(tierCachePool)?.let { return@withContext Result.success(it) }
+                val tierSources = targetSources.filter { providerPolicy.tierRankForSource(it) == tierRank }
+                if (tierSources.isNotEmpty()) {
+                    val (winner, tierErr) = resolveBatchHedged(tierSources)
+                    if (winner != null) return@withContext Result.success(winner)
+                    if (tierErr != null) lastError = tierErr
+                }
+            }
+        }
+
+        // On-demand fallback to lower-priority provider tiers that were intentionally skipped
+        // during initial 4KHDHUB-first discovery. Resolve using each tier's own backendEpisodeId.
+        if (normPreferred == null || allowFallbackToOtherSources) {
+            while (true) {
+                val pendingQueue = unqueriedFallbackTiers[scopeKey] ?: break
+                val nextTier = synchronized(pendingQueue) {
+                    if (pendingQueue.isEmpty()) null else pendingQueue.removeAt(0)
+                } ?: break
+                if (pendingQueue.isEmpty()) {
+                    unqueriedFallbackTiers.remove(scopeKey, pendingQueue)
+                }
+
+                for (tierEpId in nextTier.episodeIds) {
+                    val epResp = runCatching {
+                        withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
+                            prophecyApi.getEpisodeFull(nextTier.backendId, tierEpId)
+                        }
+                    }.getOrNull()
+                    val body = epResp?.takeIf { it.isSuccessful }?.body() ?: continue
+                    val validation = SourceIdentityValidator.validateEpisodeFullResponse(
+                        body = body,
+                        animeEntry = anime,
+                        requestedBackendId = nextTier.backendId,
+                        requestedBackendEpisodeId = tierEpId,
+                        isMovie = isMovie,
+                        requestedSeason = effectiveSeason,
+                        effectiveBackendSeason = nextTier.effectiveBackendSeason,
+                        allowedEpisodeNumbers = nextTier.allowedEpisodeNumbers,
+                        cumulativeOffset = identity.cumulativeEpisodeOffset
+                    )
+                    if (validation is SourceValidationResult.Invalid) continue
+
+                    val tierCandidates = orderDtosForPlayback(
+                        body.sources.orEmpty()
+                            .map { SourceIdentityValidator.normalizeDto(it) }
+                            .filter { it.hasUsableSourceId && !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) },
+                        preferredSourceId = null,
+                        preferredProviderId = null
+                    )
+                    if (tierCandidates.isEmpty()) continue
+
+                    tierCandidates.forEach { dto ->
+                        val pId = providerIdOf(dto)
+                        val sId = SourceIdentityValidator.normalizeId(dto.id)
+                        if (sId.isNotEmpty()) {
+                            discoveredBackendEpisodeIds["$scopeKey|$pId|$sId"] = tierEpId
+                        }
+                    }
+
+                    val combinedOrder = (orderedSources + tierCandidates).distinctBy { it.stableIdentity }
+                    val cacheWinner = tryCachePoolForCandidates(tierCandidates)
+                    if (cacheWinner != null) {
+                        return@withContext Result.success(cacheWinner)
+                    }
+                    val (winner, tierErr) = resolveBatchHedged(
+                        candidates = tierCandidates,
+                        explicitEpisodeId = tierEpId,
+                        explicitAllCandidates = combinedOrder
+                    )
+                    if (winner != null) {
+                        return@withContext Result.success(winner)
+                    }
+                    if (tierErr != null) lastError = tierErr
                 }
             }
         }
@@ -2805,11 +3396,13 @@ class AnimeRepository(
                     if (matchesSource && matchesProvider) 0 else 1
                 }
                     .thenByDescending { !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) }
+                    .thenBy { providerPolicy.tierRankForSource(it) }
                     .thenByDescending { qualityRank(it.quality) }
             )
         }
         return active.sortedWith(
             compareByDescending<ProphecySourceDto> { !SourceExpiryTime.isExpiredOrInvalid(it.expiresAt) }
+                .thenBy { providerPolicy.tierRankForSource(it) }
                 .thenByDescending { qualityRank(it.quality) }
                 .thenByDescending { it.downloadable == true }
         )
@@ -3413,10 +4006,19 @@ class AnimeRepository(
         } else {
             null
         }
+        val canonicalProv = providerId?.let {
+            ProviderPriorityPolicy.normalizeProviderName(it).takeIf { p -> p != ProviderPriorityPolicy.PROVIDER_UNKNOWN }
+        } ?: ProviderPriorityPolicy.identifyProviderFromText(providerId)
+            ?: ProviderPriorityPolicy.PROVIDER_UNKNOWN
         val preferredEpId = (normProvider?.let { discoveredBackendEpisodeIds["$scopeKey|$it|$normSourceId"] })
-            ?: discoveredBackendEpisodeIds[scopeKey]
+            ?: canonicalProv.takeIf { it != ProviderPriorityPolicy.PROVIDER_UNKNOWN }
+                ?.let { providerBackendEpisodeIds["$scopeKey|prov:$it"] }
+            ?: if (canonicalProv == ProviderPriorityPolicy.PROVIDER_UNKNOWN) discoveredBackendEpisodeIds[scopeKey] else null
         val knownBackendIds = buildSet {
             discoveredBackendEpisodeIds[scopeKey]?.takeIf { it.isNotBlank() }?.let(::add)
+            providerBackendEpisodeIds.entries
+                .filter { it.key.startsWith("$scopeKey|prov:") && it.value.isNotBlank() }
+                .forEach { add(it.value) }
             catalogEpisode?.let { ep ->
                 EpisodeSourceEpisodeIds.decode(ep.sourceEpisodeIds).forEach { id ->
                     val norm = SourceIdentityValidator.normalizeId(id)
@@ -3434,7 +4036,8 @@ class AnimeRepository(
             episodeNumber = identity.episodeNumber,
             catalogEpisodeId = catalogEpisode?.id,
             preferredBackendEpisodeId = preferredEpId,
-            knownBackendEpisodeIds = knownBackendIds
+            knownBackendEpisodeIds = knownBackendIds,
+            candidateProvider = canonicalProv
         )
         runCatching {
             d1KeyCandidates.forEach { d1Keys ->

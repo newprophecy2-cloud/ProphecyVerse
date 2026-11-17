@@ -34,7 +34,7 @@ data class AniListData(
 @JsonClass(generateAdapter = true)
 data class AniListPage(
     @Json(name = "pageInfo") val pageInfo: AniListPageInfo? = null,
-    @Json(name = "media") val media: List<AniListMedia> = emptyList()
+    @Json(name = "media") val media: List<AniListMedia?>? = emptyList()
 )
 
 @JsonClass(generateAdapter = true)

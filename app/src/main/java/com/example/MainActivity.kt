@@ -80,7 +80,23 @@ import com.example.data.notice.NoticeManager
 import com.example.ui.components.BilingualNoticeDialog
 import kotlinx.coroutines.launch
 
-private const val OPTIONAL_UPDATE_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000L
+internal const val OPTIONAL_UPDATE_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000L
+
+internal fun shouldShowOptionalUpdatePrompt(
+    optionalUpdate: com.example.data.firebase.VersionCheckState.OptionalUpdate?,
+    dismissedOptionalVersionCode: Int,
+    dismissedOptionalAtMs: Long,
+    nowMs: Long = System.currentTimeMillis(),
+    isInPipMode: Boolean = false,
+    isPlayerRoute: Boolean = false,
+    reminderIntervalMs: Long = OPTIONAL_UPDATE_REMINDER_INTERVAL_MS
+): Boolean {
+    if (optionalUpdate == null || isInPipMode || isPlayerRoute) return false
+    val latestCode = optionalUpdate.config.latestVersionCode
+    if (dismissedOptionalVersionCode != latestCode) return true
+    if (dismissedOptionalAtMs <= 0L) return true
+    return (nowMs - dismissedOptionalAtMs) >= reminderIntervalMs
+}
 
 class MainActivity : ComponentActivity() {
     var isInPipMode by mutableStateOf(false)
@@ -461,22 +477,18 @@ fun MainAppNav(
         )
 
         val optionalUpdate = versionState as? com.example.data.firebase.VersionCheckState.OptionalUpdate
-        val reminderExpired = dismissedOptionalAtMs <= 0L ||
-            System.currentTimeMillis() - dismissedOptionalAtMs >= OPTIONAL_UPDATE_REMINDER_INTERVAL_MS
-        if (optionalUpdate != null &&
-            dismissedOptionalVersionCode != optionalUpdate.config.latestVersionCode &&
-            !isInPipMode && currentRoute?.startsWith("player/") != true) {
-            com.example.ui.screens.ForceUpdateScreen(
-                versionState = optionalUpdate,
-                onDismissOptional = { dismissOptionalUpdate(optionalUpdate.config.latestVersionCode) }
+        if (shouldShowOptionalUpdatePrompt(
+                optionalUpdate = optionalUpdate,
+                dismissedOptionalVersionCode = dismissedOptionalVersionCode,
+                dismissedOptionalAtMs = dismissedOptionalAtMs,
+                isInPipMode = isInPipMode,
+                isPlayerRoute = currentRoute?.startsWith("player/") == true
             )
-        } else if (optionalUpdate != null &&
-            dismissedOptionalVersionCode == optionalUpdate.config.latestVersionCode &&
-            reminderExpired &&
-            !isInPipMode && currentRoute?.startsWith("player/") != true) {
+        ) {
+            val nonNullOptional = optionalUpdate!!
             com.example.ui.screens.ForceUpdateScreen(
-                versionState = optionalUpdate,
-                onDismissOptional = { dismissOptionalUpdate(optionalUpdate.config.latestVersionCode) }
+                versionState = nonNullOptional,
+                onDismissOptional = { dismissOptionalUpdate(nonNullOptional.config.latestVersionCode) }
             )
         }
     }
