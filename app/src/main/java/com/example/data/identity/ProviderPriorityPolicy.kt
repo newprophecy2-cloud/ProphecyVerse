@@ -298,7 +298,9 @@ object CanonicalEpisodeCatalogBuilder {
             val normFallbackAnime = fallbackAnimeIdentity.trim().lowercase(Locale.ROOT)
             if (normCanonAnime != normFallbackAnime) {
                 val titleSim = TitleMatcher.normalize(canonicalAnimeIdentity) == TitleMatcher.normalize(fallbackAnimeIdentity)
-                if (!titleSim) return false
+                val canonicalIdentityIsOpaque = normCanonAnime.all { it.isDigit() } ||
+                    normCanonAnime.startsWith("anilist_")
+                if (!titleSim && !canonicalIdentityIsOpaque) return false
             }
         }
 
