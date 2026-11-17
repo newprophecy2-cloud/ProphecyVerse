@@ -265,7 +265,12 @@ object CanonicalEpisodeCatalogBuilder {
         val b = normalizeEpisodeTitle(titleB)
         if (a.isBlank() || b.isBlank()) return 0f
         if (a == b) return 1f
-        if (a.length >= 4 && b.length >= 4 && (a.contains(b) || b.contains(a))) return 0.90f
+        val numericTokensA = a.split(" ").filter { it.all(Char::isDigit) }.toSet()
+        val numericTokensB = b.split(" ").filter { it.all(Char::isDigit) }.toSet()
+        val conflictingNumericTokens = numericTokensA.isNotEmpty() &&
+            numericTokensB.isNotEmpty() &&
+            numericTokensA != numericTokensB
+        if (!conflictingNumericTokens && a.length >= 4 && b.length >= 4 && (a.contains(b) || b.contains(a))) return 0.90f
         val tokensA = a.split(" ").filter { it.length > 1 }.toSet()
         val tokensB = b.split(" ").filter { it.length > 1 }.toSet()
         if (tokensA.isEmpty() || tokensB.isEmpty()) return 0f
