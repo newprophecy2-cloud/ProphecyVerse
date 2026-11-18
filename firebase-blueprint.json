@@ -1,0 +1,104 @@
+{
+  "entities": {
+    "Anime": {
+      "title": "Anime",
+      "description": "Master entry for an anime title or movie in the platform catalog.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "englishTitle": { "type": "string" },
+        "japaneseTitle": { "type": "string" },
+        "description": { "type": "string" },
+        "poster": { "type": "string" },
+        "banner": { "type": "string" },
+        "type": { "type": "string", "enum": ["TV", "Movie", "OVA", "Special"] },
+        "status": { "type": "string" },
+        "episodesCount": { "type": "number" },
+        "studio": { "type": "string" },
+        "releaseYear": { "type": "number" },
+        "duration": { "type": "string" },
+        "rating": { "type": "string" },
+        "genres": { "type": "array" },
+        "score": { "type": "number" },
+        "isTrending": { "type": "boolean" },
+        "isVisible": { "type": "boolean" }
+      },
+      "required": ["id", "title"]
+    },
+    "Episode": {
+      "title": "Episode",
+      "description": "An episode or movie video stream document.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "animeId": { "type": "string" },
+        "episodeNumber": { "type": "number" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "releaseDate": { "type": "string" },
+        "duration": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "hlsUrl": { "type": "string" },
+        "status": { "type": "string" },
+        "subtitlesUrl": { "type": "string" },
+        "defaultLanguage": { "type": "string" },
+        "isVisible": { "type": "boolean" }
+      },
+      "required": ["id", "animeId", "episodeNumber"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile and preferences.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "watchlist": { "type": "array" },
+        "favorites": { "type": "array" }
+      },
+      "required": ["uid"]
+    }
+  },
+  "firestore": {
+    "/anime/{animeId}": {
+      "schema": { "$ref": "#/entities/Anime" },
+      "description": "Collection of anime series and movies."
+    },
+    "/episodes/{episodeId}": {
+      "schema": { "$ref": "#/entities/Episode" },
+      "description": "Collection of all video episodes."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Collection of user profile accounts."
+    },
+    "/comments/{commentId}": {
+      "schema": { "type": "object" },
+      "description": "User comments on episodes or anime."
+    },
+    "/ratings/{ratingId}": {
+      "schema": { "type": "object" },
+      "description": "User ratings and reviews."
+    },
+    "/watchHistory/{historyId}": {
+      "schema": { "type": "object" },
+      "description": "User watch progress and playback positions."
+    },
+    "/watchlist/{watchlistId}": {
+      "schema": { "type": "object" },
+      "description": "User saved watchlist entries."
+    },
+    "/favorites/{favoriteId}": {
+      "schema": { "type": "object" },
+      "description": "User favorite anime entries."
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "type": "object" },
+      "description": "Platform broadcast notifications."
+    }
+  }
+}

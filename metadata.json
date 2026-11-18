@@ -1,0 +1,6 @@
+{
+  "name": "Prophecy verse",
+  "description": "Prophecy Verse - Premier Anime & Movie Streaming Platform with high-performance Cloudflare R2 video streaming, multi-track audio playback, and responsive admin control center.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

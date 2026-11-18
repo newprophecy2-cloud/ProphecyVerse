@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'admin@animestream.com' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    // Default deny rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Anime collection rules
+    match /anime/{animeId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Episodes collection rules
+    match /episodes/{episodeId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Users collection rules
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if isOwner(userId) || isSignedIn();
+    }
+
+    // Comments collection rules
+    match /comments/{commentId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Ratings collection rules
+    match /ratings/{ratingId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Watch history rules
+    match /watchHistory/{historyId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Watchlist rules
+    match /watchlist/{watchlistId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Favorites rules
+    match /favorites/{favoriteId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Notifications rules
+    match /notifications/{notificationId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+  }
+}
