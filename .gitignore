@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+*.local
+*.log
+.DS_Store
+backend/node_modules/
+backend/dist/
+coverage/

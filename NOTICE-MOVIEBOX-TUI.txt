@@ -1,0 +1,17 @@
+Compatibility notice
+====================
+
+This project includes a small, independently adapted compatibility layer
+based on the public MovieBox provider implementation in:
+
+https://github.com/mesamirh/MovieBox-Tui
+
+The upstream repository is distributed under the MIT License. The upstream
+copyright and license text are preserved in that repository. This project
+reuses the documented provider protocol behavior needed for server-side
+request signing, compatible client headers, and response mapping. The server
+includes the upstream public compatibility signing material and non-user
+client metadata so preview/local deployments do not fail immediately; private
+session tokens are never bundled. Operators may override the public defaults
+with server-side environment variables, and must keep any MOVIEBOX_AUTH_TOKEN
+private.

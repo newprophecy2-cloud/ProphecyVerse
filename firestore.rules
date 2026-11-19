@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Default deny rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Users collection rules
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(userId);
+    }
+
+    // Comments collection rules
+    match /comments/{commentId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Ratings collection rules
+    match /ratings/{ratingId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Watch history rules
+    match /watchHistory/{historyId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Watchlist rules
+    match /watchlist/{watchlistId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Favorites rules
+    match /favorites/{favoriteId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Notifications rules
+    match /notifications/{notificationId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Notices rules (preserved read-only for NoticePopupModal)
+    match /notices/{noticeId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}
