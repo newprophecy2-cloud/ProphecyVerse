@@ -1,0 +1,105 @@
+name: Build & Deploy ProphecyVerse to VPS
+
+on:
+  push:
+    branches:
+      - prophecyverse-website
+  workflow_dispatch:
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: TypeScript typecheck
+        run: npm run lint
+
+      - name: Run backend unit tests
+        run: npm run test:backend
+
+      - name: Build frontend and backend bundles
+        run: npm run build
+
+      - name: Package production artifact
+        run: |
+          mkdir -p deploy-bundle
+          cp -r dist package.json ecosystem.config.cjs deploy-bundle/
+          cp -f package-lock.json deploy-bundle/ 2>/dev/null || true
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prophecyverse-dist
+          path: deploy-bundle/
+
+  deploy-vps:
+    needs: verify-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/prophecyverse-website'
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prophecyverse-dist
+          path: deploy-bundle
+
+      - name: Check VPS SSH credentials
+        id: creds
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_APP_PATH: ${{ secrets.VPS_APP_PATH }}
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USERNAME" ] || [ -z "$VPS_SSH_PRIVATE_KEY" ] || [ -z "$VPS_APP_PATH" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "VPS SSH secrets are not configured; skipping live VPS deployment."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy over SSH & restart PM2
+        if: steps.creds.outputs.ready == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_APP_PATH: ${{ secrets.VPS_APP_PATH }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/vps_deploy_key
+          chmod 600 ~/.ssh/vps_deploy_key
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/vps_deploy_key -p "$VPS_PORT" "$VPS_USERNAME@$VPS_HOST" "mkdir -p '$VPS_APP_PATH'"
+          scp -i ~/.ssh/vps_deploy_key -P "$VPS_PORT" -r deploy-bundle/* "$VPS_USERNAME@$VPS_HOST:$VPS_APP_PATH/"
+
+          ssh -i ~/.ssh/vps_deploy_key -p "$VPS_PORT" "$VPS_USERNAME@$VPS_HOST" << 'EOF'
+            set -euo pipefail
+            cd "${VPS_APP_PATH}"
+            if [ -f package-lock.json ]; then
+              npm ci --omit=dev
+            else
+              npm install --omit=dev
+            fi
+            pm2 startOrReload ecosystem.config.cjs --update-env
+            pm2 save
+            sleep 3
+            curl -fsS http://127.0.0.1:3000/api/health
+          EOF
