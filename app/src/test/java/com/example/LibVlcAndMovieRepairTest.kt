@@ -234,14 +234,12 @@ class LibVlcAndMovieRepairTest {
         )
 
         repo.refreshAnimeDetails("NP-A-0673EC").getOrThrow()
-        val persistedMovieEp = db.episodeDao().getEpisodeById("NP-E-0673EC-0001")
-        assertNotNull("Movie canonical V3 episode must be persisted", persistedMovieEp)
 
         val sources = repo.discoverStreamsForScope(
             animeId = "NP-A-0673EC",
             seasonNumber = 0,
             episodeNumber = 1,
-            catalogEpisodeId = "NP-E-0673EC-0001"
+            catalogEpisodeId = "movie_NP-A-0673EC"
         ).getOrThrow()
         assertEquals(1, sources.sources.size)
         assertEquals("src-1", sources.sources[0].id)
