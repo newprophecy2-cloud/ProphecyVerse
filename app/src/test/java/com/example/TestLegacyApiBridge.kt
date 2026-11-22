@@ -192,6 +192,7 @@ class LegacyFixtureToV3Adapter(
                 quality = s.quality,
                 codec = s.codec,
                 language = s.language,
+                providerMetadata = com.example.data.remote.V3ProviderMetadataDto(sizeBytes = s.sizeBytes),
                 verificationStatus = "unverified",
                 playabilityStatus = "available",
                 available = true

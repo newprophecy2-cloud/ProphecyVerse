@@ -397,7 +397,7 @@ class Phase2ApiAndEpisodeSourcesTest {
         val seasons = repo.observeSeasons(dandadan.id).first()
         assertEquals(listOf(1, 2), seasons.map { it.seasonNumber })
         assertEquals("canon_season_2", seasons[1].backendSeasonId)
-        assertEquals("Evil Eye Arc", seasons[1].title)
+        assertEquals("Season 2", seasons[1].title)
 
         val s2Episodes = repo.observeEpisodes(dandadan.id, 2).first()
         assertEquals(1, s2Episodes.size)
