@@ -28,3 +28,4 @@
 -keepclasseswithmembers class * {
     @retrofit2.http.* <methods>;
 }
+-keep class org.videolan.libvlc.** { *; }

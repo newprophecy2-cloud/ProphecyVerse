@@ -20,6 +20,9 @@ android {
     versionName = "3.0.2"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -42,8 +45,9 @@ android {
 
   buildTypes {
     release {
-      isCrunchPngs = false
-      isMinifyEnabled = false
+      isCrunchPngs = true
+      isMinifyEnabled = true
+      isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       // Keep normal/AI Studio release signing; CI may explicitly request an unsigned release APK
       // when authorized release-signing secrets are not configured.
@@ -68,6 +72,11 @@ android {
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
+  }
+  packaging {
+    jniLibs {
+      useLegacyPackaging = true
+    }
   }
 }
 
