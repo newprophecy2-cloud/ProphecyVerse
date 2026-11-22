@@ -1192,7 +1192,7 @@ class AnimeRepository(
                     } ?: rawDtoEpisodes.firstOrNull { ep -> ep.id.isNotBlank() }
                     mappedEpisodes = if (movieEp != null) {
                         val scopeKey = ContentIdentityHelper.scopeKey(
-                            animeId = animeId,
+                            contentKey = animeId,
                             isMovie = true,
                             seasonNumber = 0,
                             episodeNumber = 1
