@@ -508,10 +508,15 @@ fun BottomNavBar(
         NavigationItem(Screen.Profile.route, "Profile", Icons.Default.Person)
     )
 
-    NavigationBar(
-        containerColor = SurfaceDark,
-        tonalElevation = 8.dp
-    ) {
+    androidx.compose.foundation.layout.Column {
+        androidx.compose.material3.HorizontalDivider(
+            thickness = 0.5.dp,
+            color = SurfaceHighlight
+        )
+        NavigationBar(
+            containerColor = SurfaceDark,
+            tonalElevation = 0.dp
+        ) {
         items.forEach { item ->
             val isSelected = currentRoute == item.route
             NavigationBarItem(
@@ -541,6 +546,7 @@ fun BottomNavBar(
                 ),
                 modifier = Modifier.testTag("nav_item_${item.route}")
             )
+        }
         }
     }
 }

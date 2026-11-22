@@ -93,7 +93,7 @@ class Fix4CacheSecurityTest {
     }
 
     private fun noOpApi(directResolver: suspend (DirectPlayRequest) -> Response<DirectPlayResponse>): ProphecyVerseApiService =
-        object : ProphecyVerseApiService {
+        LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -103,7 +103,7 @@ class Fix4CacheSecurityTest {
             override suspend fun getEpisodeFull(animeId: String, episodeId: String) =
                 Response.success(ProphecyEpisodeFullResponse())
             override suspend fun resolveDirectPlay(request: DirectPlayRequest) = directResolver(request)
-        }
+        })
 
     @Test
     fun fix4_sensitiveHeadersKeptInMemoryOnly_roomMetadataOnly_andD1NeverStoresHeaders() = runTest {

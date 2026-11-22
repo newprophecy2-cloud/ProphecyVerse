@@ -119,6 +119,7 @@ class AnimeRepository(
     private val providerPolicy: ProviderPriorityPolicy = ProviderPriorityPolicy()
 ) {
     private val animeDao: AnimeDao = database.animeDao()
+    private val v3Gateway = com.example.data.remote.V3BackendGateway(prophecyApi)
     private val episodeDao: EpisodeDao = database.episodeDao()
     private val searchDao: SearchDao = database.searchDao()
     private val watchlistDao: WatchlistDao = database.watchlistDao()
@@ -704,7 +705,7 @@ class AnimeRepository(
                 val reqStarted = MonotonicMetrics.nowMs()
                 val resp = runCatching {
                     withTimeout(SEARCH_PER_QUERY_TIMEOUT_MS) {
-                        prophecyApi.searchAnime(query = trimmedQuery, limit = 25, cursor = requestCursor)
+                        v3Gateway.searchCompat(query = trimmedQuery)
                     }
                 }.getOrNull()
                 metricsTracker.recordApiRequest(resp?.isSuccessful == true)
@@ -1084,7 +1085,7 @@ class AnimeRepository(
                 val reqStarted = MonotonicMetrics.nowMs()
                 var response = runCatching {
                     withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
-                        prophecyApi.getAnimeDetails(backendId)
+                        v3Gateway.getDetailsCompat(backendId)
                     }
                 }.getOrNull()
                 if (response?.code() in listOf(404, 410) && animeId.startsWith("anilist_")) {
@@ -1094,7 +1095,7 @@ class AnimeRepository(
                         backendId = retryBackendId
                         response = runCatching {
                             withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
-                                prophecyApi.getAnimeDetails(backendId)
+                                v3Gateway.getDetailsCompat(backendId)
                             }
                         }.getOrNull()
                     }
@@ -1289,7 +1290,7 @@ class AnimeRepository(
                     if (rawMapped.isEmpty()) {
                         val epResp = runCatching {
                             withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
-                                prophecyApi.getAnimeEpisodes(resolvedBackendId)
+                                v3Gateway.getEpisodesFlatCompat(resolvedBackendId)
                             }
                         }.getOrNull()
                         if (epResp?.isSuccessful == true) {
@@ -1840,7 +1841,7 @@ class AnimeRepository(
                             val providerStarted = MonotonicMetrics.nowMs()
                             try {
                                 val resp = withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
-                                    prophecyApi.getEpisodeFull(targetBackendId, backendEpId)
+                                    v3Gateway.getEpisodeSourcesCompat(backendEpId)
                                 }
                                 MonotonicMetrics.recordDuration("provider_discovery_ms", providerStarted, "http=${resp.code()}")
                                 if (resp.isSuccessful && resp.body() != null) {
@@ -2196,7 +2197,7 @@ class AnimeRepository(
                     async {
                         runCatching {
                             withTimeout(SEARCH_PER_QUERY_TIMEOUT_MS) {
-                                prophecyApi.searchAnime(query = q, limit = 15)
+                                v3Gateway.searchCompat(query = q)
                             }
                         }.getOrNull()
                     }
@@ -2347,7 +2348,7 @@ class AnimeRepository(
         }
 
         val detailResp = runCatching {
-            withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) { prophecyApi.getAnimeDetails(backendId) }
+            withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) { v3Gateway.getDetailsCompat(backendId) }
         }.getOrNull()
 
         if (detailResp?.code() in listOf(404, 410)) {
@@ -2371,7 +2372,7 @@ class AnimeRepository(
         }
         if (backendEpisodes.isEmpty()) {
             val epResp = runCatching {
-                withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) { prophecyApi.getAnimeEpisodes(backendId) }
+                withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) { v3Gateway.getEpisodesFlatCompat(backendId) }
             }.getOrNull()
             if (epResp?.isSuccessful == true) {
                 backendEpisodes += epResp.body().orEmpty()
@@ -3259,7 +3260,7 @@ class AnimeRepository(
                 for (tierEpId in nextTier.episodeIds) {
                     val epResp = runCatching {
                         withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
-                            prophecyApi.getEpisodeFull(nextTier.backendId, tierEpId)
+                            v3Gateway.getEpisodeSourcesCompat(tierEpId)
                         }
                     }.getOrNull()
                     val body = epResp?.takeIf { it.isSuccessful }?.body() ?: continue
@@ -3554,7 +3555,7 @@ class AnimeRepository(
             }
             val started = MonotonicMetrics.nowMs()
             try {
-                val response = prophecyApi.getEpisodeFull(backendAnimeId, episodeId)
+                val response = v3Gateway.getEpisodeSourcesCompat(episodeId)
                 MonotonicMetrics.recordDuration("source_discovery_ms", started, "http=${response.code()}")
                 if (!response.isSuccessful || response.body() == null) {
                     if (EpisodeSourceRetryBackoff.isRetryableHttpStatus(response.code()) || response.body() == null) {
@@ -3791,12 +3792,9 @@ class AnimeRepository(
         return try {
             val resolutionStartedAt = MonotonicMetrics.nowMs()
             val response = withTimeout(DIRECT_PLAY_RESOLVE_TIMEOUT_MS) {
-                prophecyApi.resolveDirectPlay(
-                    DirectPlayRequest(
-                        animeId = resolvedAnimeId,
-                        episodeId = resolvedEpisodeId,
-                        sourceId = normSourceId
-                    )
+                v3Gateway.resolveEpisodeCompat(
+                    episodeId = resolvedEpisodeId,
+                    sourceId = normSourceId
                 )
             }
             val resolveElapsed = (MonotonicMetrics.nowMs() - resolutionStartedAt).coerceAtLeast(0L)

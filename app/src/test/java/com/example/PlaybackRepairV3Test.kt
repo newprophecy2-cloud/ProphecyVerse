@@ -319,7 +319,7 @@ class PlaybackRepairV3Test {
             var episodeFullScenario = 1
             var directPlayShouldFail503 = true
             var directPlayCalls = 0
-            val api = object : ProphecyVerseApiService {
+            val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
                 override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                     Response.success(ProphecySearchResponse(emptyList()))
                 override suspend fun getAnimeDetails(animeId: String) =
@@ -366,7 +366,7 @@ class PlaybackRepairV3Test {
                         )
                     }
                 }
-            }
+            })
             val aniList = object : AniListGraphQLService {
                 override suspend fun postQuery(request: AniListGraphQLRequest): Response<AniListGraphQLResponse> =
                     Response.success(AniListGraphQLResponse(AniListData(null)))

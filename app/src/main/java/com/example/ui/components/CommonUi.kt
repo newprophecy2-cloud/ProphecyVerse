@@ -443,3 +443,80 @@ fun ShimmerCard(modifier: Modifier = Modifier) {
             .background(shimmerBrush)
     )
 }
+
+@Composable
+fun StatusPill(
+    label: String,
+    accentColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(999.dp),
+        color = accentColor.copy(alpha = 0.14f),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.35f))
+    ) {
+        Text(
+            text = label,
+            color = accentColor,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+fun ErrorStateCard(
+    title: String,
+    message: String,
+    onRetry: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+        border = BorderStroke(1.dp, com.example.ui.theme.ErrorRed.copy(alpha = 0.35f))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Error",
+                    tint = com.example.ui.theme.ErrorRed,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary
+                )
+            }
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary
+            )
+            if (onRetry != null) {
+                androidx.compose.material3.Button(
+                    onClick = onRetry,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = AccentIndigo,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text(text = "Retry", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}

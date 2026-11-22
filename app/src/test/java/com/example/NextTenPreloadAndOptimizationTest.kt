@@ -203,7 +203,7 @@ class NextTenPreloadAndOptimizationTest {
         )
 
         val resolvedSourceCalls = ConcurrentHashMap<String, AtomicInteger>()
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -229,7 +229,7 @@ class NextTenPreloadAndOptimizationTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api, fakeD1, memoryCache)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -271,7 +271,7 @@ class NextTenPreloadAndOptimizationTest {
         val ep2Gate = CompletableDeferred<Unit>()
         val sourceResolved = ConcurrentHashMap<String, String>()
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -299,7 +299,7 @@ class NextTenPreloadAndOptimizationTest {
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = url))
                 )
             }
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

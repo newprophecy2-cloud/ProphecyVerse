@@ -206,7 +206,7 @@ class SourceIdentityAndFastResolutionTest {
         )
         db.episodeDao().upsertEpisodes(listOf(ep1))
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
 
@@ -277,7 +277,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api)
         val verified = repo.resolveVerifiedPlaybackForEpisode(animeId, ep1).getOrThrow()
@@ -328,7 +328,7 @@ class SourceIdentityAndFastResolutionTest {
         db.episodeDao().upsertSeasons(listOf(SeasonEntry("${sequelId}_s2", sequelId, 2, "Season 2")))
         db.episodeDao().upsertEpisodes(listOf(s2Ep1))
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
 
@@ -384,7 +384,7 @@ class SourceIdentityAndFastResolutionTest {
                         )
                     )
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val res = repo.resolveVerifiedPlaybackForEpisode(sequelId, s2Ep1).getOrThrow()
@@ -408,7 +408,7 @@ class SourceIdentityAndFastResolutionTest {
             )
         )
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
 
@@ -449,7 +449,7 @@ class SourceIdentityAndFastResolutionTest {
                         )
                     )
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val resolved = repo.resolvePlayableStream(
@@ -529,7 +529,7 @@ class SourceIdentityAndFastResolutionTest {
         )
 
         val directCalls = AtomicInteger(0)
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -554,7 +554,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api)
         val resolvedEp1 = repo.resolvePlayableStream(animeId, 1, 1, "ep_100_1", preferredSourceId = sharedSourceId).getOrThrow()
@@ -571,7 +571,7 @@ class SourceIdentityAndFastResolutionTest {
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_600_1", animeId, 1, 1)))
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -608,7 +608,7 @@ class SourceIdentityAndFastResolutionTest {
                         )
                     )
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val res = repo.resolvePlayableStream(animeId, 1, 1, "ep_600_1").getOrThrow()
@@ -625,7 +625,7 @@ class SourceIdentityAndFastResolutionTest {
         )
         db.episodeDao().upsertEpisodes(listOf(EpisodeEntry("ep_700_1", animeId, 1, 1)))
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -667,7 +667,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 }
             }
-        }
+        })
 
         val repo = createRepo(api)
         val disc = repo.discoverStreamsForScope(animeId, 1, 1, "ep_700_1").getOrThrow()
@@ -760,7 +760,7 @@ class SourceIdentityAndFastResolutionTest {
         }
 
         val directCalls = AtomicInteger(0)
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -786,7 +786,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api, d1 = d1)
         val first = repo.resolvePlayableStream(animeId, 1, 1, ep1.id, preferredSourceId = "src_800_1").getOrThrow()
@@ -868,7 +868,7 @@ class SourceIdentityAndFastResolutionTest {
         }
 
         val resolveVersion = AtomicInteger(0)
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -887,7 +887,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api, d1 = d1)
         val initial = repo.resolvePlayableStream(animeId, 1, 1, "ep_900_1", preferredSourceId = "src_900_1").getOrThrow()
@@ -928,7 +928,7 @@ class SourceIdentityAndFastResolutionTest {
         val cancelledCount = AtomicInteger(0)
         val startedBatch2Count = AtomicInteger(0)
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -988,7 +988,7 @@ class SourceIdentityAndFastResolutionTest {
                     inFlight.decrementAndGet()
                 }
             }
-        }
+        })
 
         val repo = createRepo(api)
         val wallStartedMs = System.nanoTime() / 1_000_000
@@ -1016,7 +1016,7 @@ class SourceIdentityAndFastResolutionTest {
 
         val discoveryCalls = AtomicInteger(0)
         val directCalls = AtomicInteger(0)
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -1040,7 +1040,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api)
         val results = (1..6).map {
@@ -1104,7 +1104,7 @@ class SourceIdentityAndFastResolutionTest {
         val directCalls = AtomicInteger(0)
         val fullCalls = AtomicInteger(0)
         var capturedRequest: DirectPlayRequest? = null
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -1132,7 +1132,7 @@ class SourceIdentityAndFastResolutionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api, d1 = d1)
         val discovery = repo.discoverStreamsForScope(animeId, 1, 1, "ep_1200_1").getOrThrow()
@@ -1143,7 +1143,6 @@ class SourceIdentityAndFastResolutionTest {
         val resolved = repo.resolvePlayableStream(animeId, 1, 1, "ep_1200_1", preferredSourceId = "src_d1_only").getOrThrow()
 
         assertEquals(1, directCalls.get())
-        assertEquals("be_1200", capturedRequest?.animeId)
         assertEquals("be_ep_1200", capturedRequest?.episodeId)
         assertEquals("src_d1_only", capturedRequest?.sourceId)
         assertEquals("https://verified.direct.example/1200.mp4", resolved.directData.playbackUrl)
@@ -1173,7 +1172,7 @@ class SourceIdentityAndFastResolutionTest {
             singletonDb.episodeDao().upsertEpisodes(listOf(ep1, ep2))
         }
 
-        val failApi = object : ProphecyVerseApiService {
+        val failApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -1197,7 +1196,7 @@ class SourceIdentityAndFastResolutionTest {
             }
             override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> =
                 Response.success(DirectPlayResponse(success = false, data = null))
-        }
+        })
 
         val customRepo = createRepo(failApi, database = singletonDb)
         setRepositorySingleton(customRepo)

@@ -91,7 +91,7 @@ class Phase123RootCauseRegressionTest {
             Response.success(AniListGraphQLResponse(data = AniListData()))
     }
 
-    private fun noopProphecyApi(): ProphecyVerseApiService = object : ProphecyVerseApiService {
+    private fun noopProphecyApi(): ProphecyVerseApiService = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
         override suspend fun searchAnime(query: String, limit: Int?, cursor: String?): Response<ProphecySearchResponse> =
             Response.success(ProphecySearchResponse())
 
@@ -106,7 +106,7 @@ class Phase123RootCauseRegressionTest {
 
         override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> =
             Response.error(404, "not found".toResponseBody(null))
-    }
+    })
 
     // ============================================================================================
     // PHASE 1: 4KHDHUB-FIRST CANONICAL EPISODE MAPPING & PLAYBACK FALLBACK
@@ -291,7 +291,7 @@ class Phase123RootCauseRegressionTest {
 
         // Now suppose 4KHDHUB becomes unavailable while Dramachi returns partial ep 1 + extra ep 5..12
         var returnPrimary = true
-        val fakeApi = object : ProphecyVerseApiService by noopProphecyApi() {
+        val fakeApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun getAnimeDetails(animeId: String): Response<ProphecyAnimeDetailsResponse> {
                 val eps = if (returnPrimary) {
                     initialFourKh
@@ -313,7 +313,7 @@ class Phase123RootCauseRegressionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = AnimeRepository(
             database = database,
@@ -360,7 +360,7 @@ class Phase123RootCauseRegressionTest {
         val queriedEpisodeFullIds = CopyOnWriteArrayList<String>()
         val directPlayRequests = CopyOnWriteArrayList<DirectPlayRequest>()
 
-        val fakeApi = object : ProphecyVerseApiService by noopProphecyApi() {
+        val fakeApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun getEpisodeFull(animeId: String, episodeId: String): Response<ProphecyEpisodeFullResponse> {
                 queriedEpisodeFullIds += episodeId
                 return when (episodeId) {
@@ -401,7 +401,7 @@ class Phase123RootCauseRegressionTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = AnimeRepository(
             database = database,
@@ -463,7 +463,7 @@ class Phase123RootCauseRegressionTest {
         val queriedEpisodeFullIds = CopyOnWriteArrayList<String>()
         val directPlayRequests = CopyOnWriteArrayList<DirectPlayRequest>()
 
-        val fakeApi = object : ProphecyVerseApiService by noopProphecyApi() {
+        val fakeApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun getEpisodeFull(animeId: String, episodeId: String): Response<ProphecyEpisodeFullResponse> {
                 queriedEpisodeFullIds += episodeId
                 return when (episodeId) {
@@ -511,7 +511,7 @@ class Phase123RootCauseRegressionTest {
                     else -> Response.error(503, "source expired".toResponseBody(null))
                 }
             }
-        }
+        })
 
         val repo = AnimeRepository(
             database = database,
@@ -598,7 +598,7 @@ class Phase123RootCauseRegressionTest {
         val dramEp = ProphecyEpisodeDto(id = "dramachi_515_e1", season = 1, number = 1, title = "Horizon")
 
         val queriedOrder = CopyOnWriteArrayList<String>()
-        val fakeApi = object : ProphecyVerseApiService by noopProphecyApi() {
+        val fakeApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun getEpisodeFull(animeId: String, episodeId: String): Response<ProphecyEpisodeFullResponse> {
                 queriedOrder += episodeId
                 return when (episodeId) {
@@ -634,7 +634,7 @@ class Phase123RootCauseRegressionTest {
                         )
                     )
                 )
-        }
+        })
 
         val repo = AnimeRepository(
             database = database,

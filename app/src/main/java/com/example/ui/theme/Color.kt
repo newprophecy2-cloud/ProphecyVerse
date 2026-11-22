@@ -2,24 +2,33 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val SpaceDark = Color(0xFF0B0E14)
-val SurfaceDark = Color(0xFF131722)
+// Dark-first cinematic palette
+val SpaceDark = Color(0xFF0B0D12)
+val SurfaceDark = Color(0xFF141821)
 val SurfaceVariantDark = Color(0xFF1C2230)
-val SurfaceHighlight = Color(0xFF283244)
+val SurfaceHighlight = Color(0xFF282E3B)
 
-val AccentCyan = Color(0xFF00E5FF)
-val AccentIndigo = Color(0xFF6366F1)
-val AccentPurple = Color(0xFFA855F7)
-val AccentCoral = Color(0xFFFF6B6B)
-val AccentGold = Color(0xFFFBBF24)
+val AccentIndigo = Color(0xFF8B7CFF)
+val AccentCyan = Color(0xFF55C8D8)
+val AccentPurple = Color(0xFFA78BFA)
+val AccentCoral = Color(0xFFFF6B75)
+val AccentGold = Color(0xFFF4B86A)
 
-val PlayableGreen = Color(0xFF10B981)
-val InfoBlue = Color(0xFF3B82F6)
-val ErrorRed = Color(0xFFEF4444)
+val PlayableGreen = Color(0xFF55C995)
+val InfoBlue = Color(0xFF55C8D8)
+val ErrorRed = Color(0xFFFF6B75)
 
-val TextPrimary = Color(0xFFF8FAFC)
-val TextSecondary = Color(0xFF94A3B8)
-val TextMuted = Color(0xFF64748B)
+val TextPrimary = Color(0xFFF4F5FA)
+val TextSecondary = Color(0xFFA3A9B8)
+val TextMuted = Color(0xFF6E7585)
+
+// Additive Light palette
+val LightBackground = Color(0xFFF6F7FB)
+val LightSurface = Color(0xFFFFFFFF)
+val LightSurfaceVariant = Color(0xFFEBEEF5)
+val LightDivider = Color(0xFFD5DBE7)
+val LightTextPrimary = Color(0xFF10131C)
+val LightTextSecondary = Color(0xFF4A5266)
 
 val Purple80 = Color(0xFFD0BCFF)
 val PurpleGrey80 = Color(0xFFCCC2DC)

@@ -237,7 +237,7 @@ class Fix1And2PrioritySchedulerTest {
         val eps = seedSeries(animeId, "be_7101", 3)
         val preResolveCalls = Collections.synchronizedList(mutableListOf<String>())
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -257,7 +257,7 @@ class Fix1And2PrioritySchedulerTest {
                         data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4")
                     )
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -290,7 +290,7 @@ class Fix1And2PrioritySchedulerTest {
         val animeId = "anilist_7102"
         val eps = seedSeries(animeId, "be_7102", 1)
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -319,7 +319,7 @@ class Fix1And2PrioritySchedulerTest {
                     )
                 }
             }
-        }
+        })
 
         val repo = createRepo(api)
         val startedAt = System.nanoTime() / 1_000_000
@@ -341,7 +341,7 @@ class Fix1And2PrioritySchedulerTest {
         val eps = seedSeries(animeId, "be_7201", 30)
         val resolveStartOrder = Collections.synchronizedList(mutableListOf<Int>())
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -360,7 +360,7 @@ class Fix1And2PrioritySchedulerTest {
                 Response.success(
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4"))
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -406,7 +406,7 @@ class Fix1And2PrioritySchedulerTest {
         val slowEpGate = CompletableDeferred<Unit>()
         val resolvedEps = ConcurrentHashMap.newKeySet<Int>()
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -427,7 +427,7 @@ class Fix1And2PrioritySchedulerTest {
                 Response.success(
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4"))
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -468,7 +468,7 @@ class Fix1And2PrioritySchedulerTest {
         assertEquals(listOf("anilist_7203_s1_e2", "anilist_7203_s1_e3", "anilist_7203_s1_e4", "anilist_7203_s1_e5"), planned.map { it.id })
 
         val resolveCalls = ConcurrentHashMap<String, AtomicInteger>()
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -485,7 +485,7 @@ class Fix1And2PrioritySchedulerTest {
                 Response.success(
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4"))
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -537,7 +537,7 @@ class Fix1And2PrioritySchedulerTest {
         val eps = seedSeries(animeId, "be_7204", 12)
         val resolveCounts = ConcurrentHashMap<String, AtomicInteger>()
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -554,7 +554,7 @@ class Fix1And2PrioritySchedulerTest {
                 Response.success(
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4"))
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -605,7 +605,7 @@ class Fix1And2PrioritySchedulerTest {
         val eps = seedSeries(animeId, "be_7205", 5)
         val attempts = ConcurrentHashMap<String, AtomicInteger>()
 
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -625,7 +625,7 @@ class Fix1And2PrioritySchedulerTest {
                 Response.success(
                     DirectPlayResponse(success = true, data = DirectPlayData(sourceId = request.sourceId, playbackUrl = "https://cdn.example/${request.sourceId}.mp4"))
                 )
-        }
+        })
 
         val repo = createRepo(api)
         val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

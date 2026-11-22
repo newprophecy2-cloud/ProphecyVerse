@@ -175,7 +175,7 @@ class D1StreamPlaybackAndBufferingFixTest {
         episodeId: String = "ep_700_1",
         backendEpisodeId: String = "be_ep_700_1",
         sources: List<ProphecySourceDto> = listOf(ProphecySourceDto(id = "src_700", label = "Pahe 1080p", quality = "1080p"))
-    ): ProphecyVerseApiService {
+    ): LegacyFixtureToV3Adapter {
         kotlinx.coroutines.runBlocking {
             db.animeDao().upsertAnime(
                 AnimeEntry(
@@ -191,7 +191,7 @@ class D1StreamPlaybackAndBufferingFixTest {
                 listOf(EpisodeEntry(episodeId, animeId, 1, 1, sourceEpisodeIds = "1:$backendEpisodeId"))
             )
         }
-        return object : ProphecyVerseApiService {
+        return LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -202,7 +202,7 @@ class D1StreamPlaybackAndBufferingFixTest {
                 Response.success(ProphecyEpisodeFullResponse(sources = sources))
             override suspend fun resolveDirectPlay(request: DirectPlayRequest) =
                 Response.success(DirectPlayResponse(success = false, data = null))
-        }
+        })
     }
 
     // Scenario 1 & 7: Valid D1 hit skips backend direct resolution AND restores safeHeadersJson & contentType
@@ -244,7 +244,7 @@ class D1StreamPlaybackAndBufferingFixTest {
         }
 
         val baseApi = seedAnimeAndEpisode()
-        val backendApi = object : ProphecyVerseApiService by baseApi {
+        val backendApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi by baseApi.legacy {
             override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> {
                 backendDirectCalls.incrementAndGet()
                 return Response.success(
@@ -254,7 +254,7 @@ class D1StreamPlaybackAndBufferingFixTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(backendApi, CloudflareD1DataSource(d1Api, metricsTracker))
         val resolved = repo.resolvePlayableStream("anilist_700", 1, 1, "ep_700_1", preferredSourceId = "src_700").getOrThrow()
@@ -385,7 +385,7 @@ class D1StreamPlaybackAndBufferingFixTest {
             }
         }
         val baseApi = seedAnimeAndEpisode("anilist_704", "be_704", "ep_704_1", "be_ep_704_1", listOf(ProphecySourceDto("src_704", "Kwik 1080p")))
-        val backendApi = object : ProphecyVerseApiService by baseApi {
+        val backendApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi by baseApi.legacy {
             override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> {
                 backendCalls.incrementAndGet()
                 return Response.success(
@@ -395,7 +395,7 @@ class D1StreamPlaybackAndBufferingFixTest {
                     )
                 )
             }
-        }
+        })
         val repo = createRepo(backendApi, CloudflareD1DataSource(d1Api, metricsTracker))
         val result = repo.resolvePlayableStream("anilist_704", 1, 1, "ep_704_1", preferredSourceId = "src_704").getOrThrow()
         assertEquals("BACKEND_RESOLVE", result.cacheTier)
@@ -563,7 +563,7 @@ class D1StreamPlaybackAndBufferingFixTest {
             downloadable = true
         )
         val baseApi = seedAnimeAndEpisode("anilist_705", "be_705", "ep_705_1", "be_ep_705_1", listOf(sourceDto))
-        val backendApi = object : ProphecyVerseApiService by baseApi {
+        val backendApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi by baseApi.legacy {
             override suspend fun resolveDirectPlay(request: DirectPlayRequest): Response<DirectPlayResponse> {
                 backendCalls.incrementAndGet()
                 return Response.success(
@@ -585,7 +585,7 @@ class D1StreamPlaybackAndBufferingFixTest {
                     )
                 )
             }
-        }
+        })
 
         val memCache = MemoryCacheManager(metricsTracker = metricsTracker)
         val repo = createRepo(backendApi, CloudflareD1DataSource(d1Api, metricsTracker), memCache)

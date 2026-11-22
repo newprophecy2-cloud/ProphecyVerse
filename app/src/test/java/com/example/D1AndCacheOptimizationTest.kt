@@ -367,7 +367,7 @@ class D1AndCacheOptimizationTest {
             }
         }
 
-        val prophecyApi = object : ProphecyVerseApiService {
+        val prophecyApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse(emptyList()))
             override suspend fun getAnimeDetails(animeId: String): Response<ProphecyAnimeDetailsResponse> {
@@ -420,7 +420,7 @@ class D1AndCacheOptimizationTest {
                     )
                 )
             }
-        }
+        })
 
         val d1 = CloudflareD1DataSource(d1Api, metricsTracker)
         val memCache = MemoryCacheManager(metricsTracker = metricsTracker)

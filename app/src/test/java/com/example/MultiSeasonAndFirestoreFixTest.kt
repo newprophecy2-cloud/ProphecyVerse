@@ -193,7 +193,7 @@ class MultiSeasonAndFirestoreFixTest {
         }
     }
 
-    private class BlackCloverBackendFake : ProphecyVerseApiService {
+    private class BlackCloverBackendFake : LegacyFixtureApi {
         val searchQueries = mutableListOf<String>()
         val episodeFullRequests = mutableListOf<Pair<String, String>>()
         val resolveRequests = AtomicInteger(0)
@@ -482,7 +482,7 @@ class MultiSeasonAndFirestoreFixTest {
     ): Triple<AnimeRepository, BlackCloverBackendFake, FakeInMemoryD1Api> {
         val repo = AnimeRepository(
             database = db,
-            prophecyApi = backend,
+            prophecyApi = LegacyFixtureToV3Adapter(backend),
             aniListApi = blackCloverAniListService(),
             applicationContext = context,
             d1DataSource = d1DataSource,

@@ -202,7 +202,7 @@ class Fix6PlaybackBufferingTest {
                 fetchedAtMs = System.currentTimeMillis()
             )
 
-            val api = object : ProphecyVerseApiService {
+            val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
                 override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) = Response.success(ProphecySearchResponse())
                 override suspend fun getAnimeDetails(animeId: String) = Response.success(ProphecyAnimeDetailsResponse(id = animeId, title = "Fix6 Show"))
                 override suspend fun getAnimeEpisodes(animeId: String) = Response.success(emptyList<ProphecyEpisodeDto>())
@@ -221,7 +221,7 @@ class Fix6PlaybackBufferingTest {
                         )
                     )
                 }
-            }
+            })
             val aniList = object : AniListGraphQLService {
                 override suspend fun postQuery(request: AniListGraphQLRequest) =
                     Response.success(AniListGraphQLResponse(AniListData(null)))

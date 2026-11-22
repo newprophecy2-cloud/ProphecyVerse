@@ -1,5 +1,7 @@
 package com.example.data.remote
 
+import com.example.core.network.BackendConfig
+import com.example.data.remote.session.PvSessionManager
 import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.JsonReader
 import com.squareup.moshi.JsonWriter
@@ -14,7 +16,7 @@ import java.lang.reflect.Type
 import java.util.concurrent.TimeUnit
 
 object NetworkModule {
-    private const val PROPHECY_BASE_URL = "https://api.prophecyverse.tech"
+    private const val PROPHECY_BASE_URL = BackendConfig.BASE_URL
     private const val ANILIST_BASE_URL = "https://graphql.anilist.co"
 
     internal val prophecyResponseAdapterFactory = object : JsonAdapter.Factory {
@@ -403,10 +405,15 @@ object NetworkModule {
             .writeTimeout(20, TimeUnit.SECONDS)
             .callTimeout(40, TimeUnit.SECONDS)
             .addInterceptor { chain ->
-                val request = chain.request().newBuilder()
+                val orig = chain.request()
+                val builder = orig.newBuilder()
                     .header("User-Agent", "ProphecyVerse/${com.example.BuildConfig.VERSION_NAME} (Android)")
-                    .build()
-                chain.proceed(request)
+                if (orig.url.host.equals(BackendConfig.HOST, ignoreCase = true)) {
+                    PvSessionManager.currentSessionId()?.let { sid ->
+                        builder.header(PvSessionManager.HEADER_NAME, sid)
+                    }
+                }
+                chain.proceed(builder.build())
             }
             .addInterceptor(HttpLoggingInterceptor().apply {
                 // Keep BASIC without headers/bodies so transient URLs or tokens are never logged

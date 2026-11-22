@@ -95,7 +95,7 @@ class Fix3IdentityValidationTest {
 
     private fun noOpApi(directResolver: suspend (DirectPlayRequest) -> Response<DirectPlayResponse> = {
         Response.success(DirectPlayResponse(false, null))
-    }): ProphecyVerseApiService = object : ProphecyVerseApiService {
+    }): ProphecyVerseApiService = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
         override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
             Response.success(ProphecySearchResponse())
         override suspend fun getAnimeDetails(animeId: String) =
@@ -105,7 +105,7 @@ class Fix3IdentityValidationTest {
         override suspend fun getEpisodeFull(animeId: String, episodeId: String) =
             Response.success(ProphecyEpisodeFullResponse())
         override suspend fun resolveDirectPlay(request: DirectPlayRequest) = directResolver(request)
-    }
+    })
 
     @Test
     fun fix3_sameSourceIdAcrossTwoProviders_doesNotCollideInMemoryRoomOrResolution() = runTest {
@@ -243,7 +243,7 @@ class Fix3IdentityValidationTest {
         memoryCache.putResolvedPlayback(sharedSourceId, DirectPlayData(sourceId = sharedSourceId, playbackUrl = "https://old-provider.example/old.mp4"), scope, oldProv)
 
         val directCalls = AtomicInteger(0)
-        val api = object : ProphecyVerseApiService {
+        val api = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -265,7 +265,7 @@ class Fix3IdentityValidationTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = createRepo(api)
         val snap = repo.discoverStreamsForScope(animeId, 1, 1, "ep_3004_1", forceRefresh = true).getOrThrow()

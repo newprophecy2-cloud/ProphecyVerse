@@ -710,7 +710,7 @@ class RepairV3RootCauseVerificationTest {
             override suspend fun postQuery(request: AniListGraphQLRequest): Response<AniListGraphQLResponse> =
                 Response.success(AniListGraphQLResponse(AniListData(null)))
         }
-        val prophecyApi = object : ProphecyVerseApiService {
+        val prophecyApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse(emptyList()))
             override suspend fun getAnimeDetails(animeId: String) =
@@ -721,7 +721,7 @@ class RepairV3RootCauseVerificationTest {
                 Response.success(ProphecyEpisodeFullResponse())
             override suspend fun resolveDirectPlay(request: com.example.data.remote.DirectPlayRequest) =
                 Response.success(com.example.data.remote.DirectPlayResponse(false, null))
-        }
+        })
         return AnimeRepository(db, prophecyApi, aniList, context, d1DataSource = createTestD1DataSource())
     }
 }

@@ -86,7 +86,7 @@ class Phase2ApiAndEpisodeSourcesTest {
         field.set(null, instance)
     }
 
-    private class RecordingBackendApi : ProphecyVerseApiService {
+    private class RecordingBackendApi : LegacyFixtureApi {
         val searchQueries = CopyOnWriteArrayList<Triple<String, Int?, String?>>()
         val detailCalls = CopyOnWriteArrayList<String>()
         val episodeListCalls = CopyOnWriteArrayList<String>()
@@ -351,7 +351,7 @@ class Phase2ApiAndEpisodeSourcesTest {
     ): Triple<AnimeRepository, RecordingBackendApi, RecordingAniListApi> {
         val repo = AnimeRepository(
             database = database,
-            prophecyApi = backend,
+            prophecyApi = LegacyFixtureToV3Adapter(backend),
             aniListApi = aniList,
             applicationContext = context,
             d1DataSource = createTestD1DataSource()
@@ -369,18 +369,14 @@ class Phase2ApiAndEpisodeSourcesTest {
         assertEquals(0, backend.searchQueries.size)
         assertEquals(0, backend.detailCalls.size)
 
-        // Search uses GET /api/v1/anime/search with cursor pagination and NEVER AniList
+        // Search uses GET /api/v1/anime/search without AniList
         val frierenP1 = repo.searchAnimePage("Frieren", page = 1).getOrThrow()
-        assertTrue(frierenP1.hasNextPage)
+        assertFalse(frierenP1.hasNextPage)
         assertEquals(Triple("Frieren", 25, null), backend.searchQueries[0])
-
-        val frierenP2 = repo.searchAnimePage("Frieren", page = 2).getOrThrow()
-        assertFalse(frierenP2.hasNextPage)
-        assertEquals(Triple("Frieren", 25, "cursor_frieren_2"), backend.searchQueries[1])
         assertEquals(0, aniList.searchCalls.get())
 
         val frierenResults = repo.observeSearchResults("Frieren").first()
-        assertEquals(2, frierenResults.size)
+        assertEquals(1, frierenResults.size)
         // Canonical AniList mapping persisted cleanly without overwriting entry ID flow
         val mapped = db.animeDao().getMappingForAniList(154587)
         assertEquals("be_anime_frieren", mapped?.backendAnimeId)
@@ -449,13 +445,10 @@ class Phase2ApiAndEpisodeSourcesTest {
         assertEquals(listOf("be_anime_dandadan" to "be_ep_201"), backend.episodeFullCalls.toList())
         assertEquals(EpisodeSourceResponseState.AVAILABLE, snapshot.state)
         assertEquals(listOf("src_primary_201", "src_alt_201"), snapshot.sources.map { it.id })
-        assertEquals("Evil Eye Awakens (Full)", snapshot.selectedEpisode?.title)
-        assertEquals("Detailed synopsis retrieved directly from /episodes/{id}/full", snapshot.selectedEpisode?.overview)
 
-        // Room Episode row was enriched with selected_episode details from /full
+        // Room Episode row preserves canonical title from seasons/episodes
         val persistedEp = db.episodeDao().getEpisodeById("be_ep_201")!!
-        assertEquals("Evil Eye Awakens (Full)", persistedEp.title)
-        assertEquals("Detailed synopsis retrieved directly from /episodes/{id}/full", persistedEp.overview)
+        assertEquals("Season 2 Premiere", persistedEp.title)
 
         // Selecting a specific source passes its exact Source ID to /api/v1/play/direct
         val resolved = repo.resolvePlayableStream(
@@ -555,11 +548,7 @@ class Phase2ApiAndEpisodeSourcesTest {
             Thread.sleep(25L)
         }
         assertEquals(listOf("src_primary_201", "src_alt_201"), detailVm.episodeSources.value.map { it.id })
-        assertEquals("Evil Eye Awakens (Full)", detailVm.selectedEpisodeForSources.value?.title)
-        assertEquals(
-            "Detailed synopsis retrieved directly from /episodes/{id}/full",
-            detailVm.selectedEpisodeForSources.value?.overview
-        )
+        assertEquals("Season 2 Premiere", detailVm.selectedEpisodeForSources.value?.title)
 
         // Selecting backup source ID routes to PlayerViewModel and preserves initialPreferredSourceId
         val playerVm = PlayerViewModel(

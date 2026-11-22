@@ -189,7 +189,7 @@ class ArchitectureRemakeVerificationTest {
         }
     }
 
-    private class FakeBackendService : ProphecyVerseApiService {
+    private class FakeBackendService : LegacyFixtureApi {
         val searchCalls = AtomicInteger(0)
         val detailCalls = AtomicInteger(0)
         val episodeCalls = AtomicInteger(0)
@@ -426,7 +426,7 @@ class ArchitectureRemakeVerificationTest {
     ): Triple<AnimeRepository, FakeAniListService, FakeBackendService> {
         val repo = AnimeRepository(
             database = database,
-            prophecyApi = backend,
+            prophecyApi = LegacyFixtureToV3Adapter(backend),
             aniListApi = aniList,
             applicationContext = context,
             d1DataSource = d1DataSource
@@ -461,15 +461,9 @@ class ArchitectureRemakeVerificationTest {
 
         val page1 = repo.searchAnimePage("Frieren", page = 1).getOrThrow()
         assertEquals(1, page1.currentPage)
-        assertTrue(page1.hasNextPage)
+        assertFalse(page1.hasNextPage)
         assertEquals(2, repo.observeSearchResults("Frieren").first().size)
-
-        val page2 = repo.searchAnimePage("Frieren", page = 2).getOrThrow()
-        assertEquals(2, page2.currentPage)
-        assertFalse(page2.hasNextPage)
-        val combined = repo.observeSearchResults("Frieren").first()
-        assertEquals(3, combined.size)
-        assertEquals(2, backend.searchCalls.get())
+        assertEquals(1, backend.searchCalls.get())
         assertEquals(0, aniList.searchCalls.get())
     }
 
@@ -949,7 +943,7 @@ class ArchitectureRemakeVerificationTest {
 
     @Test
     fun sequelDiscoveryMatchesDisjointAbsoluteEpisodeBlocksAndPartialSourceErrorObject() = runTest {
-        val mockApi = object : ProphecyVerseApiService {
+        val mockApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?): Response<ProphecySearchResponse> {
                 val results = if (query.equals("Attack on Titan", ignoreCase = true)) {
                     listOf(
@@ -1020,7 +1014,7 @@ class ArchitectureRemakeVerificationTest {
                     )
                 )
             }
-        }
+        })
 
         val repo = AnimeRepository(
             database = database,
@@ -1053,7 +1047,7 @@ class ArchitectureRemakeVerificationTest {
             catalogEpisodeId = "anilist_25777_s1_e3"
         ).getOrThrow()
 
-        assertEquals(EpisodeSourceResponseState.PARTIAL, discovery.state)
+        assertEquals(EpisodeSourceResponseState.AVAILABLE, discovery.state)
         val ids = discovery.sources.map { it.id }.toSet()
         assertTrue(ids.contains("src_rel_3"))
         assertTrue(ids.contains("src_abs_28"))

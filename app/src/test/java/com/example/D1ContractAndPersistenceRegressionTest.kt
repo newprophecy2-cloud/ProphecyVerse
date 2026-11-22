@@ -469,7 +469,7 @@ class D1ContractAndPersistenceRegressionTest {
             }
         }
 
-        val backendApi = object : ProphecyVerseApiService {
+        val backendApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -492,7 +492,7 @@ class D1ContractAndPersistenceRegressionTest {
                     )
                 )
             )
-        }
+        })
 
         val repo = createRepo(backendApi, CloudflareD1DataSource(d1Api, metricsTracker))
 
@@ -637,7 +637,7 @@ class D1ContractAndPersistenceRegressionTest {
             }
         }
 
-        val backendApi = object : ProphecyVerseApiService {
+        val backendApi = LegacyFixtureToV3Adapter(object : LegacyFixtureApi {
             override suspend fun searchAnime(query: String, limit: Int?, cursor: String?) =
                 Response.success(ProphecySearchResponse())
             override suspend fun getAnimeDetails(animeId: String) =
@@ -663,7 +663,7 @@ class D1ContractAndPersistenceRegressionTest {
                     )
                 )
             }
-        }
+        })
 
         val animeId = "anilist_888"
         db.animeDao().upsertAnime(
