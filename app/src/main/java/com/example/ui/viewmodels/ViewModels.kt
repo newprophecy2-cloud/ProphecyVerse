@@ -206,7 +206,7 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         searchJob = viewModelScope.launch {
             _isSearching.value = true
             _error.value = null
-            delay(250L)
+            delay(if (norm.length >= 2) 180L else 250L)
             val res = repository.searchAnimePage(trimmed, page = 1)
             if (requestId == searchRequestSequence) {
                 res.onSuccess { pageRes ->

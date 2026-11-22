@@ -115,6 +115,7 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer.dash)
   implementation(libs.androidx.media3.datasource.okhttp)
   implementation(libs.media3.ffmpeg.decoder)
+  implementation(libs.libvlc.all)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   implementation(libs.firebase.firestore)

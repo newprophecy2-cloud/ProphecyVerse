@@ -42,9 +42,11 @@ credentials = "1.5.0"
 googleid = "1.1.1"
 media3 = "1.5.1"
 media3Ffmpeg = "1.5.0+1"
+libvlc = "3.6.5"
 
 
 [libraries]
+libvlc-all = { group = "org.videolan.android", name = "libvlc-all", version.ref = "libvlc" }
 media3-ffmpeg-decoder = { group = "org.jellyfin.media3", name = "media3-ffmpeg-decoder", version.ref = "media3Ffmpeg" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }

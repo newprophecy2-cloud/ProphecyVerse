@@ -63,6 +63,8 @@ class PlayerManager(
         com.example.data.metrics.DatabaseMetricsTracker.getInstance()
 ) {
     private var exoPlayer: ExoPlayer? = null
+    private var libVlcAdapter: com.example.playback.libvlc.LibVlcEngineAdapter? = null
+    private var libVlcObserverJob: Job? = null
     private var activePlayerListener: Player.Listener? = null
     private var activeAnalyticsListener: AnalyticsListener? = null
     private var activeRebufferStartedAtMs: Long = 0L
@@ -76,6 +78,9 @@ class PlayerManager(
 
     private val _exoPlayerInstance = MutableStateFlow<ExoPlayer?>(null)
     val exoPlayerInstance: StateFlow<ExoPlayer?> = _exoPlayerInstance.asStateFlow()
+
+    private val _libVlcActive = MutableStateFlow(false)
+    val libVlcActive: StateFlow<Boolean> = _libVlcActive.asStateFlow()
 
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
@@ -837,6 +842,10 @@ class PlayerManager(
     }
 
     fun togglePlayPause() {
+        if (_libVlcActive.value) {
+            if (_isPlaying.value) libVlcAdapter?.pause() else libVlcAdapter?.play()
+            return
+        }
         val player = exoPlayer ?: return
         if (player.isPlaying) {
             player.pause()
@@ -846,11 +855,23 @@ class PlayerManager(
     }
 
     fun seekTo(positionMs: Long) {
+        if (_libVlcActive.value) {
+            libVlcAdapter?.seekTo(positionMs)
+            _currentPosition.value = positionMs.coerceAtLeast(0L)
+            return
+        }
         exoPlayer?.seekTo(positionMs.coerceAtLeast(0L))
         _currentPosition.value = positionMs
     }
 
     fun seekBy(offsetMs: Long) {
+        if (_libVlcActive.value) {
+            val dur = _duration.value.coerceAtLeast(0L)
+            val newPos = (_currentPosition.value + offsetMs).let { if (dur > 0) it.coerceIn(0L, dur) else it.coerceAtLeast(0L) }
+            libVlcAdapter?.seekTo(newPos)
+            _currentPosition.value = newPos
+            return
+        }
         val player = exoPlayer ?: return
         val newPos = (player.currentPosition + offsetMs).coerceIn(0L, player.duration.coerceAtLeast(0L))
         player.seekTo(newPos)
@@ -858,6 +879,11 @@ class PlayerManager(
     }
 
     fun setSpeed(speed: Float) {
+        if (_libVlcActive.value) {
+            libVlcAdapter?.setSpeed(speed)
+            _playbackSpeed.value = speed
+            return
+        }
         exoPlayer?.setPlaybackSpeed(speed)
         _playbackSpeed.value = speed
     }
@@ -930,11 +956,63 @@ class PlayerManager(
     }
 
     fun pause() {
+        if (_libVlcActive.value) {
+            libVlcAdapter?.pause()
+            return
+        }
         exoPlayer?.pause()
+    }
+
+    fun attachLibVlcVideoLayout(layout: org.videolan.libvlc.util.VLCVideoLayout) {
+        val adapter = libVlcAdapter ?: com.example.playback.libvlc.LibVlcEngineAdapter(context).also {
+            libVlcAdapter = it
+        }
+        adapter.attachVideoLayout(layout)
+    }
+
+    fun detachLibVlcVideoLayout() {
+        libVlcAdapter?.detachVideoLayout()
+    }
+
+    fun startLibVlcPlayback(directData: DirectPlayData, startPositionMs: Long = 0L) {
+        runCatching { exoPlayer?.stop() }
+        val adapter = libVlcAdapter ?: com.example.playback.libvlc.LibVlcEngineAdapter(context).also {
+            libVlcAdapter = it
+        }
+        _libVlcActive.value = true
+        libVlcObserverJob?.cancel()
+        libVlcObserverJob = CoroutineScope(Dispatchers.Main.immediate).launch {
+            launch {
+                adapter.state.collect { st ->
+                    _isPlaying.value = st == com.example.playback.core.PlaybackEngineState.PLAYING
+                    _isBuffering.value = st == com.example.playback.core.PlaybackEngineState.BUFFERING ||
+                        st == com.example.playback.core.PlaybackEngineState.OPENING_MEDIA
+                    _isPlaybackEnded.value = st == com.example.playback.core.PlaybackEngineState.ENDED
+                }
+            }
+            launch { adapter.positionMs.collect { _currentPosition.value = it } }
+            launch { adapter.durationMs.collect { _duration.value = it } }
+            launch { adapter.error.collect { err -> _errorMessage.value = err?.message } }
+        }
+        val headerMap = directData.headers
+            .filter { it.size >= 2 && it[0].isNotBlank() }
+            .associate { it[0] to it[1] }
+        adapter.prepare(
+            com.example.playback.core.PlaybackRequest(
+                mediaUri = directData.playbackUrl,
+                requestHeaders = headerMap,
+                startPositionMs = startPositionMs
+            )
+        )
     }
 
     fun release(resetRetryBudget: Boolean = true) {
         resetPlaybackStateForSwitch(resetRetryBudget = resetRetryBudget)
+        libVlcObserverJob?.cancel()
+        libVlcObserverJob = null
+        libVlcAdapter?.release()
+        libVlcAdapter = null
+        _libVlcActive.value = false
         exoPlayer?.let { player ->
             runCatching { player.release() }
         }

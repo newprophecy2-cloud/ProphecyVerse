@@ -1025,19 +1025,20 @@ class AnimeRepository(
                     (now - entry.updatedAt < memoryCache.animeTtlMs)
                 ) {
                     val isMovieLocal = ContentIdentityHelper.isMovie(entry)
-                    if (isMovieLocal) {
+                    val localEps = episodeDao.getEpisodesForAnime(animeId)
+                    if (isMovieLocal && localEps.isNotEmpty()) {
                         metricsTracker.recordRoomHit()
                         memoryCache.putAnime(entry)
                         return@withContext Result.success(
                             EpisodeCatalogRefreshStatus(
                                 state = EpisodeCatalogState.NOT_APPLICABLE,
                                 detailsEndpointSucceeded = true,
-                                episodeListEndpointSucceeded = false
+                                episodeListEndpointSucceeded = true,
+                                currentRefreshEpisodeIds = localEps.map { it.id }.toSet()
                             )
                         )
                     }
                     val localSeasons = memoryCache.getSeasons(animeId) ?: episodeDao.getSeasonsForAnime(animeId)
-                    val localEps = episodeDao.getEpisodesForAnime(animeId)
                     if (entry.metadataCompleteness == "MISSING_EPISODES" || (localSeasons.isNotEmpty() && localEps.isNotEmpty())) {
                         metricsTracker.recordRoomHit()
                         memoryCache.putAnime(entry)
@@ -1186,7 +1187,32 @@ class AnimeRepository(
 
                 if (isMovie) {
                     mappedSeasons = emptyList()
-                    mappedEpisodes = emptyList()
+                    val movieEp = rawDtoEpisodes.firstOrNull { ep ->
+                        ep.id.isNotBlank() && ((ep.season ?: 1) == 1 && ep.number == 1)
+                    } ?: rawDtoEpisodes.firstOrNull { ep -> ep.id.isNotBlank() }
+                    mappedEpisodes = if (movieEp != null) {
+                        val scopeKey = ContentIdentityHelper.scopeKey(
+                            animeId = animeId,
+                            isMovie = true,
+                            seasonNumber = 0,
+                            episodeNumber = 1
+                        )
+                        discoveredBackendEpisodeIds[scopeKey] = movieEp.id
+                        listOf(
+                            EpisodeEntry(
+                                id = movieEp.id,
+                                animeId = animeId,
+                                seasonNumber = 0,
+                                episodeNumber = 1,
+                                title = movieEp.title?.takeIf { it.isNotBlank() } ?: preferredTitle,
+                                overview = movieEp.overview?.takeIf { it.isNotBlank() },
+                                isAvailable = true,
+                                sourceEpisodeIds = buildEpisodeSourceIdsForDto(movieEp)
+                            )
+                        )
+                    } else {
+                        emptyList()
+                    }
                     finalSeasons = emptyList()
                 } else if (shouldReconcileMultiProvider) {
                     val providerPayloads = buildList {

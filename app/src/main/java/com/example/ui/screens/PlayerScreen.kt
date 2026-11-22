@@ -156,6 +156,7 @@ fun PlayerScreen(
 
     val isPlaying by viewModel.playerManager.isPlaying.collectAsStateWithLifecycle()
     val isBuffering by viewModel.playerManager.isBuffering.collectAsStateWithLifecycle()
+    val libVlcActive by viewModel.playerManager.libVlcActive.collectAsStateWithLifecycle()
     val currentPosition by viewModel.playerManager.currentPosition.collectAsStateWithLifecycle()
     val duration by viewModel.playerManager.duration.collectAsStateWithLifecycle()
     val playerError by viewModel.playerManager.errorMessage.collectAsStateWithLifecycle()
@@ -389,7 +390,12 @@ fun PlayerScreen(
                 .background(Color.Black)
                 .testTag("player_screen_fullscreen")
         ) {
-            VideoSurface(playerInstance = playerInstance)
+            VideoSurface(
+                playerInstance = playerInstance,
+                libVlcActive = libVlcActive,
+                onAttachLibVlcLayout = { viewModel.playerManager.attachLibVlcVideoLayout(it) },
+                onDetachLibVlcLayout = { viewModel.playerManager.detachLibVlcVideoLayout() }
+            )
 
             if (!isInPipMode) {
                 PlayerGestureLayer(
@@ -558,7 +564,12 @@ fun PlayerScreen(
                     .aspectRatio(16f / 9f)
                     .background(Color.Black)
             ) {
-                VideoSurface(playerInstance = playerInstance)
+                VideoSurface(
+                playerInstance = playerInstance,
+                libVlcActive = libVlcActive,
+                onAttachLibVlcLayout = { viewModel.playerManager.attachLibVlcVideoLayout(it) },
+                onDetachLibVlcLayout = { viewModel.playerManager.detachLibVlcVideoLayout() }
+            )
 
                 if (!isInPipMode) {
                     PlayerGestureLayer(
@@ -1177,23 +1188,46 @@ fun HorizontalEpisodeCard(
 
 @androidx.annotation.OptIn(markerClass = [UnstableApi::class])
 @Composable
-private fun VideoSurface(playerInstance: androidx.media3.exoplayer.ExoPlayer?) {
-    AndroidView(
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                useController = false
-                keepScreenOn = true
-                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
-                player = playerInstance
-            }
-        },
-        update = { playerView ->
-            if (playerView.player != playerInstance) {
-                playerView.player = playerInstance
-            }
-        },
-        modifier = Modifier.fillMaxSize()
-    )
+private fun VideoSurface(
+    playerInstance: androidx.media3.exoplayer.ExoPlayer?,
+    libVlcActive: Boolean = false,
+    onAttachLibVlcLayout: ((org.videolan.libvlc.util.VLCVideoLayout) -> Unit)? = null,
+    onDetachLibVlcLayout: (() -> Unit)? = null
+) {
+    if (libVlcActive && onAttachLibVlcLayout != null) {
+        AndroidView(
+            factory = { ctx ->
+                org.videolan.libvlc.util.VLCVideoLayout(ctx).apply {
+                    keepScreenOn = true
+                    onAttachLibVlcLayout(this)
+                }
+            },
+            update = { layout ->
+                onAttachLibVlcLayout(layout)
+            },
+            onRelease = {
+                onDetachLibVlcLayout?.invoke()
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+    } else {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    useController = false
+                    keepScreenOn = true
+                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    player = playerInstance
+                }
+            },
+            update = { playerView ->
+                if (playerView.player != playerInstance) {
+                    playerView.player = playerInstance
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+    }
 }
 
 @Composable
