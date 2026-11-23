@@ -183,7 +183,12 @@ class PlayerManager(
         val contentType: String? = null,
         val resolveDurationMs: Long = 0L,
         val videoResolution: String? = null,
+        val videoCodec: String? = null,
+        val activeVideoDecoder: String? = null,
+        val frameRate: Float? = null,
+        val droppedFrames: Long = 0L,
         val activeAudioDecoder: String? = null,
+        val audioCodec: String? = null,
         val failureCategory: PlaybackFailureCategory? = null,
         val lastErrorMessage: String? = null,
         val ttfbMs: Long? = null,
@@ -457,6 +462,50 @@ class PlayerManager(
                 Log.i(TAG, "Audio decoder initialized: $decoderName init_ms=${initializationDurationMs} provider=$providerDiagnostic")
                 _activeAudioDecoder.value = decoderName
                 _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeAudioDecoder = decoderName)
+            }
+
+            override fun onVideoDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long
+            ) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(activeVideoDecoder = decoderName)
+            }
+
+            override fun onVideoInputFormatChanged(
+                eventTime: AnalyticsListener.EventTime,
+                format: androidx.media3.common.Format,
+                decoderReuseEvaluation: androidx.media3.exoplayer.DecoderReuseEvaluation?
+            ) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                    videoCodec = format.sampleMimeType ?: format.codecs,
+                    frameRate = format.frameRate.takeIf { it > 0f }
+                )
+            }
+
+            override fun onAudioInputFormatChanged(
+                eventTime: AnalyticsListener.EventTime,
+                format: androidx.media3.common.Format,
+                decoderReuseEvaluation: androidx.media3.exoplayer.DecoderReuseEvaluation?
+            ) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                    audioCodec = format.sampleMimeType ?: format.codecs
+                )
+            }
+
+            override fun onDroppedVideoFrames(
+                eventTime: AnalyticsListener.EventTime,
+                droppedFrames: Int,
+                elapsedMs: Long
+            ) {
+                if (generation != playbackGeneration || player !== exoPlayer) return
+                _playbackDiagnostics.value = _playbackDiagnostics.value.copy(
+                    droppedFrames = _playbackDiagnostics.value.droppedFrames + droppedFrames.coerceAtLeast(0)
+                )
             }
         }
         activeAnalyticsListener = analyticsListener
