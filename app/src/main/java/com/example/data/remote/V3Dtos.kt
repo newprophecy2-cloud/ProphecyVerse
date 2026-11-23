@@ -60,6 +60,7 @@ data class V3AnimeDetailsResponse(
     @Json(name = "verified_episodes") val verifiedEpisodes: Int? = null,
     @Json(name = "unverified_episodes") val unverifiedEpisodes: Int? = null,
     @Json(name = "season_structure_status") val seasonStructureStatus: String? = null,
+    @Json(name = "primary_episode_id") val primaryEpisodeId: String? = null,
     @Json(name = "provider_coverage") val providerCoverage: Map<String, String>? = null,
     @Json(name = "provider_variants") val providerVariants: List<V3ProviderVariantDto>? = null
 )

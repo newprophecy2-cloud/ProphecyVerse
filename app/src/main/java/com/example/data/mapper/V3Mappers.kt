@@ -175,28 +175,49 @@ object V3Mappers {
         description = details.description,
         posterUrl = details.posterUrl,
         genres = details.genres,
-        seasons = seasonsWithEpisodes.map { (season, eps) ->
-            val verifiedEps = eps.filter {
-                it.episodeId.isNotBlank() &&
-                    it.episodeNumber > 0 &&
-                    parseCanonicalVerification(it.verification) == CanonicalVerification.Verified
-            }
-            ProphecySeasonDto(
-                id = season.seasonId,
-                canonicalId = season.seasonId,
-                number = season.seasonNumber,
-                title = "Season ${season.seasonNumber}",
-                episodes = verifiedEps.map { ep ->
-                    ProphecyEpisodeDto(
-                        id = ep.episodeId,
-                        canonicalId = ep.episodeId,
-                        season = season.seasonNumber,
-                        number = ep.episodeNumber,
-                        title = ep.title,
-                        overview = null
+        seasons = if (seasonsWithEpisodes.isEmpty() && !details.primaryEpisodeId.isNullOrBlank()) {
+            listOf(
+                ProphecySeasonDto(
+                    id = "${details.animeId}_movie",
+                    canonicalId = "${details.animeId}_movie",
+                    number = 1,
+                    title = "Movie",
+                    episodes = listOf(
+                        ProphecyEpisodeDto(
+                            id = details.primaryEpisodeId,
+                            canonicalId = details.primaryEpisodeId,
+                            season = 1,
+                            number = 1,
+                            title = "Movie",
+                            overview = null
+                        )
                     )
-                }
+                )
             )
+        } else {
+            seasonsWithEpisodes.map { (season, eps) ->
+                val verifiedEps = eps.filter {
+                    it.episodeId.isNotBlank() &&
+                        it.episodeNumber > 0 &&
+                        parseCanonicalVerification(it.verification) == CanonicalVerification.Verified
+                }
+                ProphecySeasonDto(
+                    id = season.seasonId,
+                    canonicalId = season.seasonId,
+                    number = season.seasonNumber,
+                    title = "Season ${season.seasonNumber}",
+                    episodes = verifiedEps.map { ep ->
+                        ProphecyEpisodeDto(
+                            id = ep.episodeId,
+                            canonicalId = ep.episodeId,
+                            season = season.seasonNumber,
+                            number = ep.episodeNumber,
+                            title = ep.title,
+                            overview = null
+                        )
+                    }
+                )
+            }
         },
         partial = details.seasonStructureStatus?.equals("partial", ignoreCase = true) ?: false,
         alternativeTitles = details.alternativeTitles,

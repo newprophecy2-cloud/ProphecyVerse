@@ -96,6 +96,25 @@ class V3BackendGateway(
         if (!seasonsResp.isSuccessful || seasonsBody == null) {
             return Response.error(seasonsResp.code(), seasonsResp.errorBody() ?: okhttp3.ResponseBody.create(null, ""))
         }
+        if (seasonsBody.seasons.isEmpty()) {
+            val det = runCatching { withSessionRetry { api.getAnimeDetails(animeId) } }.getOrNull()
+            val primaryEpId = det?.takeIf { it.isSuccessful }?.body()?.primaryEpisodeId?.takeIf { it.isNotBlank() }
+            if (primaryEpId != null) {
+                return Response.success(
+                    listOf(
+                        ProphecyEpisodeDto(
+                            id = primaryEpId,
+                            canonicalId = primaryEpId,
+                            season = 1,
+                            number = 1,
+                            title = "Movie",
+                            overview = null
+                        )
+                    ),
+                    seasonsResp.raw()
+                )
+            }
+        }
         val gate = Semaphore(3)
         val flat = coroutineScope {
             seasonsBody.seasons.map { season ->
