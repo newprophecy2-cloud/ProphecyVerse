@@ -401,9 +401,9 @@ object NetworkModule {
             .connectionPool(sharedConnectionPool)
             .apply { diskHttpCache?.let { cache(it) } }
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(35, TimeUnit.SECONDS)
+            .readTimeout(75, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
-            .callTimeout(40, TimeUnit.SECONDS)
+            .callTimeout(80, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val orig = chain.request()
                 val builder = orig.newBuilder()

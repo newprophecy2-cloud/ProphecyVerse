@@ -881,11 +881,23 @@ class AnimeRepository(
 
     private fun extractImmediateTvPrequel(media: AniListMedia): AniListRelatedMediaNode? {
         if (!isSeriesAnimeFormat(media.format)) return null
+        val mediaFormat = media.format?.trim()?.uppercase()
+        val mediaYear = media.seasonYear ?: media.startDate?.year
+        val mediaEps = media.episodes?.takeIf { it > 0 }
+            ?: media.nextAiringEpisode?.episode?.minus(1)?.takeIf { it > 0 }
         return media.relations?.edges.orEmpty()
             .firstOrNull { edge ->
-                edge.relationType.equals("PREQUEL", ignoreCase = true) &&
-                    edge.node != null &&
-                    isSeriesAnimeFormat(edge.node.format, edge.node.type)
+                val node = edge.node ?: return@firstOrNull false
+                if (!edge.relationType.equals("PREQUEL", ignoreCase = true)) return@firstOrNull false
+                if (!isSeriesAnimeFormat(node.format, node.type)) return@firstOrNull false
+                val nodeFormat = node.format?.trim()?.uppercase()
+                // An ONA/short spinoff prequel (e.g. MONSTERS 2024 for One Piece 1999) must not hijack a TV series.
+                if (nodeFormat == "ONA" && (mediaFormat == "TV" || mediaFormat == "TV_SHORT")) return@firstOrNull false
+                val nodeEps = nodeEpisodeCount(node)
+                if (nodeEps == 1 && (mediaEps == null || mediaEps > 1)) return@firstOrNull false
+                val nodeYear = node.seasonYear ?: node.startDate?.year
+                if (mediaYear != null && nodeYear != null && nodeYear > mediaYear) return@firstOrNull false
+                true
             }
             ?.node
     }
@@ -1122,6 +1134,37 @@ class AnimeRepository(
                             errorMessage = "Could not refresh details from ProphecyVerse (HTTP ${response?.code() ?: 0})."
                         )
                     )
+                }
+
+                if (response != null && response.isSuccessful && response.body() != null &&
+                    !ContentIdentityHelper.isMovie(entry) && animeId.startsWith("anilist_")
+                ) {
+                    val candidateBody = response.body()!!
+                    val hasAnyEpisodes = (candidateBody.episodeCount ?: 0) > 0 ||
+                        candidateBody.seasons.orEmpty().any { !it.episodes.isNullOrEmpty() }
+                    if (!hasAnyEpisodes) {
+                        val altBackendId = resolveBackendIdForDiscovery(
+                            animeId,
+                            entry,
+                            excludeBackendIds = setOf(backendId)
+                        )
+                        if (altBackendId != null && altBackendId != backendId) {
+                            val altResp = runCatching {
+                                withTimeout(DISCOVERY_PER_CALL_TIMEOUT_MS) {
+                                    v3Gateway.getDetailsCompat(altBackendId)
+                                }
+                            }.getOrNull()
+                            val altBody = altResp?.takeIf { it.isSuccessful }?.body()
+                            val altHasEpisodes = altBody != null && (
+                                (altBody.episodeCount ?: 0) > 0 ||
+                                    altBody.seasons.orEmpty().any { !it.episodes.isNullOrEmpty() }
+                                )
+                            if (altHasEpisodes) {
+                                backendId = altBackendId
+                                response = altResp
+                            }
+                        }
+                    }
                 }
 
                 val details = response.body()!!
@@ -4294,9 +4337,9 @@ class AnimeRepository(
     }
 
     companion object {
-        private const val DISCOVERY_PER_CALL_TIMEOUT_MS = 16_000L
-        private const val SEARCH_PER_QUERY_TIMEOUT_MS = 12_000L
-        private const val DIRECT_PLAY_RESOLVE_TIMEOUT_MS = 35_000L
+        private const val DISCOVERY_PER_CALL_TIMEOUT_MS = 60_000L
+        private const val SEARCH_PER_QUERY_TIMEOUT_MS = 20_000L
+        private const val DIRECT_PLAY_RESOLVE_TIMEOUT_MS = 45_000L
         val searchMutexes = ConcurrentHashMap<String, Mutex>()
         val detailRefreshMutexes = ConcurrentHashMap<String, Mutex>()
         val sourceFetchMutexes = ConcurrentHashMap<String, Mutex>()
